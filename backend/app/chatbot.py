@@ -57,17 +57,66 @@ def _find_persona(name):
 
 
 def _find_agent(name):
-    return query_one("SELECT * FROM agents WHERE lower(name) = lower(?)", (name,))
+    n = str(name or "").lower().strip().removeprefix("a ").removeprefix("the ").strip()
+    if not n:
+        return None
+    exact = query_one("SELECT * FROM agents WHERE lower(name) = lower(?)", (n,))
+    if exact:
+        return exact
+    contains = query(
+        "SELECT * FROM agents WHERE lower(name) LIKE ? ORDER BY name", (f"%{n}%",))
+    if contains:
+        return contains[0]
+    # Fall back to matching by role name, e.g. "a senior developer" -> any agent whose
+    # role matches; prefer idle agents, then alphabetical.
+    by_role = query(
+        "SELECT a.* FROM agents a JOIN roles r ON r.id = a.role_id "
+        "WHERE lower(r.name) LIKE ? ORDER BY CASE a.lifecycle_state WHEN 'Idle' THEN 0 ELSE 1 END, a.name",
+        (f"%{n}%",))
+    if by_role:
+        return by_role[0]
+    for word in sorted(re.findall(r"[a-z0-9]+", n), key=len, reverse=True):
+        if len(word) < 3:
+            continue
+        hits = query(
+            "SELECT a.* FROM agents a JOIN roles r ON r.id = a.role_id "
+            "WHERE lower(r.name) LIKE ? ORDER BY CASE a.lifecycle_state WHEN 'Idle' THEN 0 ELSE 1 END, a.name",
+            (f"%{word}%",))
+        if hits:
+            return hits[0]
+    return None
+
+
+_TASK_FILLER = {"task", "the", "a", "an", "to", "please", "assign"}
 
 
 def _find_task(project_id, title):
     rows = query("SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at", (project_id,))
-    t = title.lower().strip()
+    if not rows:
+        return None
+    t = str(title or "").lower().strip()
     exact = [r for r in rows if r["title"].lower() == t]
     if exact:
         return exact[0]
+    if t in ("", "task"):
+        return rows[0]
     partial = [r for r in rows if t in r["title"].lower()]
-    return partial[0] if partial else None
+    if partial:
+        return partial[0]
+    # Token-overlap scoring so "user authentication task" matches "Design auth API contract".
+    wanted = {w for w in re.findall(r"[a-z0-9]+", t) if w not in _TASK_FILLER}
+    if not wanted:
+        return rows[0]
+    def token_match(w, word):
+        if w == word:
+            return True
+        # prefix-stem: "authentication" matches "auth" (common prefix >= 4 chars)
+        return len(w) >= 4 and len(word) >= 4 and (w.startswith(word) or word.startswith(w))
+    def score(r):
+        words = set(re.findall(r"[a-z0-9]+", r["title"].lower()))
+        return sum(1 for w in wanted if any(token_match(w, x) for x in words))
+    best = max(rows, key=score)
+    return best if score(best) > 0 else None
 
 
 def _project_summary(project_id) -> str:
@@ -241,9 +290,14 @@ def _execute_command(project_id, command, args) -> str:
         task = _find_task(project_id, args.get("task", ""))
         agent = _find_agent(args.get("agent", ""))
         if not task:
-            return f"Task matching **{args.get('task')}** not found."
+            titles = [r["title"] for r in query(
+                "SELECT title FROM tasks WHERE project_id = ? ORDER BY created_at DESC LIMIT 8", (project_id,))]
+            return (f"Task matching **{args.get('task')}** not found. Current tasks: "
+                    + ("; ".join(titles) if titles else "(none yet)") + ".")
         if not agent:
-            return f"Agent **{args.get('agent')}** not found."
+            names = [r["name"] for r in query("SELECT name FROM agents ORDER BY name LIMIT 8")]
+            return (f"Agent **{args.get('agent')}** not found. Available agents: "
+                    + ("; ".join(names) if names else "(none yet)") + ".")
         update("tasks", task["id"], {"assigned_agent_id": agent["id"], "updated_at": ts})
         audit("assign_task", "task", task["id"], f"Assigned '{task['title']}' to {agent['name']}")
         return f"Task **{task['title']}** assigned to **{agent['name']}**."
@@ -434,7 +488,8 @@ Available commands (name: args):
 
 Rules:
 - Pick a command only when the user clearly wants that action; otherwise set command to null and just answer.
-- Reference agents, tasks and sprints by the exact names in the context below.
+- Reference tasks by the closest title in the context (partial titles are fine, e.g. "user authentication" for "User authentication API").
+- Reference agents by exact name, or by role when the user means "any/one <role>" (e.g. agent "a senior developer" if a developer role exists); the resolver picks the best idle agent for that role.
 - If the user asks about status or progress, set command to null and summarize from the context.
 - reply: short, friendly, concrete. suggestions: exactly 3 short follow-up messages the user might send next.
 
