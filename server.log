@@ -1,0 +1,16 @@
+2026-09-20 01:48:26,020 INFO uvicorn.error: Started server process [14880]
+2026-09-20 01:48:26,020 INFO uvicorn.error: Waiting for application startup.
+2026-09-20 01:48:26,065 INFO uvicorn.error: Application startup complete.
+2026-09-20 01:48:26,066 INFO uvicorn.error: Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+2026-09-20 01:48:37,593 INFO uvicorn.access: 127.0.0.1:56577 - "GET / HTTP/1.1" 200
+2026-09-20 01:49:05,308 INFO uvicorn.access: 127.0.0.1:56604 - "GET / HTTP/1.1" 200
+2026-09-20 01:49:05,417 INFO uvicorn.access: 127.0.0.1:56604 - "GET /assets/index-gEB95r3y.js HTTP/1.1" 304
+2026-09-20 01:49:05,425 INFO uvicorn.access: 127.0.0.1:56604 - "GET /assets/index-JMm6l6D3.css HTTP/1.1" 304
+2026-09-20 01:49:07,533 INFO uvicorn.access: 127.0.0.1:56604 - "GET /favicon.ico HTTP/1.1" 200
+2026-09-20 01:49:34,848 INFO uvicorn.access: 127.0.0.1:56639 - "GET / HTTP/1.1" 200
+2026-09-20 01:50:34,330 INFO uvicorn.error: Started server process [21132]
+2026-09-20 01:50:34,330 INFO uvicorn.error: Waiting for application startup.
+2026-09-20 01:50:34,381 INFO uvicorn.error: Application startup complete.
+2026-09-20 01:50:34,384 INFO uvicorn.error: Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+2026-09-20 01:50:49,136 INFO uvicorn.access: 127.0.0.1:56718 - "GET / HTTP/1.1" 200
+2026-09-20 01:50:49,375 INFO uvicorn.access: 127.0.0.1:56719 - "POST /api/v1/projects/bf69c1e426504874962676acd207ae3f/sprint-execution/start HTTP/1.1" 200
