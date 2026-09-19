@@ -530,7 +530,7 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
                   <div className="small muted" style={{ marginBottom: 8 }}>
                     <span className={`live-dot ${s?.scheduler_running || running > 0 ? '' : 'idle'}`} /> Live event stream
                   </div>
-                  {liveEvents.map((e) => (
+                  {[...liveEvents].sort((a, b) => b.seq - a.seq).map((e) => (
                     <div key={e.seq} className="event-item">
                       <span className={`event-dot ${eventColor(e.event_type)}`} />
                       <div>
