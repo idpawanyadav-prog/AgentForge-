@@ -203,7 +203,7 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
         return (active ?? list[0])?.id ?? '';
       });
     }).catch(() => undefined);
-  }, [activeProject, s?.sprint?.id]);
+  }, [activeProject, summary?.sprint?.id]);
 
   React.useEffect(() => {
     if (selectedSprint && activeProject) saveUi(`ao.sprint.${activeProject}`, selectedSprint);
