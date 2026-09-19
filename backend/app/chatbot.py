@@ -452,6 +452,22 @@ def _execute_command(project_id, command, args) -> str:
                 agent_rows.append(a)
         if not agent_rows:
             return "No matching agents found. Create agents first with `create agent ...`."
+        existing = query_one("SELECT * FROM teams WHERE lower(name) = lower(?)", (str(args["name"]).strip(),))
+        if existing:
+            member_ids = {r["agent_id"] for r in
+                          query("SELECT agent_id FROM team_agents WHERE team_id = ? AND active = 1",
+                                (existing["id"],))}
+            added = [a["name"] for a in agent_rows if a["id"] not in member_ids]
+            for a in agent_rows:
+                execute("INSERT OR IGNORE INTO team_agents (team_id, agent_id, role_in_team, active) VALUES (?,?,?,1)",
+                        (existing["id"], a["id"], "Member"))
+            audit("create_team", "team", existing["id"],
+                  f"Added {len(added)} agent(s) to existing team '{existing['name']}'")
+            if added:
+                return (f"Team **{existing['name']}** already exists — added missing agents: "
+                        + ", ".join(added) + ". No duplicate team was created.")
+            return (f"Team **{existing['name']}** already exists and all requested agents "
+                    f"({', '.join(a['name'] for a in agent_rows)}) are already on it.")
         tid = new_id()
         insert("teams", {"id": tid, "name": args["name"], "description": "",
                          "status": "Active", "created_at": ts})
@@ -974,7 +990,14 @@ def handle_message(project_id: str, conversation_id: str, text: str) -> dict:
             _save_message(conversation_id, "assistant", reply)
             return {"reply": reply, "suggestions": ["Status", "Help"]}
         args = json.loads(pending["args_json"])
-        reply = _execute_command(project_id, pending["command"], args)
+        try:
+            reply = _execute_command(project_id, pending["command"], args)
+        except Exception as exc:  # keep pending so the user can retry with confirm
+            reply = (f"The command failed with: {exc}\n\n"
+                     "The request is still pending — reply `confirm` to retry or `cancel that` to discard.")
+            _save_message(conversation_id, "assistant", reply)
+            return {"reply": reply, "needs_confirmation": True, "pending_command": pending["id"],
+                    "suggestions": ["confirm", "cancel that"]}
         execute("DELETE FROM pending_commands WHERE id = ?", (pending["id"],))
         _save_message(conversation_id, "assistant", reply)
         return {"reply": reply, "suggestions": SUGGESTIONS.get(pending["command"], ["Status", "Help"])}

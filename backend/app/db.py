@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -51,9 +52,18 @@ def query_one(sql: str, params=()):
 
 def execute(sql: str, params=()):
     db = get_db()
-    cur = db.execute(sql, params)
-    db.commit()
-    return cur
+    last_exc = None
+    for attempt in range(5):
+        try:
+            cur = db.execute(sql, params)
+            db.commit()
+            return cur
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            last_exc = exc
+            time.sleep(0.3 * (attempt + 1))
+    raise last_exc
 
 
 def insert(table: str, values: dict) -> str:
