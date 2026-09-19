@@ -135,7 +135,8 @@ export default function MemoryPage() {
             ) : tab === 'skills' ? (
               <SkillsPanel roleId={role.id} allSkills={allSkills ?? []} onError={fail} onChanged={reloadRoles} />
             ) : (
-              <PersonaPanel roleId={role.id} onError={fail} onOpenModal={setModal} />
+              <PersonaPanel roleId={role.id} selected={selectedPersona} onSelect={setSelectedPersona}
+                onError={fail} onOpenModal={setModal} />
             )}
 
             <div className="assign-section">
