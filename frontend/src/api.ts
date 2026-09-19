@@ -1,15 +1,18 @@
 export async function api<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
   });
   if (!res.ok) {
     let detail = res.statusText;
     try {
       const body = await res.json();
-      detail = body.detail || JSON.stringify(body);
+      detail = body.detail ?? JSON.stringify(body);
+      if (Array.isArray(detail)) {
+        detail = detail.map((d: any) => d.msg || JSON.stringify(d)).join('; ');
+      }
     } catch { /* ignore */ }
-    throw new Error(detail);
+    throw new Error(String(detail));
   }
   return res.json();
 }
