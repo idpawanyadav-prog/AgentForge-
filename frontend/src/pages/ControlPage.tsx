@@ -137,6 +137,18 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
   React.useEffect(() => { if (activeConv) loadMessages(activeConv); }, [activeConv, loadMessages]);
   React.useEffect(() => { msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
+  // Live messages: the Product Owner narrates autonomous decisions into the
+  // main chat — poll so they appear without the user sending anything.
+  React.useEffect(() => {
+    if (!activeConv || poMode) return;
+    const t = setInterval(() => {
+      get(`/api/v1/conversations/${activeConv}/messages`).then((ms: Msg[]) => {
+        setMessages((prev) => (ms.length !== prev.length || ms[ms.length - 1]?.content !== prev[prev.length - 1]?.content ? ms : prev));
+      }).catch(() => undefined);
+    }, 3000);
+    return () => clearInterval(t);
+  }, [activeConv, poMode]);
+
   // Live polling: summary (team state), incremental event stream, selected sprint tasks.
   React.useEffect(() => {
     if (!activeProject) return;
@@ -174,20 +186,24 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
     return () => { alive = false; clearInterval(timer); };
   }, [activeProject]);
 
-  // Sprints list + default selection (last session's sprint, else active sprint)
+  // Sprints list + default selection. Auto-follows the ACTIVE sprint (e.g.
+  // when the Product Owner activates a new one) unless the user manually
+  // picked a sprint in this session.
+  const userPickedSprint = React.useRef(false);
   React.useEffect(() => {
     if (!activeProject) return;
     get(`/api/v1/projects/${activeProject}/sprints`).then((list: any[]) => {
       setSprints(list);
       setSelectedSprint((cur) => {
-        if (cur && list.some((x) => x.id === cur)) return cur;
+        const active = list.find((x) => x.status === 'Active');
+        if (userPickedSprint.current && cur && list.some((x) => x.id === cur)) return cur;
+        if (active) return active.id;
         const saved = loadUi(`ao.sprint.${activeProject}`, '');
         if (saved && list.some((x) => x.id === saved)) return saved;
-        const active = list.find((x) => x.status === 'Active');
         return (active ?? list[0])?.id ?? '';
       });
     }).catch(() => undefined);
-  }, [activeProject]);
+  }, [activeProject, s?.sprint?.id]);
 
   React.useEffect(() => {
     if (selectedSprint && activeProject) saveUi(`ao.sprint.${activeProject}`, selectedSprint);
@@ -521,7 +537,7 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
                 <>
                   <div className="row" style={{ marginBottom: 10, gap: 8 }}>
                     <select style={{ flex: 1 }} value={selectedSprint}
-                      onChange={(e) => setSelectedSprint(e.target.value)}>
+                      onChange={(e) => { userPickedSprint.current = true; setSelectedSprint(e.target.value); }}>
                       <option value="">— select sprint —</option>
                       {sprints.map((sp) => (
                         <option key={sp.id} value={sp.id}>

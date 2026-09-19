@@ -15,11 +15,15 @@ import json
 import os
 import threading
 
-from . import db, workspace, runtime
+from . import db, workspace, runtime, toolchains
 from .db import audit, emit_event, execute, insert, new_id, now, query, query_one, update
 
 PO_ROLE = "Product Owner"
 PO_CONV_TITLE = "Product Owner"
+MAIN_CONV_TITLE = "Project Control"
+
+_FAMILY_WORD = {"dev": "development", "qa": "QA", "architecture": "architecture",
+                "requirements": "business analysis", "devops": "DevOps", "design": "design"}
 
 _MAX_ATTACHMENT_CHARS = 8000
 _MAX_ACTION_TOKENS = 1800
@@ -43,6 +47,10 @@ Available actions:
 - {"action": "update_task", "task": "<title or partial>", "title"?: str, "description"?: str,
     "priority"?: 1-3, "points"?: 1-8}
 - {"action": "assign_task", "task": "<title or partial>", "agent": "<agent name>"}
+- {"action": "install_library", "packages": ["package1", "package2"],
+    "reason"?: str} — pip-installs missing Python packages into the QA/dev environment.
+    Use it whenever a task is blocked by ModuleNotFoundError / ImportError (e.g. sqlalchemy,
+    slowapi), then unblock_task the affected task(s) so they rerun.
 - {"action": "unblock_task", "task": "<title or partial>",
     "note"?: str} — clears the blocker and makes the task Ready again (also resets its rework counter)
 - {"action": "cancel_task", "task": "<title or partial>", "reason"?: str}
@@ -54,11 +62,51 @@ Rules:
   architecture to the Solution Architect. Use "assign_task" only when the default role-based
   assignment is wrong.
 - Unblock escalated tasks when the fix is obvious (rework, small defect) — say so in the reply.
+- Missing-dependency blockers are yours to fix: install the library yourself, never mark the
+  task Done or cancel it because of ModuleNotFoundError.
+- NEVER duplicate completed work. If a task is already Done, do not create it again in another
+  sprint. When a task is Blocked, fix the cause (install_library + unblock_task) instead of
+  re-creating it as a new task.
+- Keep all idle developers busy: when several independent tasks are open, they should run in
+  parallel across every idle developer, not one after another on a single agent.
 - Keep "reply" under 6 sentences. Never invent agents that are not on the team roster.
 - If nothing needs to change, return an empty "actions" list.
 
 Current project state:
 """
+
+
+# ---------------------------------------------------------------- narration
+
+def po_narrate(project_id: str, text: str):
+    """Post a Product Owner update into the project's MAIN control chat so
+    autonomous PO activity is visible where the owner chats. The dedicated
+    'Product Owner' conversation is excluded (it has its own thread)."""
+    if not str(text or "").strip():
+        return None
+    conv = query_one(
+        "SELECT * FROM conversations WHERE project_id = ? AND title != ? "
+        "ORDER BY updated_at DESC LIMIT 1", (project_id, PO_CONV_TITLE))
+    if not conv:
+        ts = now()
+        insert("conversations", {"id": (cid := new_id()), "project_id": project_id,
+                                 "title": MAIN_CONV_TITLE, "created_at": ts, "updated_at": ts})
+        conv = query_one("SELECT * FROM conversations WHERE id = ?", (cid,))
+    insert("messages", {"id": new_id(), "conversation_id": conv["id"], "role": "assistant",
+                        "content": text, "created_at": now()})
+    update("conversations", conv["id"], {"updated_at": now()})
+    return conv["id"]
+
+
+def _narrate_actions(project_id: str, agent_name: str, summary: str, actions: list[str]):
+    """Main-chat narration for an autonomous PO pass that took actions."""
+    agent_name = agent_name or "Product Owner"
+    lines = [f"👑 **{agent_name} (Product Owner)** — autonomous update:",
+             summary or "I reviewed the project and took action."]
+    if actions:
+        lines.append("")
+        lines.extend(f"- {a}" for a in actions)
+    po_narrate(project_id, "\n".join(lines))
 
 
 # ---------------------------------------------------------------- status
@@ -127,6 +175,8 @@ def set_po_enabled(project_id: str, enabled: bool) -> dict:
             note = (f"{agent['name']} ({PO_ROLE}) now acts with full authority on the owner's behalf. "
                     "An initial project review is running now.")
         emit_event(project_id, "po.enabled", {"agent": agent["name"], "note": note})
+        po_narrate(project_id, f"👑 **{agent['name']} (Product Owner)** has taken control of this "
+                               "project. " + note.split('. ', 1)[-1])
         # Immediate autonomous review so enabling always produces visible
         # activity — the PO may unblock items, re-plan, or start a next sprint.
         threading.Thread(
@@ -195,17 +245,38 @@ def _project_brief(project_id: str, focus_blockers: bool = False) -> str:
 # ---------------------------------------------------------------- action execution
 
 def _resolve_task(project_id: str, ref: str):
+    """Resolve a task by exact or partial title. Open tasks (not Done/
+    Cancelled) always win: an action aimed at a blocked task must never
+    land on a completed one just because the titles partially match."""
     ref = str(ref or "").lower().strip()
     if not ref:
         return None
     rows = query("SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at", (project_id,))
-    for t in rows:
-        if t["title"].lower() == ref:
-            return t
-    for t in rows:
-        if ref in t["title"].lower():
-            return t
+    open_rows = [t for t in rows if t["status"] not in ("Done", "Cancelled")]
+    for pool in (open_rows, rows):
+        for t in pool:
+            if t["title"].lower() == ref:
+                return t
+        for t in pool:
+            if ref in t["title"].lower():
+                return t
     return None
+
+
+def _norm_title(title: str) -> str:
+    return " ".join(str(title or "").lower().split())
+
+
+def _duplicate_task_exists(project_id: str, title: str) -> bool:
+    """True when a task with the same normalized title already exists in any
+    sprint of this project — blocks the PO from re-creating completed work."""
+    norm = _norm_title(title)
+    if not norm:
+        return False
+    for t in query("SELECT title FROM tasks WHERE project_id = ?", (project_id,)):
+        if _norm_title(t["title"]) == norm:
+            return True
+    return False
 
 
 def _resolve_agent(project_id: str, name: str):
@@ -214,7 +285,8 @@ def _resolve_agent(project_id: str, name: str):
     if not team_id:
         return None
     rows = query(
-        "SELECT a.* FROM team_agents ta JOIN agents a ON a.id = ta.agent_id "
+        "SELECT a.*, r.name AS role_name FROM team_agents ta "
+        "JOIN agents a ON a.id = ta.agent_id JOIN roles r ON r.id = a.role_id "
         "WHERE ta.team_id = ? AND ta.active = 1 ORDER BY a.name", (team_id,))
     for a in rows:
         if a["name"].lower() == n:
@@ -282,10 +354,13 @@ def _apply_actions(project_id: str, actions) -> list[str]:
                                    "capacity": _clamp(a.get("capacity"), 1, 200, 40),
                                    "status": "Planned", "created_at": now()})
                 ts = now()
-                made = 0
+                made = skipped = 0
                 for t in a.get("tasks") or []:
                     title = str((t or {}).get("title") or "").strip()
                     if not title:
+                        continue
+                    if _duplicate_task_exists(project_id, title):
+                        skipped += 1
                         continue
                     insert("tasks", {"id": new_id(), "project_id": project_id, "sprint_id": sid,
                                      "title": title[:120],
@@ -295,13 +370,18 @@ def _apply_actions(project_id: str, actions) -> list[str]:
                                      "priority": _clamp(t.get("priority"), 1, 3, 2),
                                      "status": "Todo", "created_at": ts, "updated_at": ts})
                     made += 1
-                log.append(f"Created sprint '{name}' with {made} task(s).")
+                log.append(f"Created sprint '{name}' with {made} task(s)"
+                           + (f" ({skipped} duplicate(s) of existing work skipped)" if skipped else "") + ".")
                 audit("po_create_sprint", "sprint", sid, f"PO created sprint '{name}' ({made} tasks)",
                       actor="product-owner")
                 emit_event(project_id, "po.action", {"action": "create_sprint", "sprint": name, "tasks": made})
             elif act == "add_task":
                 title = str(a.get("title") or "").strip()
                 if not title:
+                    continue
+                if _duplicate_task_exists(project_id, title):
+                    log.append(f"Skipped duplicate task '{title}' — it already exists "
+                               "(re-create completed work is not allowed).")
                     continue
                 sprint = None
                 ref = str(a.get("sprint") or "").strip()
@@ -346,15 +426,63 @@ def _apply_actions(project_id: str, actions) -> list[str]:
             elif act == "assign_task":
                 t = _resolve_task(project_id, a.get("task"))
                 agent = _resolve_agent(project_id, a.get("agent"))
-                if not t or not agent:
-                    log.append(f"Assign skipped: task '{a.get('task')}' or agent '{a.get('agent')}' not found.")
+                if not t:
+                    log.append(f"Task '{a.get('task')}' not found — assign skipped.")
+                    continue
+                # Role-family enforcement: a dev task is never handed to QA/BA/
+                # DevOps/PO even if the PO named them. A wrong-role pick falls
+                # back to the runtime's role-based specialist selection.
+                family = runtime._family_for_task(t)
+                if agent and family and runtime._family_of_role(agent["role_name"]) != family:
+                    log.append(f"Override: {agent['name']} ({agent['role_name']}) is not "
+                               f"{_FAMILY_WORD.get(family, family)} staff — picking a specialist instead.")
+                    agent = None
+                if not agent:
+                    members = [m for m in runtime._team_members(project_id)
+                               if m["lifecycle_state"] == "Idle"]
+                    pick, matched = runtime._pick_member(members, family)
+                    agent = pick
+                if not agent:
+                    log.append(f"No idle eligible agent for '{t['title']}' — assign skipped.")
                     continue
                 update("tasks", t["id"], {"assigned_agent_id": agent["id"], "updated_at": now()})
-                log.append(f"Assigned '{t['title']}' to {agent['name']}.")
-                audit("po_assign_task", "task", t["id"], f"PO assigned '{t['title']}' to {agent['name']}",
+                log.append(f"Assigned '{t['title']}' to {agent['name']} ({agent['role_name']}).")
+                audit("po_assign_task", "task", t["id"],
+                      f"PO assigned '{t['title']}' to {agent['name']} ({agent['role_name']})",
                       actor="product-owner")
                 emit_event(project_id, "po.action",
-                           {"action": "assign_task", "task": t["title"], "agent": agent["name"]})
+                           {"action": "assign_task", "task": t["title"], "agent": agent["name"],
+                            "role": agent["role_name"]})
+            elif act == "install_library":
+                pkgs = a.get("packages") or ([a.get("package")] if a.get("package") else [])
+                reason = str(a.get("reason") or "").strip()
+                ws = workspace.get_workspace(project_id)
+                if ws and os.path.isdir(ws):
+                    # Install into the PROJECT-LOCAL environment (.venv) that
+                    # the generated start_server.bat activates and QA reuses —
+                    # requirements.txt is synced and named packages added on top.
+                    result = toolchains.ensure_project_env(ws, extra_packages=pkgs)
+                    where = "project-local .venv"
+                else:
+                    result = toolchains.pip_install(pkgs)
+                    where = "AgentForge environment"
+                if result.get("ok"):
+                    log.append(f"Installed into {where}: "
+                               + (", ".join(result.get("packages") or pkgs) or "requirements.txt")
+                               + (f" ({result['output'].splitlines()[-1][:120]})" if result.get("output") else ""))
+                    audit("po_install_library", "project", project_id,
+                          f"PO installed libraries into {where}: "
+                          + (", ".join(result.get("packages") or ["requirements.txt"]))
+                          + (f" — {reason}" if reason else ""), actor="product-owner")
+                    emit_event(project_id, "po.action",
+                               {"action": "install_library", "where": where,
+                                "packages": result.get("packages") or pkgs})
+                else:
+                    log.append(f"Library install into {where} FAILED: "
+                               f"{str(result.get('output'))[-200:]}")
+                    emit_event(project_id, "po.action",
+                               {"action": "install_library", "ok": False,
+                                "packages": result.get("packages") or pkgs})
             elif act == "unblock_task":
                 t = _resolve_task(project_id, a.get("task"))
                 if not t:
@@ -549,4 +677,7 @@ def po_autonomy_tick(project_id: str, instruction: str | None = None,
                {"ok": True, "summary": summary[:400],
                 "actions": actions[:10] if actions else [],
                 "acted": bool(actions)})
+    if actions:
+        agent = po_agent_for_project(project_id)
+        _narrate_actions(project_id, agent["name"] if agent else None, summary, actions)
     return summary

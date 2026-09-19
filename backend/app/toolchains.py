@@ -59,6 +59,122 @@ def _which(stack: str) -> str | None:
     return shutil.which(exe)
 
 
+def pip_install(packages, timeout: int = 300) -> dict:
+    """Install Python packages into the backend/QA environment with pip.
+    Used by the Product Owner (full autonomy) to clear ModuleNotFoundError
+    blockers. Never fakes success: returns the real pip verdict and output."""
+    pkgs = [str(p).strip() for p in (packages or []) if str(p).strip()]
+    if not pkgs:
+        return {"ok": False, "packages": [], "output": "no packages given"}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", *pkgs],
+            capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace")
+        output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        return {"ok": proc.returncode == 0, "packages": pkgs,
+                "output": output[-1500:] if output else f"pip exit {proc.returncode}"}
+    except Exception as exc:
+        return {"ok": False, "packages": pkgs, "output": f"pip failed: {exc}"}
+
+
+def project_python(ws_dir: str | None) -> str | None:
+    """The project's own virtualenv interpreter (linked from the generated
+    start_server.bat), when the workspace has one."""
+    if not ws_dir:
+        return None
+    sub = "Scripts" if os.name == "nt" else "bin"
+    exe = os.path.join(ws_dir, ".venv", sub, "python.exe" if os.name == "nt" else "python")
+    return exe if os.path.isfile(exe) else None
+
+
+def ensure_project_env(ws_dir: str | None, extra_packages=None, timeout: int = 600) -> dict:
+    """Create and fill the project-local environment: `<workspace>/.venv`
+    with everything from the workspace requirements.txt plus any explicitly
+    requested packages. This is the folder the generated start_server.bat
+    activates, so installing here makes the app itself runnable — QA build
+    and test runs use the same interpreter (see project_python). Idempotent:
+    an existing .venv just gets its requirements re-synced. Never fakes
+    success; the real pip verdict is returned."""
+    if not ws_dir or not os.path.isdir(ws_dir):
+        return {"ok": False, "output": "workspace missing", "packages": list(extra_packages or [])}
+    steps: list[str] = []
+    ok = True
+    py = project_python(ws_dir)
+    if py:
+        # A stale venv (e.g. Python 3.6 created by scaffolding on the system
+        # interpreter) can never run modern requirements — recreate it when
+        # its version doesn't match the backend interpreter.
+        try:
+            ver = subprocess.run([py, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                                 capture_output=True, text=True, timeout=60,
+                                 encoding="utf-8", errors="replace")
+            want = f"{sys.version_info[0]}.{sys.version_info[1]}"
+            got = (ver.stdout or "").strip()
+            if ver.returncode == 0 and got != want:
+                shutil.rmtree(os.path.join(ws_dir, ".venv"), ignore_errors=True)
+                py = None
+                steps.append(f"removed stale project .venv (Python {got}; need {want})")
+            else:
+                steps.append("project .venv already present")
+        except Exception as exc:
+            steps.append(f"venv version check failed: {exc}")
+    if not py:
+        try:
+            proc = subprocess.run([sys.executable, "-m", "venv", ".venv"], cwd=ws_dir,
+                                  capture_output=True, text=True, timeout=180,
+                                  encoding="utf-8", errors="replace")
+            steps.append("created project .venv" if proc.returncode == 0
+                         else f"venv creation failed: {(proc.stderr or proc.stdout or '')[-200:]}")
+            ok &= proc.returncode == 0
+        except Exception as exc:
+            steps.append(f"venv creation failed: {exc}")
+            ok = False
+        py = project_python(ws_dir)
+        if not py:
+            return {"ok": False, "packages": list(extra_packages or []),
+                    "output": "\n".join(steps)[-1500:]}
+
+    # A venv can exist without pip (created by scaffolding scripts without
+    # ensurepip). Bootstrap it before any install attempt.
+    try:
+        probe = subprocess.run([py, "-m", "pip", "--version"], capture_output=True,
+                               text=True, timeout=60, encoding="utf-8", errors="replace")
+        if probe.returncode != 0:
+            fix = subprocess.run([py, "-m", "ensurepip", "--upgrade"], cwd=ws_dir,
+                                 capture_output=True, text=True, timeout=180,
+                                 encoding="utf-8", errors="replace")
+            steps.append("bootstrapped pip via ensurepip"
+                         + (" ok" if fix.returncode == 0 else f" FAILED: {(fix.stderr or '')[-120:]}"))
+            ok &= fix.returncode == 0
+    except Exception as exc:
+        steps.append(f"pip bootstrap check failed: {exc}")
+        ok = False
+
+    def _pip(args: list[str], label: str):
+        nonlocal ok
+        try:
+            proc = subprocess.run([py, "-m", "pip", "install", "--disable-pip-version-check", *args],
+                                  cwd=ws_dir, capture_output=True, text=True, timeout=timeout,
+                                  encoding="utf-8", errors="replace")
+            out = ((proc.stdout or "") + (proc.stderr or "")).strip().splitlines()
+            steps.append(f"{label}: {'ok' if proc.returncode == 0 else 'FAILED'}"
+                         + (f" — {out[-1][:160]}" if out else ""))
+            ok &= proc.returncode == 0
+        except Exception as exc:
+            steps.append(f"{label} FAILED: {exc}")
+            ok = False
+
+    req = os.path.join(ws_dir, "requirements.txt")
+    if os.path.isfile(req):
+        _pip(["-r", "requirements.txt"], "pip install -r requirements.txt")
+    pkgs = [str(p).strip() for p in (extra_packages or []) if str(p).strip()]
+    if pkgs:
+        _pip(pkgs, f"pip install {' '.join(pkgs)}")
+    if not steps:
+        steps.append("nothing to install (no requirements.txt, no packages)")
+    return {"ok": ok, "python": py, "packages": pkgs, "output": "\n".join(steps)[-1500:]}
+
+
 def toolchain_available(stack: str) -> tuple[bool, str]:
     """(available, message). message explains the install path when False."""
     if stack not in STACKS:
@@ -197,9 +313,10 @@ def ensure_pyproject(ws_dir: str):
 def _python_build(ws_dir: str) -> tuple[bool, str]:
     if not ws_dir or not os.path.isdir(ws_dir):
         return False, "workspace missing"
+    py = project_python(ws_dir) or sys.executable
     try:
         proc = subprocess.run(
-            [sys.executable, "-c", _BUILD_DRIVER],
+            [py, "-c", _BUILD_DRIVER],
             cwd=ws_dir, capture_output=True, text=True, timeout=120,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     except subprocess.TimeoutExpired:
@@ -227,7 +344,8 @@ def _python_tests(ws_dir: str) -> tuple[bool, str]:
     if not ws_dir or not os.path.isdir(ws_dir):
         return False, "workspace missing"
     ensure_pyproject(ws_dir)
-    rc, tail = _run([sys.executable, "-m", "pytest", "-q", "--no-header", "-x", "--tb=line"],
+    py = project_python(ws_dir) or sys.executable
+    rc, tail = _run([py, "-m", "pytest", "-q", "--no-header", "-x", "--tb=line"],
                     ws_dir, timeout=300)
     lines = tail.splitlines()
     summary = lines[-1] if lines else "no output"
