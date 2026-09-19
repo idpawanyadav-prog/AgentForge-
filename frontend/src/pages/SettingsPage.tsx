@@ -20,9 +20,10 @@ export default function SettingsPage() {
       </div>
       <ErrorNote error={error} />
 
-      <ControlBotCard gateways={gateways ?? []} onError={fail} />
-
-      <PoBotCard gateways={gateways ?? []} onError={fail} />
+      <div className="settings-grid">
+        <ControlBotCard gateways={gateways ?? []} onError={fail} />
+        <PoBotCard gateways={gateways ?? []} onError={fail} />
+      </div>
 
       <ModelPlayground gateways={gateways ?? []} onError={fail} />
 
