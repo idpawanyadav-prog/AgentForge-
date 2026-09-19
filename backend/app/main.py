@@ -25,6 +25,7 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "static")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    workspace.relocate_workspaces()
     runtime.recover_orphans()
     runtime.set_loop(asyncio.get_running_loop())
     yield

@@ -12,6 +12,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(HERE)
 sys.path.insert(0, HERE)
 
+# Generated project workspaces are runtime data — keep them OUTSIDE the
+# published source tree (repo root), otherwise deploy scans package them.
+os.environ.setdefault("AGENT_OFFICE_WORKSPACES",
+                      os.path.join(os.path.expanduser("~"), ".verdent", "agentforge-projects"))
+
 logging.basicConfig(
     filename=os.path.join(os.path.dirname(HERE), "server.log"),
     level=logging.INFO,

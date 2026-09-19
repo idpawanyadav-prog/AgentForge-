@@ -14,7 +14,7 @@ import re
 import shutil
 import subprocess
 
-from .db import execute, now, query_one, update
+from .db import execute, now, query, query_one, update
 
 
 def workspaces_root() -> str:
@@ -23,6 +23,25 @@ def workspaces_root() -> str:
         # <repo>/Projects — sits next to the backend/ folder.
         root = os.path.join(os.path.dirname(__file__), "..", "..", "Projects")
     return os.path.abspath(root)
+
+
+def relocate_workspaces() -> int:
+    """Re-point stored workspace paths whose folder was moved — e.g. when the
+    projects root moved out of the published source tree (runtime data such as
+    generated workspaces must not ship with the source). Returns count fixed."""
+    moved = 0
+    for row in query("SELECT id, workspace_path FROM projects "
+                     "WHERE workspace_path IS NOT NULL AND workspace_path != ''"):
+        old = row["workspace_path"]
+        if os.path.isdir(old):
+            continue
+        leaf = os.path.basename(old.rstrip("\\/"))
+        cand = os.path.join(workspaces_root(), leaf)
+        if os.path.isdir(cand):
+            execute("UPDATE projects SET workspace_path=?, updated_at=? WHERE id=?",
+                    (cand, now(), row["id"]))
+            moved += 1
+    return moved
 
 
 def safe_dir_name(name: str) -> str:
