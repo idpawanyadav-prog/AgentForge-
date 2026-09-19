@@ -730,7 +730,10 @@ def _agent_load(agent_id):
 
 def auto_assign_tasks(project_id: str) -> dict:
     """Assign unassigned sprint tasks to team members, matching role keywords
-    in the task title/description first, then least-loaded as fallback."""
+    in the task title/description first, then least-loaded as fallback.
+    Work spreads across ALL idle agents: each task in one pass goes to a
+    distinct idle member, and busy agents are never queued — the loop
+    retries in the next round instead."""
     sprint = query_one("SELECT * FROM sprints WHERE project_id = ? AND status = 'Active'", (project_id,))
     if not sprint:
         return {"assigned": 0, "note": "No active sprint"}
@@ -743,13 +746,17 @@ def auto_assign_tasks(project_id: str) -> dict:
         "SELECT * FROM tasks WHERE project_id = ? AND sprint_id = ? "
         "AND status IN ('Todo','Ready') AND assigned_agent_id IS NULL ORDER BY priority, created_at",
         (project_id, sprint["id"]))
+    # Mutable availability snapshot: assigning a task makes that member busy
+    # for the rest of this pass so several idle devs get work in one round.
+    avail = [dict(m) for m in members]
     assigned = 0
     for t in tasks:
         family = _family_for_task(t)
-        pick, matched = _pick_member(members, family)
-        if not pick:
-            continue
+        pick, matched = _pick_member(avail, family)
+        if not pick or pick["lifecycle_state"] != "Idle":
+            continue  # busy specialist: leave for the next round, never queue
         update("tasks", t["id"], {"assigned_agent_id": pick["id"], "updated_at": now()})
+        pick["lifecycle_state"] = "Working"  # reflected for the remaining tasks
         note = "" if matched else f" (no {_FAMILY_LABEL.get(family, 'matching')} specialist on the team)"
         emit_event(project_id, "task.assigned",
                    {"task_id": t["id"], "task": t["title"], "agent": pick["name"],
