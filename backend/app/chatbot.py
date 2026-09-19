@@ -176,6 +176,171 @@ def _queue_pending(conversation_id, command, args, summary) -> str:
     return pid
 
 
+
+def _default_gateway_and_model():
+    """Pick the AI brain's gateway/model if set, else the first gateway that has models."""
+    gw, model = _bot_config()
+    if gw and model:
+        return gw, model
+    for g in query("SELECT * FROM gateways ORDER BY created_at"):
+        m = query_one("SELECT * FROM gateway_models WHERE gateway_id = ? ORDER BY created_at LIMIT 1", (g["id"],))
+        if m:
+            return g, m
+    return None, None
+
+
+_ROLE_KIT_PROMPT = """You are provisioning a complete starter kit for the role "{role_name}" ({role_desc}) \
+in a simulated AI software delivery team. Use EXACTLY this output format with the section markers as shown \
+(no markdown code fences, no extra commentary):
+
+=== PERSONA_INSTRUCTIONS ===
+(2-4 paragraph system prompt for an agent filling this role: identity, expertise, working style, deliverables)
+=== PERSONA_CONSTRAINTS ===
+(3-5 bullet constraints: things the role must never do / must always do)
+=== CHARTER_MD ===
+(a markdown charter with sections: Mission, Core Responsibilities, Deliverables, Collaboration, Constraints)
+=== SKILL: <short skill name> | <one-line description> ===
+(markdown guidance for applying this skill)
+
+Provide exactly 3 SKILL sections that are core to this role's expertise.
+"""
+
+_ROLE_KIT_SECTIONS = ("PERSONA_INSTRUCTIONS", "PERSONA_CONSTRAINTS", "CHARTER_MD")
+
+
+def _parse_role_kit(text: str):
+    """Parse the delimiter-format role kit. Returns dict or None."""
+    sections: dict = {"skills": []}
+    current = None
+    last_skill = None
+    buf: list = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        marker = None
+        if stripped.startswith("=== ") and stripped.endswith(" ==="):
+            marker = stripped[4:-4].strip()
+        elif stripped in _ROLE_KIT_SECTIONS:
+            marker = stripped
+        if marker is not None:
+            if current is not None:
+                sections[current] = "\n".join(buf).strip()
+            buf = []
+            if marker.startswith("SKILL:"):
+                spec = marker[len("SKILL:"):].strip()
+                sname, sdesc = (spec.split("|", 1) + [""])[:2]
+                last_skill = {"name": sname.strip(), "description": sdesc.strip(), "content": ""}
+                sections["skills"].append(last_skill)
+                current = None
+            elif marker in _ROLE_KIT_SECTIONS:
+                current = marker
+            continue
+        if last_skill is not None and current is None:
+            last_skill["content"] = (last_skill["content"] + "\n" + line).strip()
+        else:
+            buf.append(line)
+    if current is not None:
+        sections[current] = "\n".join(buf).strip()
+    if not sections.get("PERSONA_INSTRUCTIONS"):
+        return None
+    return sections
+
+
+def _template_role_kit(role):
+    rn = role["name"]
+    return {
+        "persona_instructions": (
+            f"You are a senior {rn} on a simulated delivery team. You bring deep expertise in your domain, "
+            f"break work into concrete verifiable steps, and produce clear artifacts for every task. "
+            f"You coordinate with adjacent roles and keep commitments small and shippable."),
+        "persona_constraints": (
+            f"- Never commit changes that bypass the definition of done.\n"
+            f"- Always document decisions and open questions.\n"
+            f"- Escalate blockers instead of going silent."),
+        "charter_md": (
+            f"# {rn} — Role Charter\n\n## Mission\nDeliver expert {rn} work across all project phases.\n\n"
+            f"## Core Responsibilities\n- Own {rn} work items end to end\n"
+            f"- Apply best practices and quality standards\n- Review and support teammates' work\n\n"
+            f"## Deliverables\n- Task artifacts with evidence\n- Clear status updates\n\n"
+            f"## Collaboration\n- Coordinate with the team daily\n- Hand off work with documentation\n\n"
+            f"## Constraints\n- Follow project conventions\n- Escalate blockers early"),
+        "skills": [
+            {"name": f"{rn} Fundamentals", "description": f"Core practices of the {rn} role",
+             "content": f"Apply standard {rn} practices: plan, execute in small steps, verify, document."},
+            {"name": "Quality Standards", "description": "Definition of done and review checklist",
+             "content": "- Meets acceptance criteria\n- Reviewed by a peer\n- Documented"},
+            {"name": "Team Collaboration", "description": "Working agreements across roles",
+             "content": "Communicate status daily; hand off with context; escalate blockers within a day."},
+        ],
+    }
+
+
+def _generate_role_kit(role) -> str:
+    """Create persona + instruction files + skills + model binding for a new role.
+    Uses the AI brain when configured; falls back to templates. Returns a summary string."""
+    now_ts = now()
+    try:
+        kit = _template_role_kit(role)
+        gw, model = _bot_config()
+        if gw and model:
+            try:
+                raw = _call_llm(gw, model,
+                                _ROLE_KIT_PROMPT.format(role_name=role["name"],
+                                                        role_desc=role["description"] or role["name"]),
+                                f"Generate the role kit for: {role['name']}",
+                                max_tokens=3000)
+                parsed = _parse_role_kit(raw)
+                if parsed:
+                    kit = {
+                        "persona_instructions": parsed.get("PERSONA_INSTRUCTIONS") or kit["persona_instructions"],
+                        "persona_constraints": parsed.get("PERSONA_CONSTRAINTS") or kit["persona_constraints"],
+                        "charter_md": parsed.get("CHARTER_MD") or kit["charter_md"],
+                        "skills": [s for s in parsed.get("skills", []) if s.get("name")] or kit["skills"],
+                    }
+            except Exception:
+                pass  # fall back to template kit
+
+        # Persona
+        pid = new_id()
+        insert("personas", {"id": pid, "role_id": role["id"], "name": f"Default {role['name']}",
+                            "description": f"Auto-generated expertise kit for {role['name']}.",
+                            "instructions": kit["persona_instructions"],
+                            "constraints_text": kit["persona_constraints"],
+                            "version": 1, "active": 1, "created_at": now_ts, "updated_at": now_ts})
+        insert("persona_versions", {"id": new_id(), "persona_id": pid, "version": 1,
+                                    "instructions": kit["persona_instructions"],
+                                    "constraints_text": kit["persona_constraints"],
+                                    "checksum": db.checksum(kit["persona_instructions"]), "created_at": now_ts})
+        # Instruction files
+        insert("instruction_files", {"id": new_id(), "role_id": role["id"],
+                                     "filename": f"{role['name'].replace(' ', '-')}-Charter.md",
+                                     "description": f"Role charter for {role['name']}",
+                                     "content": kit["charter_md"], "version": 1,
+                                     "created_at": now_ts, "updated_at": now_ts})
+        # Skills
+        n_skills = 0
+        for s in kit["skills"][:4]:
+            if not isinstance(s, dict) or not s.get("name"):
+                continue
+            sid = new_id()
+            insert("skills", {"id": sid, "name": str(s["name"])[:60], "description": str(s.get("description", "")),
+                              "content": str(s.get("content", "")), "version": 1, "active": 1,
+                              "created_at": now_ts, "updated_at": now_ts})
+            execute("INSERT OR IGNORE INTO role_skills (role_id, skill_id) VALUES (?,?)", (role["id"], sid))
+            n_skills += 1
+        # Model binding from an available gateway
+        binding_note = "no model binding (configure a gateway in Settings)"
+        gw, model = _default_gateway_and_model()
+        if gw and model:
+            insert("model_bindings", {"id": new_id(), "role_id": role["id"], "gateway_id": gw["id"],
+                                      "model_id": model["id"], "settings_json": '{"temperature": 0.3}',
+                                      "active": 1})
+            binding_note = f"model binding to {model['provider_model_id']} @ {gw['name']}"
+        return (f"persona 'Default {role['name']}', charter instruction file, "
+                f"{n_skills} skill(s), {binding_note}")
+    except Exception as exc:
+        return f"kit generation failed ({exc}) — add persona/instructions manually"
+
+
 def _execute_command(project_id, command, args) -> str:
     ts = now()
     if command == "create_gateway":
@@ -219,8 +384,14 @@ def _execute_command(project_id, command, args) -> str:
         insert("roles", {"id": rid, "name": args["name"],
                          "description": args.get("description", ""), "active": 1,
                          "created_at": ts, "updated_at": ts})
-        audit("create_role", "role", rid, f"Created role '{args['name']}'")
-        return f"Role **{args['name']}** created. You can now add personas and a model binding."
+        role = query_one("SELECT * FROM roles WHERE id = ?", (rid,))
+        kit_note = _generate_role_kit(role)
+        audit("create_role", "role", rid,
+              f"Created role '{args['name']}' with full kit ({kit_note})")
+        return (f"Role **{args['name']}** created with a full expertise kit: "
+                f"{kit_note}. Everything is editable later in the Agent Memory tab.")
+
+
 
     if command == "create_persona":
         role = _find_role(args.get("role", ""))
@@ -683,7 +854,7 @@ def _extract_json(text: str):
     return data if isinstance(data, dict) else None
 
 
-def _call_llm(gw, model, system_prompt: str, user_text: str) -> str:
+def _call_llm(gw, model, system_prompt: str, user_text: str, max_tokens: int = 700) -> str:
     """Live inference call to the configured gateway/model. Returns raw text."""
     import urllib.error as _uerr
     import urllib.request as _ureq
@@ -701,7 +872,7 @@ def _call_llm(gw, model, system_prompt: str, user_text: str) -> str:
             url = base + "/messages"
         else:
             url = base + "/v1/messages"
-        payload = {"model": model["provider_model_id"], "max_tokens": 700,
+        payload = {"model": model["provider_model_id"], "max_tokens": max_tokens,
                    "system": system_prompt,
                    "messages": [{"role": "user", "content": user_text}]}
         headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
@@ -710,7 +881,7 @@ def _call_llm(gw, model, system_prompt: str, user_text: str) -> str:
         if "/v1" not in base:
             base += "/v1"
         url = base + "/chat/completions"
-        payload = {"model": model["provider_model_id"], "max_tokens": 700,
+        payload = {"model": model["provider_model_id"], "max_tokens": max_tokens,
                    "messages": [{"role": "system", "content": system_prompt},
                                 {"role": "user", "content": user_text}]}
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}

@@ -77,7 +77,7 @@ class RoleIn(BaseModel):
 
 
 class PersonaIn(BaseModel):
-    role_id: str
+    role_id: str = ""
     name: str
     description: str = ""
     instructions: str = ""
@@ -425,7 +425,8 @@ def roles_memory():
     for r in query("SELECT * FROM roles ORDER BY name"):
         ic = query_one("SELECT COUNT(*) AS n FROM instruction_files WHERE role_id=?", (r["id"],))["n"]
         sc = query_one("SELECT COUNT(*) AS n FROM role_skills WHERE role_id=?", (r["id"],))["n"]
-        out.append({**r, "instruction_count": ic, "skill_count": sc})
+        pc = query_one("SELECT COUNT(*) AS n FROM personas WHERE role_id=?", (r["id"],))["n"]
+        out.append({**r, "instruction_count": ic, "skill_count": sc, "persona_count": pc})
     return out
 
 
@@ -524,6 +525,7 @@ def delete_role(rid: str):
         return {"ok": True, "deactivated": True}
     execute("DELETE FROM instruction_files WHERE role_id=?", (rid,))
     execute("DELETE FROM role_skills WHERE role_id=?", (rid,))
+    execute("DELETE FROM persona_versions WHERE persona_id IN (SELECT id FROM personas WHERE role_id=?)", (rid,))
     execute("DELETE FROM personas WHERE role_id=?", (rid,))
     execute("DELETE FROM model_bindings WHERE role_id=?", (rid,))
     execute("DELETE FROM roles WHERE id=?", (rid,))
@@ -579,6 +581,7 @@ def delete_persona(pid: str):
     if used:
         update("personas", pid, {"active": 0, "updated_at": now()})
         return {"ok": True, "deactivated": True}
+    execute("DELETE FROM persona_versions WHERE persona_id=?", (pid,))
     execute("DELETE FROM persona_skills WHERE persona_id=?", (pid,))
     execute("DELETE FROM personas WHERE id=?", (pid,))
     return {"ok": True}

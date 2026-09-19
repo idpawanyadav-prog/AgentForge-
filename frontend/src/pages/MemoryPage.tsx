@@ -50,7 +50,7 @@ export default function MemoryPage() {
   const { data: allSkills } = useAsyncData<any[]>(() => get('/api/v1/skills'), []);
   const [search, setSearch] = React.useState('');
   const [selectedRole, setSelectedRole] = React.useState<string | null>(null);
-  const [tab, setTab] = React.useState<'instructions' | 'skills'>('instructions');
+  const [tab, setTab] = React.useState<'instructions' | 'skills' | 'persona'>('instructions');
   const [modal, setModal] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const fail = (e: any) => setError(e.message || String(e));
@@ -65,6 +65,8 @@ export default function MemoryPage() {
   const filtered = (roles ?? []).filter((r) => r.name.toLowerCase().includes(search.toLowerCase()));
   const [selectedInstr, setSelectedInstr] = React.useState<string | null>(null);
   React.useEffect(() => { setSelectedInstr(null); }, [selectedRole]);
+  const [selectedPersona, setSelectedPersona] = React.useState<string | null>(null);
+  React.useEffect(() => { setSelectedPersona(null); }, [selectedRole]);
 
   return (
     <div className="page">
@@ -94,7 +96,7 @@ export default function MemoryPage() {
                 <div className="group-icon">{iconFor(r.name)}</div>
                 <div style={{ minWidth: 0 }}>
                   <div className="group-name">{r.name}</div>
-                  <div className="kv">{r.instruction_count} instructions · {r.skill_count} skills</div>
+                  <div className="kv">{r.instruction_count} instr · {r.skill_count} skills · {r.persona_count ?? 0} personas</div>
                 </div>
                 {!r.active && <span style={{ marginLeft: 'auto' }}><Badge kind="dim">off</Badge></span>}
               </div>
@@ -124,13 +126,16 @@ export default function MemoryPage() {
             <div className="subtabs">
               <button className={`subtab ${tab === 'instructions' ? 'active' : ''}`} onClick={() => setTab('instructions')}>📋 Instructions</button>
               <button className={`subtab ${tab === 'skills' ? 'active' : ''}`} onClick={() => setTab('skills')}>⛁ Skills</button>
+              <button className={`subtab ${tab === 'persona' ? 'active' : ''}`} onClick={() => setTab('persona')}>🎭 Persona</button>
             </div>
 
             {tab === 'instructions' ? (
               <InstructionsPanel roleId={role.id} selected={selectedInstr} onSelect={setSelectedInstr}
                 onError={fail} onOpenModal={setModal} />
-            ) : (
+            ) : tab === 'skills' ? (
               <SkillsPanel roleId={role.id} allSkills={allSkills ?? []} onError={fail} onChanged={reloadRoles} />
+            ) : (
+              <PersonaPanel roleId={role.id} onError={fail} onOpenModal={setModal} />
             )}
 
             <div className="assign-section">
@@ -158,8 +163,13 @@ export default function MemoryPage() {
           <div className="mem-card col-main"><div className="empty">Select or create a role group.</div></div>
         )}
 
-        {/* ---------------- right: instruction editor ---------------- */}
-        <EditorPanel roleId={selectedRole} selectedId={selectedInstr} onSelect={setSelectedInstr} onError={fail} />
+        {/* ---------------- right: instruction / persona editor ---------------- */}
+        {tab === 'persona' ? (
+          <PersonaEditor roleId={selectedRole} personaId={selectedPersona} onSelect={setSelectedPersona}
+            onError={fail} reloadRoles={reloadRoles} />
+        ) : (
+          <EditorPanel roleId={selectedRole} selectedId={selectedInstr} onSelect={setSelectedInstr} onError={fail} />
+        )}
       </div>
 
       {modal === 'newRole' && (
@@ -171,6 +181,10 @@ export default function MemoryPage() {
       {modal === 'newInstruction' && role && (
         <InstructionForm roleId={role.id} onClose={() => setModal(null)}
           onSaved={async (id: string) => { setModal(null); setSelectedInstr(id); }} />
+      )}
+      {modal === 'newPersona' && role && (
+        <NewPersonaModal roleId={role.id} onClose={() => setModal(null)}
+          onSaved={async (id: string) => { setModal(null); setSelectedPersona(id); reloadRoles(); }} onError={fail} />
       )}
       {modal === 'assignAgent' && role && (
         <AssignAgentModal role={role} agents={agents ?? []} onClose={() => setModal(null)}
@@ -376,6 +390,128 @@ function AssignAgentModal({ role, agents, onClose, onSaved, onError }: any) {
         } catch (e: any) { onError(e); }
       }}>Assign Agent</button>
       {!candidates.length && <div className="kv" style={{ marginTop: 10 }}>All agents already use this role.</div>}
+    </Modal>
+  );
+}
+
+function PersonaPanel({ roleId, selected, onSelect, onError, onOpenModal }:
+  { roleId: string; selected: string | null; onSelect: (id: string) => void; onError: (e: any) => void; onOpenModal: (m: string) => void }) {
+  const { data: personas, reload } = useAsyncData<any[]>(() => get(`/api/v1/personas?role_id=${roleId}`), [roleId]);
+  React.useEffect(() => {
+    if (!selected && personas?.length) onSelect(personas[0].id);
+  }, [personas, selected]);
+  return (
+    <>
+      <div className="spread" style={{ marginBottom: 10 }}>
+        <div>
+          <div className="mem-card-title" style={{ margin: 0 }}>Personas</div>
+          <div className="muted small">System prompt + constraints for agents with this role. Editing bumps the version.</div>
+        </div>
+        <button className="btn small primary" onClick={() => onOpenModal('newPersona')}>+ New Persona</button>
+      </div>
+      <div className="instr-list">
+        {(personas ?? []).map((p) => (
+          <div key={p.id} className={`instr-item ${selected === p.id ? 'active' : ''}`} onClick={() => onSelect(p.id)}>
+            <div className="group-icon">🎭</div>
+            <div className="grow" style={{ minWidth: 0 }}>
+              <div className="group-name">{p.name}</div>
+              <div className="kv">{p.description || 'No description'}</div>
+            </div>
+            <Badge kind="dim">v{p.version}</Badge>
+            <button className="btn small danger" onClick={async (e) => {
+              e.stopPropagation();
+              if (!confirm(`Delete persona "${p.name}"?`)) return;
+              try { await del(`/api/v1/personas/${p.id}`); if (selected === p.id) onSelect(''); reload(); } catch (err: any) { onError(err); }
+            }}>⋮</button>
+          </div>
+        ))}
+        {!personas?.length && <div className="empty">No personas yet. Create the first one.</div>}
+      </div>
+    </>
+  );
+}
+
+function PersonaEditor({ roleId, personaId, onSelect, onError, reloadRoles }:
+  { roleId: string | null; personaId: string | null; onSelect: (id: string) => void; onError: (e: any) => void; reloadRoles: () => void }) {
+  const { data: personas } = useAsyncData<any[]>(
+    () => (roleId ? get(`/api/v1/personas?role_id=${roleId}`) : Promise.resolve([])), [roleId, personaId]);
+  const persona = personas?.find((p) => p.id === personaId) ?? null;
+  const [f, setF] = React.useState({ name: '', description: '', instructions: '', constraints_text: '' });
+  const [saving, setSaving] = React.useState(false);
+  const [savedTick, setSavedTick] = React.useState(0);
+
+  React.useEffect(() => {
+    if (persona) setF({ name: persona.name, description: persona.description ?? '',
+      instructions: persona.instructions ?? '', constraints_text: persona.constraints_text ?? '' });
+  }, [persona?.id, persona?.version]);
+
+  if (!roleId) return null;
+  if (!persona) {
+    return <div className="mem-card col-editor"><div className="empty">Select a persona to view or edit it.</div></div>;
+  }
+  const dirty = f.name !== persona.name || f.description !== persona.description ||
+    f.instructions !== persona.instructions || f.constraints_text !== persona.constraints_text;
+  return (
+    <div className="mem-card col-editor">
+      <div className="spread">
+        <div className="row" style={{ gap: 8 }}>
+          <span className="group-icon">🎭</span>
+          <b>{persona.name}</b>
+          <Badge kind="dim">v{persona.version}</Badge>
+          {savedTick > 0 && <Badge kind="ok">Saved v{savedTick}</Badge>}
+        </div>
+      </div>
+      <div className="persona-editor-fields">
+        <Field label="Persona name"><input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></Field>
+        <Field label="Description"><input value={f.description} onChange={(e) => setF({ ...f, description: e.target.value })} /></Field>
+        <Field label="Instructions (system prompt)">
+          <CodeEditor value={f.instructions} onChange={(v) => setF({ ...f, instructions: v })} />
+        </Field>
+        <Field label="Constraints (one per line)">
+          <textarea style={{ minHeight: 80 }} value={f.constraints_text}
+            onChange={(e) => setF({ ...f, constraints_text: e.target.value })} />
+        </Field>
+      </div>
+      <div className="btn-row" style={{ marginTop: 10 }}>
+        <button className="btn primary" disabled={!dirty || saving || !f.name} onClick={async () => {
+          setSaving(true);
+          try {
+            const updated = await patch(`/api/v1/personas/${persona.id}`, f);
+            setSavedTick(updated.version);
+            reloadRoles();
+          } catch (e: any) { onError(e); }
+          finally { setSaving(false); }
+        }}>{saving ? 'Saving…' : dirty ? 'Save (bumps version)' : 'Saved'}</button>
+        <button className="btn danger" onClick={async () => {
+          if (!confirm(`Delete persona "${persona.name}"?`)) return;
+          try { await del(`/api/v1/personas/${persona.id}`); onSelect(''); reloadRoles(); } catch (e: any) { onError(e); }
+        }}>Delete</button>
+      </div>
+    </div>
+  );
+}
+
+function NewPersonaModal({ roleId, onClose, onSaved, onError }: any) {
+  const [f, setF] = React.useState({ name: '', description: '', instructions: '', constraints_text: '' });
+  return (
+    <Modal title="New Persona" onClose={onClose}>
+      <Field label="Persona name"><input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></Field>
+      <Field label="Description"><input value={f.description} onChange={(e) => setF({ ...f, description: e.target.value })} /></Field>
+      <Field label="Instructions (system prompt)">
+        <textarea style={{ minHeight: 140 }} value={f.instructions}
+          onChange={(e) => setF({ ...f, instructions: e.target.value })}
+          placeholder="You are a …" />
+      </Field>
+      <Field label="Constraints (one per line)">
+        <textarea style={{ minHeight: 70 }} value={f.constraints_text}
+          onChange={(e) => setF({ ...f, constraints_text: e.target.value })} />
+      </Field>
+      <button className="btn primary" disabled={!f.name} onClick={async () => {
+        try {
+          const created = await post(`/api/v1/roles/${roleId}/personas`, f);
+          onSaved(created.id);
+        } catch (e: any) { onError(e); }
+      }}>Create Persona</button>
     </Modal>
   );
 }
