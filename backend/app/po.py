@@ -13,6 +13,7 @@ disabling the toggle hands control back and leaves every open task untouched.
 """
 import json
 import os
+import threading
 
 from . import db, workspace, runtime
 from .db import audit, emit_event, execute, insert, new_id, now, query, query_one, update
@@ -101,15 +102,12 @@ def set_po_enabled(project_id: str, enabled: bool) -> dict:
                           f"say `hire product owner` in the control chat.")}
     update("projects", project_id, {"po_enabled": 1 if enabled else 0, "updated_at": now()})
     if enabled:
-        emit_event(project_id, "po.enabled",
-                   {"agent": agent["name"],
-                    "note": (f"{agent['name']} ({PO_ROLE}) now acts with full authority on the "
-                             "owner's behalf. Disable the toggle to take back control.")})
         audit("po_enabled", "project", project_id,
               f"Product Owner agent '{agent['name']}' enabled for project '{project['name']}'",
               actor="product-owner")
         # Full autonomy: make sure delivery is actually running.
         started = None
+        start_error = None
         if project_id not in runtime._schedulers:
             active = query_one(
                 "SELECT id FROM sprints WHERE project_id = ? AND status IN ('Active','Planned')",
@@ -117,7 +115,31 @@ def set_po_enabled(project_id: str, enabled: bool) -> dict:
             if active:
                 result = runtime.start_sprint_execution(project_id)
                 started = result.get("sprint") if result.get("ok") else None
-        return {"ok": True, "enabled": True, "agent": agent["name"], "sprint_started": started}
+                start_error = result.get("error")
+        if started:
+            note = (f"{agent['name']} ({PO_ROLE}) now acts with full authority on the owner's behalf. "
+                    f"Sprint '{started}' is running under PO control. An initial project review is next.")
+        elif start_error:
+            note = (f"{agent['name']} ({PO_ROLE}) now acts with full authority on the owner's behalf. "
+                    f"Sprint could not start ({start_error}) — the PO is reviewing the project now "
+                    "to plan next steps.")
+        else:
+            note = (f"{agent['name']} ({PO_ROLE}) now acts with full authority on the owner's behalf. "
+                    "An initial project review is running now.")
+        emit_event(project_id, "po.enabled", {"agent": agent["name"], "note": note})
+        # Immediate autonomous review so enabling always produces visible
+        # activity — the PO may unblock items, re-plan, or start a next sprint.
+        threading.Thread(
+            target=po_autonomy_tick, args=(project_id,),
+            kwargs={"instruction": (
+                "You have just been given full authority over this project. Do an initial Product "
+                "Owner review: if the current sprint cannot start or has no open tasks, plan and "
+                "start the next sprint from the backlog; otherwise keep the current plan moving. "
+                "Take no action if the requirements are met and no work remains."),
+                    "emit_no_model": True},
+            daemon=True).start()
+        return {"ok": True, "enabled": True, "agent": agent["name"], "sprint_started": started,
+                "start_error": start_error}
     emit_event(project_id, "po.disabled",
                {"note": "Product Owner authority disabled — control returns to the owner. "
                         "All open tasks remain as they are."})
@@ -499,22 +521,27 @@ def handle_po_message(project_id: str, text: str, attachments=None) -> dict:
 
 # ---------------------------------------------------------------- autonomous review tick
 
-def po_autonomy_tick(project_id: str) -> str | None:
+def po_autonomy_tick(project_id: str, instruction: str | None = None,
+                     emit_no_model: bool = False) -> str | None:
     """One autonomous Product Owner review pass. Called from the sprint loop
-    while po_enabled: the PO reviews current state and acts. Returns a short
-    summary of what changed (None when the PO could not run)."""
+    and right after enabling: the PO reviews current state and acts. Returns
+    a short summary of what changed (None when the PO could not run)."""
     if not po_enabled(project_id):
         return None
+    ask = instruction or (
+        "Do a Product Owner review pass: examine requirements, sprints and tasks "
+        "(especially blocked or unassigned items) and take any actions needed to "
+        "keep the project moving to completion.")
     try:
-        parsed = _ask_po(project_id,
-                         "Do a Product Owner review pass: examine requirements, sprints and tasks "
-                         "(especially blocked or unassigned items) and take any actions needed to "
-                         "keep the project moving to completion.")
+        parsed = _ask_po(project_id, ask)
     except Exception as exc:
-        emit_event(project_id, "po.review", {"ok": False, "error": str(exc)[:200]})
+        emit_event(project_id, "po.review", {"ok": False, "error": str(exc)[:300]})
         return None
     if not parsed:
-        emit_event(project_id, "po.review", {"ok": False, "error": "PO model returned no valid plan"})
+        if emit_no_model:
+            emit_event(project_id, "po.review",
+                       {"ok": False, "error": "PO model returned no valid plan "
+                                              "(check gateway key / usage quota under Settings)"})
         return None
     actions = _apply_actions(project_id, parsed.get("actions"))
     summary = str(parsed.get("reply") or "").strip()

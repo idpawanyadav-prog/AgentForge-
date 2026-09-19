@@ -577,6 +577,20 @@ async def _run_sprint(project_id: str, ctrl: dict):
             if remaining == 0:
                 _emit(project_id, "project.updated",
                       {"note": "Sprint execution complete", "remaining_tasks": 0})
+                if po.po_enabled(project_id):
+                    # Continuous delivery: hand control straight back to the
+                    # Product Owner to plan/start the next sprint from the
+                    # backlog instead of halting for a human.
+                    async def _po_next_sprint():
+                        try:
+                            await asyncio.to_thread(
+                                po.po_autonomy_tick, project_id,
+                                "The sprint just completed. If backlog items or requirements "
+                                "remain, plan and start the next sprint; if the project is done, "
+                                "take no action and summarize completion.")
+                        except Exception:
+                            pass
+                    _spawn(_po_next_sprint())
                 break
             # Nothing runnable right now: tasks may exist unassigned (newly
             # drafted or freed by a state change). Re-attempt role-based

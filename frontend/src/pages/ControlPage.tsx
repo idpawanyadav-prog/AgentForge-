@@ -58,6 +58,14 @@ function eventText(e: EventRow): string {
     case 'usage.recorded': return `Usage: ${p.input_tokens + p.output_tokens} tokens, $${p.cost_usd}`;
     case 'project.updated': return p.note || 'Project updated';
     case 'chat.message': return p.text || 'Chat message';
+    case 'po.enabled': return `👑 ${p.note || `Product Owner ${p.agent || ''} enabled`}`;
+    case 'po.disabled': return `Product Owner authority disabled — control returned to you`;
+    case 'po.review': return p.ok
+      ? `👑 PO review: ${p.summary || 'no changes needed'}${p.actions?.length ? ` (${p.actions.length} action(s))` : ''}`
+      : `👑 PO review failed: ${p.error || 'model unavailable'}`;
+    case 'po.action': return `👑 PO: ${p.action}${p.task ? ` — ${p.task}` : ''}${p.agent ? ` → ${p.agent}` : ''}${p.count ? ` (${p.count})` : ''}`;
+    case 'sprint.tasks_drafted': return `Auto-drafted ${p.tasks?.length ?? 0} task(s) for "${p.sprint}"`;
+    case 'sprint.activated': return `Sprint "${p.sprint}" activated`;
     default: return e.event_type;
   }
 }
