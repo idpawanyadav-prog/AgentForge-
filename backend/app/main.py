@@ -1118,11 +1118,26 @@ async def po_chat(pid: str, body: PoChatIn):
 
 
 @app.get("/api/v1/projects/{pid}/events")
-def project_events(pid: str, after: int = Query(0, ge=0), limit: int = Query(200, ge=1, le=1000)):
-    events = query("SELECT * FROM execution_events WHERE project_id=? AND seq > ? ORDER BY seq LIMIT ?",
-                   (pid, after, limit))
+def project_events(pid: str, after: int = Query(0, ge=0), limit: int = Query(200, ge=1, le=1000),
+                   before: int = Query(0, ge=0), latest: int = Query(0, ge=0, le=1000)):
+    if latest:
+        # Newest page, newest first (desc) — for the Activity feed initial load.
+        events = query("SELECT * FROM execution_events WHERE project_id=? ORDER BY seq DESC LIMIT ?",
+                       (pid, latest))
+    elif before:
+        # One older page (events with seq < before), newest-first within the page.
+        events = query("SELECT * FROM execution_events WHERE project_id=? AND seq < ? ORDER BY seq DESC LIMIT ?",
+                       (pid, before, limit))
+    else:
+        # Incremental forward poll (existing behavior).
+        events = query("SELECT * FROM execution_events WHERE project_id=? AND seq > ? ORDER BY seq LIMIT ?",
+                       (pid, after, limit))
     for e in events:
         e["payload"] = json.loads(e["payload"])
+    if latest or before:
+        page = latest or limit
+        return {"events": events, "last_seq": events[0]["seq"] if events else after,
+                "exhausted": len(events) < page}
     last = events[-1]["seq"] if events else after
     return {"events": events, "last_seq": last}
 

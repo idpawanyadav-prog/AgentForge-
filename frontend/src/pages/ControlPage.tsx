@@ -87,9 +87,10 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
   // Chat windowing: show only the most recent messages; older ones load in
   // batches of 12 via the "Load previous chat history" button.
   const [visibleMsgs, setVisibleMsgs] = React.useState(12);
-  // Activity windowing: show the most recent 15 events; older ones load in
-  // batches of 15 via the "Load earlier activity" button.
-  const [visibleEvents, setVisibleEvents] = React.useState(15);
+  // Activity windowing: server-paged — fetch the latest 15 events (desc),
+  // then page older history 15 at a time via the "Load earlier activity" button.
+  const [eventsExhausted, setEventsExhausted] = React.useState(false);
+  const [loadingOlder, setLoadingOlder] = React.useState(false);
   const [tab, setTab] = React.useState<'team' | 'activity' | 'tasks'>(() => {
     const saved = loadUi('ao.tab', 'team');
     return saved === 'activity' || saved === 'tasks' ? saved : 'team';
@@ -141,7 +142,6 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
     setPending(null);
   }, []);
 
-  React.useEffect(() => { setVisibleEvents(15); }, [activeProject]);
   React.useEffect(() => { if (activeConv) loadMessages(activeConv); }, [activeConv, loadMessages]);
   React.useEffect(() => { msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
@@ -157,6 +157,17 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
     return () => clearInterval(t);
   }, [activeConv, poMode]);
 
+  // Initial Activity load: ONLY the latest 15 events, newest first (server-side).
+  React.useEffect(() => {
+    if (!activeProject) return;
+    setEventsExhausted(false);
+    get(`/api/v1/projects/${activeProject}/events?latest=15`).then((r: any) => {
+      lastSeqRef.current = r.last_seq ?? 0;
+      setLiveEvents(r.events ?? []);
+      setEventsExhausted(!!r.exhausted);
+    }).catch(() => undefined);
+  }, [activeProject]);
+
   // Live polling: summary (team state), incremental event stream, selected sprint tasks.
   React.useEffect(() => {
     if (!activeProject) return;
@@ -169,22 +180,19 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
         const s: Summary = await get(`/api/v1/projects/${activeProject}/control/summary`);
         if (!alive) return;
         setSummary(s);
-        setLiveEvents((prev) => {
-          if (!prev.length) {
-            lastSeqRef.current = Math.max(lastSeqRef.current, s.events.length ? s.events[s.events.length - 1].seq : 0);
-            return s.events;
+        // Events: incremental forward poll once the initial latest-15 page is in
+        // (lastSeqRef > 0); new events are prepended so the list stays desc.
+        if (lastSeqRef.current > 0) {
+          const evs: any = await get(`/api/v1/projects/${activeProject}/events?after=${lastSeqRef.current}`);
+          if (!alive) return;
+          if (evs.events?.length) {
+            lastSeqRef.current = evs.last_seq;
+            setLiveEvents((prev) => {
+              const known = new Set(prev.map((e) => e.seq));
+              const fresh = (evs.events as EventRow[]).filter((e) => !known.has(e.seq));
+              return [...fresh.reverse(), ...prev];
+            });
           }
-          return prev;
-        });
-        const evs: any = await get(`/api/v1/projects/${activeProject}/events?after=${lastSeqRef.current}`);
-        if (!alive) return;
-        if (evs.events?.length) {
-          lastSeqRef.current = evs.last_seq;
-          setLiveEvents((prev) => {
-            const known = new Set(prev.map((e) => e.seq));
-            const fresh = (evs.events as EventRow[]).filter((e) => !known.has(e.seq));
-            return [...prev, ...fresh].slice(-80);
-          });
         }
       } catch { /* transient */ }
       finally { busy = false; }
@@ -193,6 +201,18 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
     const timer = setInterval(poll, 1200);
     return () => { alive = false; clearInterval(timer); };
   }, [activeProject]);
+
+  const loadOlderEvents = async () => {
+    if (!activeProject || !liveEvents.length || loadingOlder || eventsExhausted) return;
+    setLoadingOlder(true);
+    try {
+      const oldest = liveEvents[liveEvents.length - 1].seq;
+      const r: any = await get(`/api/v1/projects/${activeProject}/events?before=${oldest}&limit=15`);
+      setLiveEvents((prev) => [...prev, ...(r.events ?? [])]);
+      if (typeof r.exhausted === 'boolean') setEventsExhausted(r.exhausted);
+    } catch { /* transient */ }
+    finally { setLoadingOlder(false); }
+  };
 
   // Sprints list + default selection. Auto-follows the ACTIVE sprint (e.g.
   // when the Product Owner activates a new one) unless the user manually
@@ -534,7 +554,7 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
                   <div className="small muted" style={{ marginBottom: 8 }}>
                     <span className={`live-dot ${s?.scheduler_running || running > 0 ? '' : 'idle'}`} /> Live event stream
                   </div>
-                  {[...liveEvents].sort((a, b) => b.seq - a.seq).slice(0, visibleEvents).map((e) => (
+                  {liveEvents.map((e) => (
                     <div key={e.seq} className="event-item">
                       <span className={`event-dot ${eventColor(e.event_type)}`} />
                       <div>
@@ -545,12 +565,13 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
                       <span className="event-time">{fmtTime(e.created_at)}</span>
                     </div>
                   ))}
-                  {liveEvents.length > visibleEvents && (
+                  {!eventsExhausted && liveEvents.length > 0 && (
                     <button
                       className="btn small"
                       style={{ alignSelf: 'center', margin: '8px 0 2px' }}
-                      onClick={() => setVisibleEvents((n) => n + 15)}>
-                      ↓ Load earlier activity ({liveEvents.length - visibleEvents} older)
+                      disabled={loadingOlder}
+                      onClick={loadOlderEvents}>
+                      {loadingOlder ? 'Loading…' : '↓ Load earlier activity'}
                     </button>
                   )}
                   {!liveEvents.length && <div className="empty">No activity yet. Start a task to see live events.</div>}
