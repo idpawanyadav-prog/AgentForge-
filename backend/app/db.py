@@ -423,17 +423,27 @@ PROVIDER_CATALOGS: dict[str, list[tuple[str, str, str]]] = {
 }
 
 
-def sync_gateway_models(gateway_id: str) -> int:
-    """Fetch the provider's available models into the gateway catalog.
+def sync_gateway_models(gateway_id: str) -> dict:
+    """Make the gateway's model catalog match the provider's available models.
 
-    Idempotent: existing provider_model_ids are left untouched, new ones are
-    registered. Returns the number of models added.
+    The provider catalog is authoritative: models from other providers that
+    ended up in the catalog (e.g. via manual registration or an older sync)
+    are removed along with any model bindings pointing at them. Returns
+    {"added": n, "removed": m}.
     """
     gw = query_one("SELECT provider FROM gateways WHERE id=?", (gateway_id,))
     if not gw:
-        return 0
+        return {"added": 0, "removed": 0}
     catalog = PROVIDER_CATALOGS.get(gw["provider"], PROVIDER_CATALOGS["custom"])
-    added = 0
+    keep = {pid for pid, _, _ in catalog}
+    added, removed = 0, 0
+
+    for row in query("SELECT id, provider_model_id FROM gateway_models WHERE gateway_id=?", (gateway_id,)):
+        if row["provider_model_id"] not in keep:
+            execute("DELETE FROM model_bindings WHERE model_id=?", (row["id"],))
+            execute("DELETE FROM gateway_models WHERE id=?", (row["id"],))
+            removed += 1
+
     for provider_model_id, display_name, capabilities in catalog:
         exists = query_one(
             "SELECT id FROM gateway_models WHERE gateway_id=? AND provider_model_id=?",
@@ -445,7 +455,7 @@ def sync_gateway_models(gateway_id: str) -> int:
                 "display_name": display_name, "capabilities": capabilities, "active": 1,
             })
             added += 1
-    return added
+    return {"added": added, "removed": removed}
 
 
 SCENARIO = """

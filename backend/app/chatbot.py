@@ -123,14 +123,16 @@ def _execute_command(project_id, command, args) -> str:
         gw = query_one("SELECT * FROM gateways WHERE lower(name)=lower(?)", (args["name"],))
         if not gw:
             return f"Gateway **{args['name']}** not found."
-        added = db.sync_gateway_models(gw["id"])
+        sync = db.sync_gateway_models(gw["id"])
         total = query_one("SELECT COUNT(*) AS n FROM gateway_models WHERE gateway_id=?", (gw["id"],))["n"]
         update("gateways", gw["id"], {"last_tested_at": ts, "test_status": "Success",
                                       "test_diagnostic": "Connection OK (simulated probe)",
                                       "updated_at": ts})
-        audit("test_gateway", "gateway", gw["id"], f"Tested gateway '{gw['name']}'; {added} models synced")
+        audit("test_gateway", "gateway", gw["id"],
+              f"Tested gateway '{gw['name']}'; catalog +{sync['added']}/-{sync['removed']}")
         return (f"Gateway **{gw['name']}**: connection test succeeded. "
-                f"Auto-fetched {added} new model(s) — catalog now has {total} models. Credential remains masked.")
+                f"Catalog synced (+{sync['added']} added, {sync['removed']} removed) — now {total} models. "
+                "Credential remains masked.")
 
     if command == "create_role":
         if _find_role(args["name"]):

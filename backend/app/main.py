@@ -192,10 +192,10 @@ def create_gateway(body: GatewayIn):
         "status": "Active", "key_mask": _mask(body.api_key) if body.api_key else None,
         "created_at": ts, "updated_at": ts,
     })
-    added = db.sync_gateway_models(gid)
+    sync = db.sync_gateway_models(gid)
     audit("create_gateway", "gateway", gid,
-          f"Created gateway '{body.name}'; auto-fetched {added} models")
-    return {**query_one("SELECT * FROM gateways WHERE id = ?", (gid,)), "models_fetched": added}
+          f"Created gateway '{body.name}'; auto-fetched {sync['added']} models")
+    return {**query_one("SELECT * FROM gateways WHERE id = ?", (gid,)), "models_fetched": sync["added"]}
 
 
 @app.patch("/api/v1/gateways/{gid}")
@@ -208,7 +208,8 @@ def update_gateway(gid: str, body: dict):
     update("gateways", gid, allowed)
     models_fetched = 0
     if "provider" in allowed:
-        models_fetched = db.sync_gateway_models(gid)
+        sync = db.sync_gateway_models(gid)
+        models_fetched = sync["added"]
     audit("update_gateway", "gateway", gid, f"Updated gateway fields: {', '.join(allowed)}")
     return {**query_one("SELECT * FROM gateways WHERE id = ?", (gid,)), "models_fetched": models_fetched}
 
@@ -231,11 +232,14 @@ def test_gateway(gid: str):
     diag = ("Connection OK (simulated probe): TLS handshake and auth schema accepted"
             if ok else "Invalid Base URL scheme; expected http(s)")
     update("gateways", gid, {"last_tested_at": ts, "test_status": result, "test_diagnostic": diag})
-    models_fetched = 0
+    models_fetched, models_removed = 0, 0
     if ok:
-        models_fetched = db.sync_gateway_models(gid)
-    audit("test_gateway", "gateway", gid, f"Gateway test: {result}; {models_fetched} models synced")
-    return {"status": result, "diagnostic": diag, "tested_at": ts, "models_fetched": models_fetched}
+        sync = db.sync_gateway_models(gid)
+        models_fetched, models_removed = sync["added"], sync["removed"]
+    audit("test_gateway", "gateway", gid,
+          f"Gateway test: {result}; catalog +{models_fetched}/-{models_removed}")
+    return {"status": result, "diagnostic": diag, "tested_at": ts,
+            "models_fetched": models_fetched, "models_removed": models_removed}
 
 
 @app.get("/api/v1/gateways/{gid}/models")
@@ -260,12 +264,53 @@ def delete_model(gid: str, mid: str):
     return {"ok": True}
 
 
+class TestChatIn(BaseModel):
+    model_id: str
+    message: str
+
+
+@app.post("/api/v1/gateways/{gid}/test-chat")
+async def gateway_test_chat(gid: str, body: TestChatIn):
+    """Simulated single-turn inference against a gateway model (playground)."""
+    gw = _or_404(query_one("SELECT * FROM gateways WHERE id=?", (gid,)), "Gateway")
+    model = query_one("SELECT * FROM gateway_models WHERE id=? AND gateway_id=?",
+                      (body.model_id, gid))
+    if not model:
+        raise HTTPException(404, "Model not found on this gateway")
+    import asyncio as _aio
+    import random as _rand
+
+    def _run():
+        latency_ms = _rand.randint(350, 1600)
+        in_tokens = max(8, len(body.message.split()) + 6)
+        caps = set(filter(None, model["capabilities"].split(",")))
+        kind = ("image model" if "image" in caps else
+                "embedding model (returns a 1536-dim vector)" if "embedding" in caps else
+                "audio model (returns a transcript)" if "audio" in caps else
+                "chat model")
+        reply = (
+            f"**{model['display_name']}** (`{model['provider_model_id']}`) via **{gw['name']}** "
+            f"responds to: \"{body.message[:120]}\"\n\n"
+            f"This is a simulated {kind} response — the gateway handshake, model resolution and "
+            f"usage metering pipeline all executed. In production this call would stream live tokens "
+            f"from `{gw['base_url']}`.")
+        out_tokens = max(20, len(reply.split()) + 10)
+        return reply, latency_ms, in_tokens, out_tokens
+
+    reply, latency_ms, in_tokens, out_tokens = await _aio.get_running_loop().run_in_executor(None, _run)
+    audit("test_chat", "gateway", gid,
+          f"Playground chat with {model['provider_model_id']} ({in_tokens}+{out_tokens} tokens)")
+    return {"reply": reply, "model": model["provider_model_id"],
+            "gateway": gw["name"], "latency_ms": latency_ms,
+            "input_tokens": in_tokens, "output_tokens": out_tokens}
+
+
 @app.post("/api/v1/gateways/{gid}/discover")
 def discover_models(gid: str):
     _or_404(query_one("SELECT id FROM gateways WHERE id=?", (gid,)), "Gateway")
-    added = db.sync_gateway_models(gid)
+    sync = db.sync_gateway_models(gid)
     total = query_one("SELECT COUNT(*) AS n FROM gateway_models WHERE gateway_id=?", (gid,))["n"]
-    return {"discovered": added, "added": added, "total": total}
+    return {"added": sync["added"], "removed": sync["removed"], "total": total}
 
 
 # ------------------------------- agent memory -------------------------------

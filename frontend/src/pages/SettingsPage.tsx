@@ -1,5 +1,5 @@
 import React from 'react';
-import { get, post, patch, del, fmtDateTime } from '../api';
+import { get, post, patch, del, fmtDateTime, md } from '../api';
 import { Badge, Field, Modal, useAsyncData, ErrorNote } from '../components';
 
 export default function SettingsPage() {
@@ -19,6 +19,8 @@ export default function SettingsPage() {
         <button className="btn primary" onClick={() => setModal('newGateway')}>+ Add Gateway</button>
       </div>
       <ErrorNote error={error} />
+
+      <ModelPlayground gateways={gateways ?? []} onError={fail} />
 
       <div className="section-title">Gateways</div>
       {(gateways ?? []).map((g) => (
@@ -49,6 +51,79 @@ export default function SettingsPage() {
         <GatewayForm gateway={gateways?.find((g) => g.id === modal.slice(7))}
           onClose={() => setModal(null)} onSaved={() => { setModal(null); reload(); }} />
       )}
+    </div>
+  );
+}
+
+function ModelPlayground({ gateways, onError }: { gateways: any[]; onError: (e: any) => void }) {
+  const [gid, setGid] = React.useState('');
+  const [modelId, setModelId] = React.useState('');
+  const [messages, setMessages] = React.useState<{ role: string; content: string; meta?: string }[]>([
+    { role: 'assistant', content: 'Pick a gateway and a model, then send a message to verify the connection works end to end.' },
+  ]);
+  const [input, setInput] = React.useState('');
+  const [sending, setSending] = React.useState(false);
+  const { data: models } = useAsyncData<any[]>(
+    () => (gid ? get(`/api/v1/gateways/${gid}/models`) : Promise.resolve([])), [gid]);
+  const endRef = React.useRef<HTMLDivElement>(null);
+
+  React.useEffect(() => { if (!gid && gateways.length) setGid(gateways[0].id); }, [gateways, gid]);
+  React.useEffect(() => { setModelId(''); }, [gid]);
+  React.useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+
+  const gw = gateways.find((g) => g.id === gid);
+
+  const send = async () => {
+    const text = input.trim();
+    if (!text || !gid || !modelId || sending) return;
+    setSending(true); setInput('');
+    setMessages((m) => [...m, { role: 'user', content: text }]);
+    try {
+      const res = await post(`/api/v1/gateways/${gid}/test-chat`, { model_id: modelId, message: text });
+      setMessages((m) => [...m, {
+        role: 'assistant', content: res.reply,
+        meta: `${res.model} · ${res.latency_ms} ms · ${res.input_tokens}+${res.output_tokens} tokens`,
+      }]);
+    } catch (e: any) {
+      setMessages((m) => [...m, { role: 'assistant', content: `⚠ Test failed: ${e.message}` }]);
+    } finally { setSending(false); }
+  };
+
+  return (
+    <div className="card playground-card">
+      <div className="spread">
+        <div>
+          <h3 style={{ margin: 0 }}>🧪 Model Playground</h3>
+          <div className="muted small">Send a test message through any gateway model to verify connectivity and metering.</div>
+        </div>
+        <div className="row">
+          <select style={{ width: 190 }} value={gid} onChange={(e) => setGid(e.target.value)}>
+            {gateways.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+          </select>
+          <select style={{ width: 220 }} value={modelId} onChange={(e) => setModelId(e.target.value)} disabled={!gid}>
+            <option value="">— select model —</option>
+            {(models ?? []).map((m) => <option key={m.id} value={m.id}>{m.display_name} ({m.provider_model_id})</option>)}
+          </select>
+        </div>
+      </div>
+      <div className="playground-msgs">
+        {messages.map((m, i) => (
+          <div key={i} className={`msg ${m.role}`}>
+            <div dangerouslySetInnerHTML={{ __html: md(m.content) }} />
+            {m.meta && <div className="kv" style={{ marginTop: 6 }}>{m.meta}</div>}
+          </div>
+        ))}
+        {sending && <div className="msg assistant muted small">awaiting {gw?.name ?? 'gateway'} response…</div>}
+        <div ref={endRef} />
+      </div>
+      <div className="chat-input" style={{ borderTop: '1px solid var(--border)' }}>
+        <textarea value={input} placeholder={modelId ? 'Type a test message…' : 'Select a model first…'}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }} />
+        <button className="btn primary" disabled={!modelId || sending || !input.trim()} onClick={send}>
+          {sending ? '…' : 'Send'}
+        </button>
+      </div>
     </div>
   );
 }

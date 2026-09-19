@@ -242,6 +242,14 @@ textarea { resize: vertical; min-height: 70px; font-family: var(--mono); }
 .md-li { padding-left: 16px; }
 .md-gap { height: 8px; }
 
+/* ---------- model playground ---------- */
+.playground-card { margin-bottom: 18px; }
+.playground-msgs {
+  height: 240px; overflow-y: auto; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 8px;
+  margin: 12px 0 0; padding: 12px; display: flex; flex-direction: column; gap: 10px;
+}
+
 @media (max-width: 1250px) {
   .col-groups { width: 210px; }
 }
