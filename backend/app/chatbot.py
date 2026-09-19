@@ -334,6 +334,222 @@ INTENTS = [
 
 SENSITIVE = {"create_gateway", "create_agent", "create_team"}
 
+# Static quick replies for the deterministic (typed) command path.
+SUGGESTIONS = {
+    "status": ["Start sprint execution", "What are the agents doing?", "Create a sprint"],
+    "create_role": ["Create persona for this role", "Create agent with this role", "Status"],
+    "create_persona": ["Create agent with this persona", "Show agent memory", "Status"],
+    "create_skill": ["Attach skill to a role", "Create another skill", "Status"],
+    "create_agent": ["Build a team with this agent", "Status", "Create another agent"],
+    "create_team": ["Add backlog item", "Create sprint", "Status"],
+    "add_backlog_item": ["Create a sprint for these items", "Assign task to an agent", "Status"],
+    "create_sprint": ["Add backlog item", "Start sprint execution", "Status"],
+    "assign_task": ["Start task", "Start sprint execution", "Agent status"],
+    "start_task": ["Status", "Pause execution", "What are the agents doing?"],
+    "start_sprint": ["Status", "Pause execution", "Stop sprint execution"],
+    "stop_sprint": ["Status", "Retry last failed task", "Resume execution"],
+    "pause_execution": ["Resume execution", "Status", "Cancel execution"],
+    "resume_execution": ["Status", "Pause execution", "What are the agents doing?"],
+    "cancel_execution": ["Status", "Retry last failed task", "Create sprint"],
+    "retry_failed": ["Status", "Pause execution", "What are the agents doing?"],
+    "create_gateway": ["Test gateway", "Status", "Help"],
+    "test_gateway": ["Create agent", "Status", "Help"],
+}
+
+
+def _get_setting(key, default=""):
+    row = query_one("SELECT value FROM settings WHERE key = ?", (key,))
+    return row["value"] if row else default
+
+
+def _bot_config():
+    """Configured AI brain for the assistant: (gateway_row, model_row) or (None, None)."""
+    import json as _json
+    raw = _get_setting("control_bot", "")
+    if not raw:
+        return None, None
+    try:
+        cfg = _json.loads(raw)
+    except ValueError:
+        return None, None
+    gw = query_one("SELECT * FROM gateways WHERE id = ?", (cfg.get("gateway_id", ""),))
+    model = query_one("SELECT * FROM gateway_models WHERE id = ?", (cfg.get("model_id", ""),))
+    if not gw or not model:
+        return None, None
+    return gw, model
+
+
+def _agent_status_lines():
+    rows = query(
+        "SELECT a.name, a.lifecycle_state, a.current_activity, r.name AS role "
+        "FROM agents a LEFT JOIN roles r ON r.id = a.role_id ORDER BY a.name")
+    return [f"- {r['name']} ({r['role']}): {r['lifecycle_state']}"
+            + (f" — {r['current_activity']}" if r["current_activity"] else "") for r in rows]
+
+
+def _context_brief(project_id) -> str:
+    p = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    sprint = query_one("SELECT * FROM sprints WHERE project_id = ? AND status IN ('Active','Planned') "
+                       "ORDER BY created_at DESC LIMIT 1", (project_id,))
+    backlog = query("SELECT title, story_points, status FROM backlog_items WHERE project_id = ? "
+                    "ORDER BY created_at DESC LIMIT 10", (project_id,))
+    tasks = query("SELECT title, status, story_points AS points FROM tasks WHERE project_id = ? ORDER BY created_at DESC LIMIT 15",
+                  (project_id,))
+    teams = query("SELECT name, status FROM teams ORDER BY name")
+    lines = [f"Project: {p['name']} — {p['goal']}", f"Stack: {p['technology_stack']} | Status: {p['status']}"]
+    if sprint:
+        lines.append(f"Sprint: {sprint['name']} ({sprint['status']}, capacity {sprint['capacity']} pts)")
+    if tasks:
+        lines.append("Recent tasks: " + "; ".join(f"{t['title']} [{t['status']}]" for t in tasks))
+    if backlog:
+        lines.append("Backlog: " + "; ".join(f"{b['title']} ({b['story_points']} pts, {b['status']})" for b in backlog))
+    if teams:
+        lines.append("Teams: " + ", ".join(f"{t['name']} [{t['status']}]" for t in teams))
+    lines.append("Agents:")
+    lines.extend(_agent_status_lines() or ["- (none yet)"])
+    return "\n".join(lines)
+
+
+AI_SYSTEM_PROMPT = """You are the Project Control copilot of "Agent Office", an app that runs a simulated \
+multi-agent software team. You convert the user's natural language into AT MOST ONE typed command per turn.
+
+Available commands (name: args):
+- create_gateway: {name, provider, base_url, api_key?}
+- test_gateway: {name}
+- create_role: {name}
+- create_persona: {name, role}
+- create_skill: {name}
+- create_agent: {name, role, persona?}
+- create_team: {name, agents: ["agent name", ...]}
+- add_backlog_item: {title, points?, priority?}
+- create_sprint: {name, goal?, capacity?}
+- assign_task: {task, agent}
+- start_task: {task}
+- start_sprint: {}
+- stop_sprint: {}
+- pause_execution: {}
+- resume_execution: {}
+- cancel_execution: {}
+- retry_failed: {}
+
+Rules:
+- Pick a command only when the user clearly wants that action; otherwise set command to null and just answer.
+- Reference agents, tasks and sprints by the exact names in the context below.
+- If the user asks about status or progress, set command to null and summarize from the context.
+- reply: short, friendly, concrete. suggestions: exactly 3 short follow-up messages the user might send next.
+
+Respond with ONLY a JSON object, no markdown fences:
+{"reply": "...", "command": {"name": "...", "args": {...}} or null, "suggestions": ["...", "...", "..."]}
+
+Current context:
+"""
+
+
+def _extract_json(text: str):
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```(?:json)?\s*", "", t)
+        t = re.sub(r"\s*```$", "", t)
+    start, end = t.find("{"), t.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(t[start:end + 1])
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _call_llm(gw, model, system_prompt: str, user_text: str) -> str:
+    """Live inference call to the configured gateway/model. Returns raw text."""
+    import urllib.error as _uerr
+    import urllib.request as _ureq
+
+    api_key = db.get_gateway_key(gw["id"])
+    if not api_key:
+        raise RuntimeError("No API key stored for the configured gateway. "
+                           "Open Settings, edit the gateway card and paste its key.")
+    base = gw["base_url"].rstrip("/")
+    is_anthropic = gw["api_type"] == "anthropic-messages"
+    if is_anthropic:
+        if base.endswith("/messages"):
+            url = base
+        elif base.endswith("/v1"):
+            url = base + "/messages"
+        else:
+            url = base + "/v1/messages"
+        payload = {"model": model["provider_model_id"], "max_tokens": 700,
+                   "system": system_prompt,
+                   "messages": [{"role": "user", "content": user_text}]}
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                   "Content-Type": "application/json"}
+    else:
+        if "/v1" not in base:
+            base += "/v1"
+        url = base + "/chat/completions"
+        payload = {"model": model["provider_model_id"], "max_tokens": 700,
+                   "messages": [{"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_text}]}
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    req = _ureq.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+    try:
+        with _ureq.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+    except _uerr.HTTPError as e:
+        raise RuntimeError(f"Gateway returned HTTP {e.code}: {e.read().decode(errors='replace')[:200]}")
+    except Exception as exc:
+        raise RuntimeError(f"Could not reach gateway: {exc}")
+    if is_anthropic:
+        return "\n".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+    return data["choices"][0]["message"]["content"]
+
+
+def _ai_route(project_id: str, conversation_id: str, text: str) -> dict:
+    """LLM-driven intent routing over the typed command engine."""
+    gw, model = _bot_config()
+    try:
+        raw = _call_llm(gw, model, AI_SYSTEM_PROMPT + _context_brief(project_id), text)
+        parsed = _extract_json(raw)
+        if not parsed or "reply" not in parsed:
+            raise RuntimeError("The model did not return a valid response.")
+    except RuntimeError as exc:
+        reply = (f"AI routing failed — falling back to typed commands. ({exc})\n\n"
+                 "Try `help` for the command catalog.")
+        _save_message(conversation_id, "assistant", reply)
+        return {"reply": reply, "suggestions": ["Status", "Help"]}
+
+    reply = parsed["reply"].strip()
+    suggestions = [str(s) for s in (parsed.get("suggestions") or [])][:3]
+    command = parsed.get("command") or None
+    result = {"reply": reply, "suggestions": suggestions or ["Status", "Help"]}
+
+    if command and isinstance(command, dict) and command.get("name"):
+        name = str(command["name"]).strip()
+        args = command.get("args") or {}
+        if not isinstance(args, dict):
+            args = {}
+        if name in ("create_team",):
+            args.setdefault("agents", [])
+            if isinstance(args["agents"], str):
+                args["agents"] = [a.strip() for a in args["agents"].split(",") if a.strip()]
+        if name in SENSITIVE:
+            pid = _queue_pending(conversation_id, name, args, name)
+            reply = (f"{reply}\n\n**Confirmation required** to run `{name}` with:\n"
+                     + "\n".join(f"- **{k}**: {v}" for k, v in args.items() if k != "api_key")
+                     + "\n\nReply `confirm` to execute or `cancel that` to discard.")
+            result.update({"reply": reply, "needs_confirmation": True,
+                           "pending_command": pid, "proposal": args})
+            _save_message(conversation_id, "assistant", reply, meta=json.dumps({"pending_command": pid}))
+            return result
+        outcome = _execute_command(project_id, name, args)
+        reply = f"{reply}\n\n{outcome}" if reply else outcome
+        result["reply"] = reply
+        if not suggestions:
+            result["suggestions"] = SUGGESTIONS.get(name, ["Status", "Help"])
+
+    _save_message(conversation_id, "assistant", reply)
+    return result
+
 
 def handle_message(project_id: str, conversation_id: str, text: str) -> dict:
     text = text.strip()
@@ -357,31 +573,35 @@ def handle_message(project_id: str, conversation_id: str, text: str) -> dict:
             (conversation_id,))
         if not pending:
             reply = "There is no pending command to confirm."
-        else:
-            args = json.loads(pending["args_json"])
-            reply = _execute_command(project_id, pending["command"], args)
-            execute("DELETE FROM pending_commands WHERE id = ?", (pending["id"],))
+            _save_message(conversation_id, "assistant", reply)
+            return {"reply": reply, "suggestions": ["Status", "Help"]}
+        args = json.loads(pending["args_json"])
+        reply = _execute_command(project_id, pending["command"], args)
+        execute("DELETE FROM pending_commands WHERE id = ?", (pending["id"],))
         _save_message(conversation_id, "assistant", reply)
-        return {"reply": reply}
+        return {"reply": reply, "suggestions": SUGGESTIONS.get(pending["command"], ["Status", "Help"])}
 
     if intent == "cancel_pending":
         execute("DELETE FROM pending_commands WHERE conversation_id = ?", (conversation_id,))
         reply = "Pending command discarded."
         _save_message(conversation_id, "assistant", reply)
-        return {"reply": reply}
+        return {"reply": reply, "suggestions": ["Status", "Help"]}
+
+    if not intent and _bot_config()[0]:
+        return _ai_route(project_id, conversation_id, text)
 
     if intent == "help" or not intent:
         reply = HELP_TEXT if intent == "help" else (
-            "I did not recognize that request. I only execute typed commands — try `help` "
-            "to see the command catalog. For example: `create role Data Engineer`, "
-            "`status`, or `start task Implement login endpoint`.")
+            "I did not recognize that request and no AI model is configured for me. "
+            "Set one under Settings → Project Control AI, or use typed commands — try `help`. "
+            "For example: `create role Data Engineer`, `status`, or `start task Implement login endpoint`.")
         _save_message(conversation_id, "assistant", reply)
-        return {"reply": reply}
+        return {"reply": reply, "suggestions": ["Status", "Start sprint execution", "Create a sprint"]}
 
     if intent == "status":
         reply = _project_summary(project_id)
         _save_message(conversation_id, "assistant", reply)
-        return {"reply": reply}
+        return {"reply": reply, "suggestions": SUGGESTIONS["status"]}
 
     args = {k: v for k, v in (match.groupdict() or {}).items() if v is not None}
     if intent == "create_team":
@@ -400,8 +620,9 @@ def handle_message(project_id: str, conversation_id: str, text: str) -> dict:
                  + "\n\nThis is a sensitive mutation (credentials or team/cost profile). "
                    "Reply `confirm` to execute or `cancel that` to discard.")
         _save_message(conversation_id, "assistant", reply, meta=json.dumps({"pending_command": pid}))
-        return {"reply": reply, "needs_confirmation": True, "pending_command": pid, "proposal": args}
+        return {"reply": reply, "needs_confirmation": True, "pending_command": pid, "proposal": args,
+                "suggestions": ["confirm", "cancel that"]}
 
     reply = _execute_command(project_id, intent, args)
     _save_message(conversation_id, "assistant", reply)
-    return {"reply": reply}
+    return {"reply": reply, "suggestions": SUGGESTIONS.get(intent, ["Status", "Help"])}

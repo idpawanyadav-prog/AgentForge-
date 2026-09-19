@@ -56,6 +56,7 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
   const [input, setInput] = React.useState('');
   const [sending, setSending] = React.useState(false);
   const [pending, setPending] = React.useState<string | null>(null);
+  const [suggestions, setSuggestions] = React.useState<string[]>([]);
   const [summary, setSummary] = React.useState<Summary | null>(null);
   const [tab, setTab] = React.useState<'team' | 'activity' | 'tasks'>('team');
   const [paneOpen, setPaneOpen] = React.useState(true);
@@ -81,6 +82,8 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
 
   const loadMessages = React.useCallback((cid: string) => {
     get(`/api/v1/conversations/${cid}/messages`).then(setMessages).catch(() => undefined);
+    setSuggestions([]);
+    setPending(null);
   }, []);
 
   React.useEffect(() => { if (activeConv) loadMessages(activeConv); }, [activeConv, loadMessages]);
@@ -114,6 +117,7 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
       const res = await post(`/api/v1/projects/${activeProject}/conversations/${activeConv}/messages`, { content });
       setMessages(res.messages);
       setPending(res.pending_command ?? null);
+      setSuggestions(Array.isArray(res.suggestions) ? res.suggestions : []);
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -214,6 +218,14 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
           <div ref={msgEndRef} />
         </div>
         {error && <div style={{ padding: '0 14px 6px' }}><Badge kind="err">{error}</Badge></div>}
+        {!pending && suggestions.length > 0 && (
+          <div className="row" style={{ padding: '4px 14px 8px', gap: 6, flexWrap: 'wrap' }}>
+            {suggestions.map((s) => (
+              <button key={s} className="btn small" disabled={sending}
+                onClick={() => send(s)} title={`Send: ${s}`}>{s}</button>
+            ))}
+          </div>
+        )}
         <div className="chat-input">
           <textarea
             value={input}

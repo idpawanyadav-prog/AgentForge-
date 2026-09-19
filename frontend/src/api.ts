@@ -22,6 +22,8 @@ export const post = <T = any>(path: string, body?: any, headers?: Record<string,
   api<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body), headers });
 export const patch = <T = any>(path: string, body: any) =>
   api<T>(path, { method: 'PATCH', body: JSON.stringify(body) });
+export const put = <T = any>(path: string, body: any) =>
+  api<T>(path, { method: 'PUT', body: JSON.stringify(body) });
 export const del = <T = any>(path: string) => api<T>(path, { method: 'DELETE' });
 
 export function fmtTime(iso: string): string {

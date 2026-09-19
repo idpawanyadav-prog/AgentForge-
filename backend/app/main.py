@@ -166,7 +166,33 @@ class SettingsIn(BaseModel):
 
 @app.get("/api/v1/settings")
 def get_settings():
-    return {"theme": _get_setting("theme", "dark")}
+    import json as _json
+    bot = {"gateway_id": None, "model_id": None, "gateway_name": None, "model_name": None}
+    raw = _get_setting("control_bot", "")
+    if raw:
+        try:
+            cfg = _json.loads(raw)
+            gw = query_one("SELECT name FROM gateways WHERE id = ?", (cfg.get("gateway_id", ""),))
+            m = query_one("SELECT provider_model_id FROM gateway_models WHERE id = ?", (cfg.get("model_id", ""),))
+            bot.update({"gateway_id": cfg.get("gateway_id"), "model_id": cfg.get("model_id"),
+                        "gateway_name": gw["name"] if gw else None,
+                        "model_name": m["provider_model_id"] if m else None})
+        except ValueError:
+            pass
+    return {"theme": _get_setting("theme", "dark"), "control_bot": bot}
+
+
+@app.put("/api/v1/settings/control-bot")
+def put_control_bot(body: dict):
+    gid, mid = body.get("gateway_id"), body.get("model_id")
+    if gid:
+        _or_404(query_one("SELECT id FROM gateways WHERE id=?", (gid,)), "Gateway")
+    if mid:
+        _or_404(query_one("SELECT id FROM gateway_models WHERE id=? AND gateway_id=?", (mid, gid)), "Model")
+    _set_setting("control_bot", json.dumps({"gateway_id": gid, "model_id": mid}))
+    audit("configure_control_bot", "settings", "control_bot",
+          f"Project Control AI set to gateway/model ({bool(gid)}, {bool(mid)})")
+    return {"ok": True}
 
 
 @app.put("/api/v1/settings")
