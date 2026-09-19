@@ -100,24 +100,44 @@ function AgentForm({ agent, teams = [], onClose, onSaved }: {
   const { data: roles } = useAsyncData<any[]>(() => get('/api/v1/roles'), []);
   const { data: personas } = useAsyncData<any[]>(() => get('/api/v1/personas'), []);
   const { data: bindings } = useAsyncData<any[]>(() => get('/api/v1/model-bindings'), []);
+  const { data: gateways } = useAsyncData<any[]>(() => get('/api/v1/gateways'), []);
+  const [gwModels, setGwModels] = React.useState<any[]>([]);
   const [f, setF] = React.useState({
     name: agent?.name ?? '', role_id: agent?.role_id ?? '',
-    persona_id: agent?.persona_id ?? '', model_binding_id: agent?.model_binding_id ?? '',
+    persona_id: agent?.persona_id ?? '', gateway_id: '', model_id: '',
     lifecycle_state: agent?.lifecycle_state ?? 'Idle',
   });
   const upd = (k: string) => (e: any) => setF({ ...f, [k]: e.target.value });
   const rolePersonas = (personas ?? []).filter((p) => p.role_id === f.role_id);
   const roleBindings = (bindings ?? []).filter((b) => b.role_id === f.role_id);
   const memberOf = (agent ? teams.filter((t) => (t.agents ?? []).some((m: any) => m.id === agent.id)) : []);
+
+  React.useEffect(() => {
+    if (agent && bindings) {
+      const b = bindings.find((x) => x.id === agent.model_binding_id);
+      if (b) setF((p) => ({ ...p, gateway_id: b.gateway_id, model_id: b.model_id }));
+    }
+  }, [agent, bindings]);
+  React.useEffect(() => {
+    if (!f.gateway_id) { setGwModels([]); return; }
+    get(`/api/v1/gateways/${f.gateway_id}/models`).then(setGwModels).catch(() => setGwModels([]));
+  }, [f.gateway_id]);
+
   const save = async () => {
     const personaId = f.persona_id || rolePersonas[0]?.id || '';
-    const bindingId = f.model_binding_id || roleBindings[0]?.id || null;
+    let bindingId = roleBindings[0]?.id || null;
+    if (f.gateway_id && f.model_id) {
+      const existing = (bindings ?? []).find((b) =>
+        b.role_id === f.role_id && b.gateway_id === f.gateway_id && b.model_id === f.model_id);
+      try {
+        bindingId = existing ? existing.id
+          : (await post('/api/v1/model-bindings', { role_id: f.role_id, gateway_id: f.gateway_id, model_id: f.model_id })).id;
+      } catch (e: any) { alert(e.message); return; }
+    }
     try {
-      if (agent) {
-        await patch(`/api/v1/agents/${agent.id}`, { ...f, persona_id: personaId, model_binding_id: bindingId });
-      } else {
-        await post('/api/v1/agents', { ...f, persona_id: personaId, model_binding_id: bindingId });
-      }
+      const payload = { name: f.name, role_id: f.role_id, persona_id: personaId, model_binding_id: bindingId };
+      if (agent) await patch(`/api/v1/agents/${agent.id}`, { ...payload, lifecycle_state: f.lifecycle_state });
+      else await post('/api/v1/agents', payload);
       onSaved();
     } catch (e: any) { alert(e.message); }
   };
@@ -125,7 +145,7 @@ function AgentForm({ agent, teams = [], onClose, onSaved }: {
     <Modal title={agent ? `Edit Agent: ${agent.name}` : 'Create Agent'} onClose={onClose}>
       <Field label="Agent name"><input value={f.name} onChange={upd('name')} /></Field>
       <Field label="Role">
-        <select value={f.role_id} onChange={(e) => setF({ ...f, role_id: e.target.value, persona_id: '', model_binding_id: '' })}>
+        <select value={f.role_id} onChange={(e) => setF({ ...f, role_id: e.target.value, persona_id: '', gateway_id: '', model_id: '' })}>
           <option value="">— select role —</option>
           {(roles ?? []).map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
         </select>
@@ -136,17 +156,16 @@ function AgentForm({ agent, teams = [], onClose, onSaved }: {
           {rolePersonas.map((p) => <option key={p.id} value={p.id}>{p.name} (v{p.version})</option>)}
         </select>
       </Field>
-      <Field label="Model binding (inherits role default)">
-        <select value={f.model_binding_id} onChange={upd('model_binding_id')} disabled={!f.role_id}>
+      <Field label="Gateway (inherits role default)">
+        <select value={f.gateway_id} onChange={(e) => setF({ ...f, gateway_id: e.target.value, model_id: '' })} disabled={!f.role_id}>
           <option value="">— role default —</option>
-          {Object.entries(roleBindings.reduce<Record<string, any[]>>((acc, b) => {
-            (acc[b.gateway_name] = acc[b.gateway_name] || []).push(b);
-            return acc;
-          }, {})).sort(([a], [c]) => a.localeCompare(c)).map(([gw, list]) => (
-            <optgroup key={gw} label={gw}>
-              {list.map((b) => <option key={b.id} value={b.id}>{b.provider_model_id}</option>)}
-            </optgroup>
-          ))}
+          {(gateways ?? []).map((g) => <option key={g.id} value={g.id}>{g.name} ({g.provider})</option>)}
+        </select>
+      </Field>
+      <Field label="Model">
+        <select value={f.model_id} onChange={upd('model_id')} disabled={!f.gateway_id}>
+          <option value="">{f.gateway_id ? '— select model —' : '— role default —'}</option>
+          {gwModels.map((m) => <option key={m.id} value={m.id}>{m.provider_model_id}</option>)}
         </select>
       </Field>
       {agent && (
