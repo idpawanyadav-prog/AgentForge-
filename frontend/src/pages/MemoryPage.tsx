@@ -67,6 +67,10 @@ export default function MemoryPage() {
   React.useEffect(() => { setSelectedInstr(null); }, [selectedRole]);
   const [selectedPersona, setSelectedPersona] = React.useState<string | null>(null);
   React.useEffect(() => { setSelectedPersona(null); }, [selectedRole]);
+  // Bumped after any instruction create/save/delete/toggle so the list and
+  // editor panels refetch (their loaders otherwise only track roleId).
+  const [instrRefresh, setInstrRefresh] = React.useState(0);
+  const refreshInstr = () => setInstrRefresh((k) => k + 1);
 
   return (
     <div className="page">
@@ -131,7 +135,7 @@ export default function MemoryPage() {
 
             {tab === 'instructions' ? (
               <InstructionsPanel roleId={role.id} selected={selectedInstr} onSelect={setSelectedInstr}
-                onError={fail} onOpenModal={setModal} />
+                onError={fail} onOpenModal={setModal} refreshKey={instrRefresh} onChanged={refreshInstr} />
             ) : tab === 'skills' ? (
               <SkillsPanel roleId={role.id} allSkills={allSkills ?? []} onError={fail} onChanged={reloadRoles} />
             ) : (
@@ -169,7 +173,8 @@ export default function MemoryPage() {
           <PersonaEditor roleId={selectedRole} personaId={selectedPersona} onSelect={setSelectedPersona}
             onError={fail} reloadRoles={reloadRoles} />
         ) : (
-          <EditorPanel roleId={selectedRole} selectedId={selectedInstr} onSelect={setSelectedInstr} onError={fail} />
+          <EditorPanel roleId={selectedRole} selectedId={selectedInstr} onSelect={setSelectedInstr}
+            onError={fail} refreshKey={instrRefresh} onChanged={refreshInstr} />
         )}
       </div>
 
@@ -181,7 +186,7 @@ export default function MemoryPage() {
       )}
       {modal === 'newInstruction' && role && (
         <InstructionForm roleId={role.id} onClose={() => setModal(null)}
-          onSaved={async (id: string) => { setModal(null); setSelectedInstr(id); }} />
+          onSaved={async (id: string) => { setModal(null); setSelectedInstr(id); refreshInstr(); }} />
       )}
       {modal === 'newPersona' && role && (
         <NewPersonaModal roleId={role.id} onClose={() => setModal(null)}
@@ -195,12 +200,21 @@ export default function MemoryPage() {
   );
 }
 
-function InstructionsPanel({ roleId, selected, onSelect, onError, onOpenModal }:
-  { roleId: string; selected: string | null; onSelect: (id: string) => void; onError: (e: any) => void; onOpenModal: (m: string) => void }) {
-  const { data: instructions, reload } = useAsyncData<any[]>(() => get(`/api/v1/roles/${roleId}/instructions`), [roleId]);
+function InstructionsPanel({ roleId, selected, onSelect, onError, onOpenModal, refreshKey, onChanged }:
+  { roleId: string; selected: string | null; onSelect: (id: string) => void; onError: (e: any) => void;
+    onOpenModal: (m: string) => void; refreshKey: number; onChanged: () => void }) {
+  const { data: instructions, reload } = useAsyncData<any[]>(
+    () => get(`/api/v1/roles/${roleId}/instructions`), [roleId, refreshKey]);
   React.useEffect(() => {
     if (!selected && instructions?.length) onSelect(instructions[0].id);
   }, [instructions, selected]);
+  const toggleActive = async (f: any) => {
+    try {
+      await patch(`/api/v1/instructions/${f.id}`, { active: f.active === 0 });
+      reload();
+      onChanged();
+    } catch (e: any) { onError(e); }
+  };
   return (
     <>
       <div className="spread" style={{ marginBottom: 10 }}>
@@ -213,17 +227,22 @@ function InstructionsPanel({ roleId, selected, onSelect, onError, onOpenModal }:
       <div className="instr-list">
         {(instructions ?? []).map((f) => (
           <div key={f.id} className={`instr-item ${selected === f.id ? 'active' : ''}`}
+            style={f.active === 0 ? { opacity: 0.5 } : undefined}
             onClick={() => onSelect(f.id)}>
             <div className="group-icon">📄</div>
             <div className="grow" style={{ minWidth: 0 }}>
-              <div className="group-name mono">{f.filename}</div>
+              <div className="group-name mono">{f.filename}{f.active === 0 ? ' (disabled)' : ''}</div>
               <div className="kv">{f.description}</div>
             </div>
             <span className="kv" style={{ whiteSpace: 'nowrap' }}>Updated {fmtRel(f.updated_at)}</span>
+            <button className={`btn small ${f.active === 0 ? '' : 'primary'}`} title={f.active === 0 ? 'Enable' : 'Disable'}
+              onClick={(e) => { e.stopPropagation(); toggleActive(f); }}>
+              {f.active === 0 ? '⏻ Enable' : '⏻ Disable'}
+            </button>
             <button className="btn small danger" onClick={async (e) => {
               e.stopPropagation();
               if (!confirm(`Delete ${f.filename}?`)) return;
-              try { await del(`/api/v1/instructions/${f.id}`); reload(); } catch (err: any) { onError(err); }
+              try { await del(`/api/v1/instructions/${f.id}`); onChanged(); } catch (err: any) { onError(err); }
             }}>⋮</button>
           </div>
         ))}
@@ -233,10 +252,11 @@ function InstructionsPanel({ roleId, selected, onSelect, onError, onOpenModal }:
   );
 }
 
-function EditorPanel({ roleId, selectedId, onSelect, onError }:
-  { roleId: string | null; selectedId: string | null; onSelect: (id: string) => void; onError: (e: any) => void }) {
+function EditorPanel({ roleId, selectedId, onSelect, onError, refreshKey, onChanged }:
+  { roleId: string | null; selectedId: string | null; onSelect: (id: string) => void; onError: (e: any) => void;
+    refreshKey: number; onChanged: () => void }) {
   const { data: instructions, reload } = useAsyncData<any[]>(
-    () => (roleId ? get(`/api/v1/roles/${roleId}/instructions`) : Promise.resolve([])), [roleId]);
+    () => (roleId ? get(`/api/v1/roles/${roleId}/instructions`) : Promise.resolve([])), [roleId, refreshKey]);
   const file = instructions?.find((f) => f.id === selectedId) ?? null;
   const [draft, setDraft] = React.useState('');
   const [mode, setMode] = React.useState<'edit' | 'preview'>('edit');
@@ -245,6 +265,14 @@ function EditorPanel({ roleId, selectedId, onSelect, onError }:
 
   React.useEffect(() => { setDraft(file?.content ?? ''); setMode('edit'); }, [file?.id, file?.version]);
 
+  // Keep selection valid when the refreshed list changes (e.g. after a
+  // delete elsewhere) so the editor never sits on a ghost id.
+  React.useEffect(() => {
+    if (selectedId && instructions && !instructions.some((f) => f.id === selectedId)) {
+      onSelect(instructions[0]?.id ?? null);
+    }
+  }, [instructions, selectedId]);
+
   if (!roleId) return null;
   if (!file) {
     return (
@@ -252,6 +280,12 @@ function EditorPanel({ roleId, selectedId, onSelect, onError }:
     );
   }
   const dirty = draft !== file.content;
+  const toggleActive = async () => {
+    try {
+      await patch(`/api/v1/instructions/${file.id}`, { active: file.active === 0 });
+      onChanged();
+    } catch (e: any) { onError(e); }
+  };
   return (
     <div className="mem-card col-editor">
       <div className="spread">
@@ -259,11 +293,17 @@ function EditorPanel({ roleId, selectedId, onSelect, onError }:
           <span className="group-icon">📄</span>
           <b className="mono">{file.filename}</b>
           <Badge kind="dim">v{file.version}</Badge>
+          {file.active === 0 && <Badge kind="err">Disabled</Badge>}
         </div>
-        <button className="btn small danger" onClick={async () => {
-          if (!confirm(`Delete ${file.filename}?`)) return;
-          try { await del(`/api/v1/instructions/${file.id}`); onSelect(null); reload(); } catch (e: any) { onError(e); }
-        }}>🗑</button>
+        <div className="btn-row">
+          <button className={`btn small ${file.active === 0 ? '' : 'primary'}`} onClick={toggleActive}>
+            {file.active === 0 ? '⏻ Enable' : '⏻ Disable'}
+          </button>
+          <button className="btn small danger" onClick={async () => {
+            if (!confirm(`Delete ${file.filename}?`)) return;
+            try { await del(`/api/v1/instructions/${file.id}`); onSelect(null); onChanged(); } catch (e: any) { onError(e); }
+          }}>🗑</button>
+        </div>
       </div>
       <div className="subtabs">
         <button className={`subtab ${mode === 'edit' ? 'active' : ''}`} onClick={() => setMode('edit')}>✎ Edit</button>
@@ -283,7 +323,7 @@ function EditorPanel({ roleId, selectedId, onSelect, onError }:
             try {
               await patch(`/api/v1/instructions/${file.id}`, { content: draft });
               setSavedTick((t) => t + 1);
-              reload();
+              onChanged();
             } catch (e: any) { onError(e); } finally { setSaving(false); }
           }}>Save Changes</button>
         </div>

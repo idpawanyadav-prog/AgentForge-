@@ -336,6 +336,7 @@ CREATE TABLE IF NOT EXISTS instruction_files (
   description TEXT NOT NULL DEFAULT '',
   content TEXT NOT NULL DEFAULT '',
   version INTEGER NOT NULL DEFAULT 1,
+  active INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(role_id, filename)
@@ -489,6 +490,9 @@ def init_db():
         execute("ALTER TABLE tasks ADD COLUMN qa_agent_id TEXT REFERENCES agents(id)")
     if "rework_count" not in task_cols:
         execute("ALTER TABLE tasks ADD COLUMN rework_count INTEGER NOT NULL DEFAULT 0")
+    instr_cols = {r["name"] for r in query("PRAGMA table_info(instruction_files)")}
+    if "active" not in instr_cols:
+        execute("ALTER TABLE instruction_files ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
     db.commit()
     seed_if_empty()
     seed_instruction_files()

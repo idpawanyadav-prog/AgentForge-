@@ -75,7 +75,7 @@ def _ensure_role_persona(role):
     if persona:
         return persona
     now_ts = now()
-    files = query("SELECT filename, content FROM instruction_files WHERE role_id = ? ORDER BY filename", (role["id"],))
+    files = query("SELECT filename, content FROM instruction_files WHERE role_id = ? AND active = 1 ORDER BY filename", (role["id"],))
     body = "\n\n".join(f"## {f['filename']}\n{f['content']}".strip() for f in files).strip()
     if not body:
         body = (f"You are a {role['name']} on a simulated delivery team. Follow standard professional practices "
@@ -1103,7 +1103,7 @@ def _execute_command(project_id, command, args) -> str:
         return f"Execution started for **{task['title']}** — watch the Team and Activity panels for live progress."
 
     if command == "start_sprint":
-        result = runtime.start_sprint_execution(project_id)
+        result = runtime.start_sprint_execution(project_id, args.get("sprint"))
         if "error" in result:
             return f"Cannot start sprint execution: {result['error']}"
         audit("start_sprint_execution", "project", project_id,
@@ -1188,6 +1188,7 @@ INTENTS = [
     ("align_team", r"(?:align|link|attach|assign)\s+(?:the\s+)?team\s+(?P<team>.+?)\s+(?:to|with)\s+(?:this\s+)?project\s*$"),
     ("assign_task", r"assign(?: task)?\s+(?P<task>.+?)\s+to\s+(?P<agent>.+?)\s*$"),
     ("start_task", r"(?:start|run|execute)\s+(?:the )?task\s+(?P<task>.+?)\s*$"),
+    ("start_sprint", r"start\s+(?:the )?sprint\s+(?!execution\b)(?:number\s+)?(?P<sprint>.+?)\s*$"),
     ("start_sprint", r"start\s+(?:the )?sprint(?: execution)?\s*$"),
     ("stop_sprint", r"stop\s+(?:the )?sprint(?: execution)?\s*$"),
     ("pause_execution", r"pause\s+(?:the )?execution\s*$"),
@@ -1431,7 +1432,7 @@ Available commands (name: args):
 - align_team: {team?} — aligns a team to the CURRENT project; team name optional (defaults to the newest team not aligned to any project). Use when the user says things like "align it in this project" after building a team.
 - assign_task: {task, agent}
 - start_task: {task}
-- start_sprint: {}
+- start_sprint: {sprint?: "<sprint number, name, or id>"} — "start sprint 2" passes sprint="2". If the target sprint has no tasks yet, the next-phase task plan is drafted automatically from the project goal, then the sprint starts autonomously and tasks are assigned by role. Never offer to assign tasks manually after starting; the run only surfaces for real blockers.
 - stop_sprint: {}
 - pause_execution: {}
 - resume_execution: {}

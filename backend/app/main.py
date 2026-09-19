@@ -462,6 +462,14 @@ def update_instruction(iid: str, body: dict):
     allowed = {k: v for k, v in body.items() if k in ("filename", "description", "content")}
     if "content" in allowed and allowed["content"] != instr["content"]:
         allowed["version"] = instr["version"] + 1
+    if "active" in body:
+        allowed["active"] = 1 if body["active"] in (True, 1, "1", "on") else 0
+        if allowed["active"] == 0:
+            audit("disable_instruction", "instruction_file", iid,
+                  f"Disabled instruction '{instr['filename']}'")
+        else:
+            audit("enable_instruction", "instruction_file", iid,
+                  f"Enabled instruction '{instr['filename']}'")
     allowed["updated_at"] = now()
     update("instruction_files", iid, allowed)
     return query_one("SELECT * FROM instruction_files WHERE id = ?", (iid,))
@@ -1162,8 +1170,10 @@ async def execution_action(run_id: str, action: str):
 
 
 @app.post("/api/v1/projects/{pid}/sprint-execution/start")
-async def start_sprint_exec(pid: str):
-    result = await asyncio.get_running_loop().run_in_executor(None, runtime.start_sprint_execution, pid)
+async def start_sprint_exec(pid: str, body: dict = None):
+    sprint_ref = (body or {}).get("sprint") if isinstance(body, dict) else None
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, runtime.start_sprint_execution, pid, sprint_ref)
     if "error" in result:
         raise HTTPException(409, result["error"])
     return result

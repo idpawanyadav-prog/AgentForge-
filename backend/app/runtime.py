@@ -9,6 +9,7 @@ credentials.
 import asyncio
 import json
 import random
+import re
 
 from . import db, workspace, codegen, toolchains
 from .db import emit_event, execute, insert, now, new_id, query_one, query, update, audit
@@ -557,17 +558,31 @@ def _eligible_tasks(project_id):
 
 async def _run_sprint(project_id: str, ctrl: dict):
     _emit(project_id, "project.updated", {"note": "Sprint execution started"})
+    idle_rounds = 0
     while not ctrl["cancelled"]:
         eligible = _eligible_tasks(project_id)
         if not eligible:
             remaining = query(
                 "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND sprint_id IS NOT NULL "
                 "AND status NOT IN ('Done','Cancelled')", (project_id,))[0]["n"]
-            _emit(project_id, "project.updated",
-                  {"note": ("Sprint execution complete" if remaining == 0
-                            else "No eligible tasks: blocked/waiting items remain"),
-                   "remaining_tasks": remaining})
-            break
+            if remaining == 0:
+                _emit(project_id, "project.updated",
+                      {"note": "Sprint execution complete", "remaining_tasks": 0})
+                break
+            # Nothing runnable right now: tasks may exist unassigned (newly
+            # drafted or freed by a state change). Re-attempt role-based
+            # assignment instead of giving up; give up only after a stretch
+            # with no progress at all.
+            auto_assign_tasks(project_id)
+            idle_rounds += 1
+            if idle_rounds > 60:
+                _emit(project_id, "project.updated",
+                      {"note": "No eligible tasks: blocked/waiting items remain",
+                       "remaining_tasks": remaining})
+                break
+            await asyncio.sleep(2.0)
+            continue
+        idle_rounds = 0
         task = eligible[0]
         result = start_execution(project_id, task["id"])
         run = result.get("run") or {}
@@ -711,36 +726,145 @@ def auto_assign_tasks(project_id: str) -> dict:
     return {"assigned": assigned, "note": ""}
 
 
-def start_sprint_execution(project_id: str):
+def _resolve_sprint(project_id: str, sprint_ref):
+    """Resolve a sprint by id, exact/partial name, or number ("2",
+    "sprint 2", "sprint-2"). Falls back to the nth sprint created. Returns
+    None when the reference cannot be matched."""
+    if not sprint_ref:
+        return None
+    ref = str(sprint_ref).strip()
+    if not ref:
+        return None
+    s = query_one("SELECT * FROM sprints WHERE project_id = ? AND id = ?", (project_id, ref))
+    if s:
+        return s
+    s = query_one("SELECT * FROM sprints WHERE project_id = ? AND lower(name) = lower(?)",
+                  (project_id, ref))
+    if s:
+        return s
+    rows = query("SELECT * FROM sprints WHERE project_id = ? ORDER BY created_at", (project_id,))
+    m = re.search(r"\d+", ref)
+    if m:
+        n = m.group(0)
+        for row in rows:
+            if re.search(rf"(?<!\d){re.escape(n)}(?!\d)", row["name"] or ""):
+                return row
+        if ref.isdigit() and 1 <= int(ref) <= len(rows):
+            return rows[int(ref) - 1]
+    return query_one("SELECT * FROM sprints WHERE project_id = ? AND lower(name) LIKE lower(?) "
+                     "ORDER BY created_at LIMIT 1", (project_id, f"%{ref}%"))
+
+
+_TASK_PLAN_SYSTEM = """You are a technical product owner planning the next sprint.
+Return ONLY a JSON object (no prose, no fences):
+{"tasks": [{"title": "...", "description": "...", "acceptance_criteria": "...", "points": 1-8, "priority": 1-3}]}
+Plan 3-6 concrete, implementable tasks that build on the already-completed work.
+Titles are short (< 70 chars) and describe deliverables, not documents."""
+
+
+def _generate_sprint_tasks(project, sprint) -> list[dict]:
+    """Autonomously draft the next phase of tasks for an empty sprint.
+    Returns a validated list of task dicts ([] when nothing usable)."""
+    gw, model = codegen.resolve_llm(project)
+    if not (gw and model):
+        return []
+    from .chatbot import _extract_json
+    done = [r["title"] for r in query(
+        "SELECT title FROM tasks WHERE project_id = ? AND status = 'Done' ORDER BY created_at",
+        (project["id"],))]
+    existing_tree = codegen._existing_tree(project["workspace_path"])
+    user = (f"PROJECT: {project['name']}\nGOAL: {project['goal'] or 'n/a'}\n"
+            f"TECH STACK: {project['technology_stack'] or 'n/a'}\n"
+            f"SPRINT TO PLAN: {sprint['name']}\nSPRINT GOAL: {sprint['goal'] or 'n/a'}\n"
+            f"ALREADY COMPLETED (do not repeat): {'; '.join(done) if done else 'nothing yet'}\n"
+            f"CURRENT WORKSPACE FILES:\n{existing_tree}\n\n"
+            "Draft the next phase of tasks for this sprint.")
+    try:
+        raw = codegen.call_llm(gw, model, _TASK_PLAN_SYSTEM, user, max_tokens=2000)
+    except Exception:
+        return []
+    data = _extract_json(raw.get("text") or "")
+    tasks = []
+    if data and isinstance(data.get("tasks"), list):
+        for t in data["tasks"]:
+            if not isinstance(t, dict):
+                continue
+            title = str(t.get("title") or "").strip()
+            if not title:
+                continue
+            try:
+                pts = max(1, min(8, int(t.get("points") or 3)))
+            except (TypeError, ValueError):
+                pts = 3
+            try:
+                prio = max(1, min(3, int(t.get("priority") or 2)))
+            except (TypeError, ValueError):
+                prio = 2
+            tasks.append({"title": title[:80], "description": str(t.get("description") or "")[:500],
+                          "acceptance_criteria": str(t.get("acceptance_criteria") or "")[:500],
+                          "points": pts, "priority": prio})
+    return tasks[:6]
+
+
+def start_sprint_execution(project_id: str, sprint_ref=None):
     # Blockers that genuinely need a human decision:
-    sprint = query_one("SELECT * FROM sprints WHERE project_id = ? AND status = 'Active'", (project_id,))
-    if not sprint:
+    project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not project:
+        return {"error": "Project not found"}
+    sprint = _resolve_sprint(project_id, sprint_ref)
+    if sprint is None and not sprint_ref:
+        sprint = query_one("SELECT * FROM sprints WHERE project_id = ? AND status = 'Active'", (project_id,))
+    if sprint is None:
         planned = query_one(
             "SELECT * FROM sprints WHERE project_id = ? AND status = 'Planned' ORDER BY created_at", (project_id,))
         if not planned:
             return {"error": "No sprint to start — create one first (e.g. say \"create a sprint\")"}
+        sprint = planned
     if project_id in _schedulers:
         return {"error": "Sprint execution already running"}
 
     task_count = query_one(
         "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND sprint_id = ? "
         "AND status NOT IN ('Done','Cancelled')",
-        (project_id, (sprint or planned)["id"]))["n"]
+        (project_id, sprint["id"]))["n"]
     if task_count == 0:
-        name = (sprint or planned)["name"]
-        return {"error": f"Sprint '{name}' has no open tasks — add tasks before starting"}
+        # Stealth mode: an empty sprint is not a blocker — draft the next
+        # phase of tasks from the project goal and start immediately.
+        drafted = _generate_sprint_tasks(project, sprint)
+        if drafted:
+            ts = now()
+            for t in drafted:
+                insert("tasks", {"id": new_id(), "project_id": project_id, "sprint_id": sprint["id"],
+                                 "title": t["title"], "description": t["description"],
+                                 "acceptance_criteria": t["acceptance_criteria"],
+                                 "story_points": t["points"], "priority": t["priority"],
+                                 "status": "Todo", "created_at": ts, "updated_at": ts})
+            audit("generate_sprint_tasks", "sprint", sprint["id"],
+                  f"Auto-drafted {len(drafted)} task(s) for '{sprint['name']}'")
+            _emit(project_id, "sprint.tasks_drafted",
+                  {"sprint": sprint["name"], "tasks": [t["title"] for t in drafted]})
+            drafted_n = len(drafted)
+        else:
+            return {"error": f"Sprint '{sprint['name']}' has no open tasks and no AI model is "
+                             "configured to draft them — add tasks before starting"}
+    else:
+        drafted_n = 0
 
     # Activate the planned sprint, auto-assign, then run autonomously.
-    if not sprint:
-        execute("UPDATE sprints SET status = 'Active' WHERE id = ?", (planned["id"],))
-        sprint = query_one("SELECT * FROM sprints WHERE id = ?", (planned["id"],))
+    if sprint["status"] != "Active":
+        # Only one sprint per project may be Active at a time.
+        execute("UPDATE sprints SET status = 'Planned' WHERE project_id = ? AND status = 'Active' AND id != ?",
+                (project_id, sprint["id"]))
+        execute("UPDATE sprints SET status = 'Active' WHERE id = ?", (sprint["id"],))
+        sprint = query_one("SELECT * FROM sprints WHERE id = ?", (sprint["id"],))
         _emit(project_id, "sprint.activated",
               {"sprint": sprint["name"], "note": "Sprint activated automatically by start command"})
     assign = auto_assign_tasks(project_id)
     ctrl = {"cancelled": False}
     handle = _spawn(_run_sprint(project_id, ctrl))
     _schedulers[project_id] = {**ctrl, "task": handle}
-    return {"ok": True, "sprint": sprint["name"], "auto_assigned": assign["assigned"]}
+    return {"ok": True, "sprint": sprint["name"], "auto_assigned": assign["assigned"],
+            "auto_drafted": drafted_n}
 
 
 def stop_sprint_execution(project_id: str):

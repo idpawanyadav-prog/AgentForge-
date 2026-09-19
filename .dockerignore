@@ -1,0 +1,44 @@
+# --- Python runtime / virtualenvs (huge + triggers secret-scan false positives) ---
+.venv/
+venv/
+env/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# --- Local state that must never enter the image or the publish archive ---
+# SQLite database (contains project data and encrypted gateway credentials)
+backend/agent_office.db
+*.db
+*.db-wal
+*.db-shm
+# Machine-local Fernet master key for gateway API keys
+.gateway_keys.key
+.env
+*.local
+
+# --- Generated project workspaces (runtime data, each its own git repo) ---
+Projects/
+
+# --- Git / CI ---
+.git/
+.gitignore
+
+# --- Frontend build inputs that are rebuilt inside the container ---
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+**/node_modules/
+**/dist/
+
+# --- Deployment artifacts themselves ---
+Dockerfile
+.dockerignore
+.verdentc.json
+
+# --- Docs / OS noise ---
+*.md
+!README.md
+.DS_Store
+Thumbs.db
