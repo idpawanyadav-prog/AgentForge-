@@ -1,255 +1,381 @@
 import React from 'react';
-import { get, post, patch, del } from '../api';
-import { Badge, Field, Modal, useAsyncData, ErrorNote } from '../components';
+import { get, post, patch, del, fmtRel } from '../api';
+import { Field, Modal, useAsyncData, ErrorNote, Badge } from '../components';
+import { AGENT_STATE_CLASS } from '../api';
+
+function iconFor(name: string): string {
+  if (/develop|coder|senior/i.test(name)) return '</>';
+  if (/architect/i.test(name)) return '⬢';
+  if (/qa|quality|test/i.test(name)) return '◎';
+  if (/ops|devops|platform/i.test(name)) return '⚙';
+  if (/analy/i.test(name)) return '📊';
+  if (/manager|scrum|owner/i.test(name)) return '◔';
+  if (/design/i.test(name)) return '🎨';
+  return '⬡';
+}
+
+function renderMd(text: string): string {
+  const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return esc.split('\n').map((line) => {
+    if (/^###\s/.test(line)) return `<div class="md-h3">${line.slice(4)}</div>`;
+    if (/^##\s/.test(line)) return `<div class="md-h2">${line.slice(3)}</div>`;
+    if (/^#\s/.test(line)) return `<div class="md-h1">${line.slice(2)}</div>`;
+    if (/^-\s/.test(line)) return `<div class="md-li">${line.slice(2)}</div>`;
+    if (!line.trim()) return '<div class="md-gap"></div>';
+    return `<div>${line}</div>`;
+  }).join('');
+}
+
+function CodeEditor({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const gutterRef = React.useRef<HTMLDivElement>(null);
+  const taRef = React.useRef<HTMLTextAreaElement>(null);
+  const lines = value.split('\n').length;
+  const onScroll = () => {
+    if (gutterRef.current && taRef.current) gutterRef.current.scrollTop = taRef.current.scrollTop;
+  };
+  return (
+    <div className="editor-wrap">
+      <div className="editor-gutter" ref={gutterRef}>
+        {Array.from({ length: lines }, (_, i) => <div key={i}>{i + 1}</div>)}
+      </div>
+      <textarea ref={taRef} className="editor-area" value={value} spellCheck={false}
+        onChange={(e) => onChange(e.target.value)} onScroll={onScroll} />
+    </div>
+  );
+}
 
 export default function MemoryPage() {
-  const [tab, setTab] = React.useState<'roles' | 'skills'>('roles');
-  const { data: roles, reload: reloadRoles } = useAsyncData<any[]>(() => get('/api/v1/roles'), []);
-  const { data: skills, reload: reloadSkills } = useAsyncData<any[]>(() => get('/api/v1/skills'), []);
+  const { data: roles, reload: reloadRoles } = useAsyncData<any[]>(() => get('/api/v1/roles/memory'), []);
+  const { data: agents, reload: reloadAgents } = useAsyncData<any[]>(() => get('/api/v1/agents'), []);
+  const { data: allSkills } = useAsyncData<any[]>(() => get('/api/v1/skills'), []);
+  const [search, setSearch] = React.useState('');
+  const [selectedRole, setSelectedRole] = React.useState<string | null>(null);
+  const [tab, setTab] = React.useState<'instructions' | 'skills'>('instructions');
   const [modal, setModal] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const fail = (e: any) => setError(e.message || String(e));
 
+  React.useEffect(() => {
+    if (!selectedRole && roles?.length) setSelectedRole(roles[0].id);
+    if (selectedRole && roles && !roles.find((r) => r.id === selectedRole)) setSelectedRole(roles[0]?.id ?? null);
+  }, [roles, selectedRole]);
+
+  const role = roles?.find((r) => r.id === selectedRole);
+  const roleAgents = (agents ?? []).filter((a) => a.role_id === selectedRole);
+  const filtered = (roles ?? []).filter((r) => r.name.toLowerCase().includes(search.toLowerCase()));
+  const [selectedInstr, setSelectedInstr] = React.useState<string | null>(null);
+  React.useEffect(() => { setSelectedInstr(null); }, [selectedRole]);
+
   return (
     <div className="page">
       <div className="page-header">
-        <div>
-          <h1>Agent Memory</h1>
-          <div className="sub">Reusable roles, versioned personas and skills. Instructions are immutable per version.</div>
+        <div className="row" style={{ gap: 14 }}>
+          <div className="brain-icon">🧠</div>
+          <div>
+            <h1 style={{ margin: 0 }}>Agent Memory</h1>
+            <div className="sub">Define role-based instructions and skills to guide your AI agents.</div>
+          </div>
         </div>
-        <div className="btn-row">
-          {tab === 'roles' && <button className="btn primary" onClick={() => setModal('newRole')}>+ New Role</button>}
-          {tab === 'skills' && <button className="btn primary" onClick={() => setModal('newSkill')}>+ New Skill</button>}
-        </div>
+        <button className="btn primary" onClick={() => setModal('newRole')}>+ New Group</button>
       </div>
       <ErrorNote error={error} />
-      <div className="row" style={{ marginBottom: 14 }}>
-        <button className={`btn small ${tab === 'roles' ? 'primary' : ''}`} onClick={() => setTab('roles')}>Roles & Personas</button>
-        <button className={`btn small ${tab === 'skills' ? 'primary' : ''}`} onClick={() => setTab('skills')}>Skills</button>
-      </div>
 
-      {tab === 'roles' && (roles ?? []).map((r) => (
-        <RoleCard key={r.id} role={r} reload={reloadRoles} onError={fail} />
-      ))}
-      {tab === 'roles' && !roles?.length && <div className="empty">No roles defined.</div>}
+      <div className="memory-layout">
+        {/* ---------------- left: role groups ---------------- */}
+        <div className="mem-card col-groups">
+          <div className="mem-card-title">Role Groups</div>
+          <div className="search-wrap">
+            <input placeholder="Search groups…" value={search} onChange={(e) => setSearch(e.target.value)} />
+          </div>
+          <div className="group-list">
+            {filtered.map((r) => (
+              <div key={r.id} className={`group-item ${selectedRole === r.id ? 'active' : ''}`}
+                onClick={() => { setSelectedRole(r.id); setTab('instructions'); }}>
+                <div className="group-icon">{iconFor(r.name)}</div>
+                <div style={{ minWidth: 0 }}>
+                  <div className="group-name">{r.name}</div>
+                  <div className="kv">{r.instruction_count} instructions · {r.skill_count} skills</div>
+                </div>
+                {!r.active && <span style={{ marginLeft: 'auto' }}><Badge kind="dim">off</Badge></span>}
+              </div>
+            ))}
+            {!filtered.length && <div className="empty" style={{ padding: 18 }}>No groups match.</div>}
+          </div>
+          <button className="btn add-group" onClick={() => setModal('newRole')}>+ Add Role Group</button>
+        </div>
 
-      {tab === 'skills' && (skills ?? []).map((s) => (
-        <div key={s.id} className="card">
-          <div className="spread">
-            <div>
-              <h3 style={{ margin: 0 }}>{s.name} <Badge kind="dim">v{s.version}</Badge></h3>
-              <div className="muted small">{s.description}</div>
+        {/* ---------------- middle: group detail ---------------- */}
+        {role ? (
+          <div className="mem-card col-main">
+            <div className="spread">
+              <div>
+                <div className="mem-group-title">{role.name}</div>
+                <div className="muted small">{role.description || 'No description'}</div>
+              </div>
+              <div className="btn-row">
+                <button className="btn small" onClick={() => setModal('editRole')}>✎ Edit Group</button>
+                <button className="btn small danger" onClick={async () => {
+                  if (!confirm(`Delete role group "${role.name}"?`)) return;
+                  try { await del(`/api/v1/roles/${role.id}`); reloadRoles(); } catch (e: any) { fail(e); }
+                }}>🗑 Delete</button>
+              </div>
             </div>
-            <div className="btn-row">
-              <button className="btn small" onClick={() => setModal('editSkill-' + s.id)}>Edit source</button>
-              <button className="btn small danger" onClick={async () => {
-                try { await del(`/api/v1/skills/${s.id}`); reloadSkills(); } catch (e: any) { fail(e); }
-              }}>Delete</button>
+
+            <div className="subtabs">
+              <button className={`subtab ${tab === 'instructions' ? 'active' : ''}`} onClick={() => setTab('instructions')}>📋 Instructions</button>
+              <button className={`subtab ${tab === 'skills' ? 'active' : ''}`} onClick={() => setTab('skills')}>⛁ Skills</button>
+            </div>
+
+            {tab === 'instructions' ? (
+              <InstructionsPanel roleId={role.id} selected={selectedInstr} onSelect={setSelectedInstr}
+                onError={fail} onOpenModal={setModal} />
+            ) : (
+              <SkillsPanel roleId={role.id} allSkills={allSkills ?? []} onError={fail} onChanged={reloadRoles} />
+            )}
+
+            <div className="assign-section">
+              <div className="mem-card-title">Assign to Agents</div>
+              <div className="muted small" style={{ marginBottom: 10 }}>
+                Agents with this role group will use these instructions and skills in their context.
+              </div>
+              <div className="row">
+                {roleAgents.map((a) => (
+                  <div key={a.id} className="agent-chip">
+                    <span className={`dot ${a.lifecycle_state === 'Working' ? 'dot-ok' : AGENT_STATE_CLASS[a.lifecycle_state] === 'err' ? 'dot-err' : 'dot-dim'}`} />
+                    <div>
+                      <div className="small" style={{ fontWeight: 600 }}>{a.name}</div>
+                      <div className="kv">{role.name}</div>
+                    </div>
+                  </div>
+                ))}
+                <button className="btn add-group" style={{ width: 'auto', padding: '8px 16px' }}
+                  onClick={() => setModal('assignAgent')}>+ Assign Agent</button>
+              </div>
+              {!roleAgents.length && <div className="kv">No agents use this group yet.</div>}
             </div>
           </div>
-        </div>
-      ))}
-      {tab === 'skills' && !skills?.length && <div className="empty">No skills defined.</div>}
+        ) : (
+          <div className="mem-card col-main"><div className="empty">Select or create a role group.</div></div>
+        )}
+
+        {/* ---------------- right: instruction editor ---------------- */}
+        <EditorPanel roleId={selectedRole} selectedId={selectedInstr} onSelect={setSelectedInstr} onError={fail} />
+      </div>
 
       {modal === 'newRole' && (
-        <RoleForm onClose={() => setModal(null)} onSaved={() => { setModal(null); reloadRoles(); }} />
+        <RoleGroupForm onClose={() => setModal(null)} onSaved={async () => { setModal(null); reloadRoles(); }} />
       )}
-      {modal === 'newSkill' && (
-        <SkillForm onClose={() => setModal(null)} onSaved={() => { setModal(null); reloadSkills(); }} />
+      {modal === 'editRole' && role && (
+        <RoleGroupForm role={role} onClose={() => setModal(null)} onSaved={async () => { setModal(null); reloadRoles(); }} />
       )}
-      {modal?.startsWith('editSkill-') && (
-        <SkillForm skill={skills?.find((s) => s.id === modal.slice(10))}
-          onClose={() => setModal(null)} onSaved={() => { setModal(null); reloadSkills(); }} />
+      {modal === 'newInstruction' && role && (
+        <InstructionForm roleId={role.id} onClose={() => setModal(null)}
+          onSaved={async (id: string) => { setModal(null); setSelectedInstr(id); }} />
+      )}
+      {modal === 'assignAgent' && role && (
+        <AssignAgentModal role={role} agents={agents ?? []} onClose={() => setModal(null)}
+          onSaved={async () => { setModal(null); reloadAgents(); }} onError={fail} />
       )}
     </div>
   );
 }
 
-function RoleCard({ role, reload, onError }: { role: any; reload: () => void; onError: (e: any) => void }) {
-  const { data: personas, reload: reloadPersonas } = useAsyncData<any[]>(() => get(`/api/v1/personas?role_id=${role.id}`), [role.id]);
-  const { data: bindings, reload: reloadBindings } = useAsyncData<any[]>(() => get(`/api/v1/model-bindings?role_id=${role.id}`), [role.id]);
-  const { data: gateways } = useAsyncData<any[]>(() => get('/api/v1/gateways'), []);
-  const [modal, setModal] = React.useState<string | null>(null);
-  const [expanded, setExpanded] = React.useState<string | null>(null);
-  const { data: allSkills } = useAsyncData<any[]>(() => get('/api/v1/skills'), []);
-
+function InstructionsPanel({ roleId, selected, onSelect, onError, onOpenModal }:
+  { roleId: string; selected: string | null; onSelect: (id: string) => void; onError: (e: any) => void; onOpenModal: (m: string) => void }) {
+  const { data: instructions, reload } = useAsyncData<any[]>(() => get(`/api/v1/roles/${roleId}/instructions`), [roleId]);
+  React.useEffect(() => {
+    if (!selected && instructions?.length) onSelect(instructions[0].id);
+  }, [instructions, selected]);
   return (
-    <div className="card" style={{ opacity: role.active ? 1 : 0.55 }}>
-      <div className="spread">
+    <>
+      <div className="spread" style={{ marginBottom: 10 }}>
         <div>
-          <h3 style={{ margin: 0 }}>{role.name} {!role.active && <Badge kind="dim">inactive</Badge>}</h3>
-          <div className="muted small">{role.description}</div>
+          <div className="mem-card-title" style={{ margin: 0 }}>Instruction Files</div>
+          <div className="muted small">These files define how agents in this group should behave.</div>
         </div>
+        <button className="btn small primary" onClick={() => onOpenModal('newInstruction')}>+ New Instruction</button>
+      </div>
+      <div className="instr-list">
+        {(instructions ?? []).map((f) => (
+          <div key={f.id} className={`instr-item ${selected === f.id ? 'active' : ''}`}
+            onClick={() => onSelect(f.id)}>
+            <div className="group-icon">📄</div>
+            <div className="grow" style={{ minWidth: 0 }}>
+              <div className="group-name mono">{f.filename}</div>
+              <div className="kv">{f.description}</div>
+            </div>
+            <span className="kv" style={{ whiteSpace: 'nowrap' }}>Updated {fmtRel(f.updated_at)}</span>
+            <button className="btn small danger" onClick={async (e) => {
+              e.stopPropagation();
+              if (!confirm(`Delete ${f.filename}?`)) return;
+              try { await del(`/api/v1/instructions/${f.id}`); reload(); } catch (err: any) { onError(err); }
+            }}>⋮</button>
+          </div>
+        ))}
+        {!instructions?.length && <div className="empty">No instruction files yet. Create the first one.</div>}
+      </div>
+    </>
+  );
+}
+
+function EditorPanel({ roleId, selectedId, onSelect, onError }:
+  { roleId: string | null; selectedId: string | null; onSelect: (id: string) => void; onError: (e: any) => void }) {
+  const { data: instructions, reload } = useAsyncData<any[]>(
+    () => (roleId ? get(`/api/v1/roles/${roleId}/instructions`) : Promise.resolve([])), [roleId]);
+  const file = instructions?.find((f) => f.id === selectedId) ?? null;
+  const [draft, setDraft] = React.useState('');
+  const [mode, setMode] = React.useState<'edit' | 'preview'>('edit');
+  const [saving, setSaving] = React.useState(false);
+  const [savedTick, setSavedTick] = React.useState(0);
+
+  React.useEffect(() => { setDraft(file?.content ?? ''); setMode('edit'); }, [file?.id, file?.version]);
+
+  if (!roleId) return null;
+  if (!file) {
+    return (
+      <div className="mem-card col-editor"><div className="empty">Select an instruction file to view or edit it.</div></div>
+    );
+  }
+  const dirty = draft !== file.content;
+  return (
+    <div className="mem-card col-editor">
+      <div className="spread">
+        <div className="row" style={{ gap: 8 }}>
+          <span className="group-icon">📄</span>
+          <b className="mono">{file.filename}</b>
+          <Badge kind="dim">v{file.version}</Badge>
+        </div>
+        <button className="btn small danger" onClick={async () => {
+          if (!confirm(`Delete ${file.filename}?`)) return;
+          try { await del(`/api/v1/instructions/${file.id}`); onSelect(null); reload(); } catch (e: any) { onError(e); }
+        }}>🗑</button>
+      </div>
+      <div className="subtabs">
+        <button className={`subtab ${mode === 'edit' ? 'active' : ''}`} onClick={() => setMode('edit')}>✎ Edit</button>
+        <button className={`subtab ${mode === 'preview' ? 'active' : ''}`} onClick={() => setMode('preview')}>👁 Preview</button>
+      </div>
+      <div className="editor-holder">
+        {mode === 'edit'
+          ? <CodeEditor value={draft} onChange={setDraft} />
+          : <div className="md-preview" dangerouslySetInnerHTML={{ __html: renderMd(draft) }} />}
+      </div>
+      <div className="spread" style={{ marginTop: 10 }}>
+        <span className="kv">Last saved: {fmtRel(file.updated_at)}{savedTick > 0 && !dirty ? ' ✓' : ''}</span>
         <div className="btn-row">
-          <button className="btn small" onClick={() => setModal('persona')}>+ Persona</button>
-          <button className="btn small" onClick={() => setModal('binding')}>+ Model binding</button>
-          <button className="btn small" onClick={async () => {
-            try { await patch(`/api/v1/roles/${role.id}`, { active: role.active ? 0 : 1 }); reload(); }
-            catch (e: any) { onError(e); }
-          }}>{role.active ? 'Deactivate' : 'Activate'}</button>
+          <button className="btn small" disabled={!dirty} onClick={() => setDraft(file.content)}>Cancel</button>
+          <button className="btn small primary" disabled={!dirty || saving} onClick={async () => {
+            setSaving(true);
+            try {
+              await patch(`/api/v1/instructions/${file.id}`, { content: draft });
+              setSavedTick((t) => t + 1);
+              reload();
+            } catch (e: any) { onError(e); } finally { setSaving(false); }
+          }}>Save Changes</button>
         </div>
       </div>
-
-      <div className="section-title">Personas</div>
-      {(personas ?? []).map((p) => (
-        <div key={p.id} className="list-row">
-          <div className="grow">
-            <b>{p.name}</b> <Badge kind="dim">v{p.version}</Badge> {!p.active && <Badge kind="dim">inactive</Badge>}
-            <div className="kv">{p.description}</div>
-          </div>
-          <div className="btn-row">
-            <button className="btn small" onClick={() => setExpanded(expanded === p.id ? null : p.id)}>
-              {expanded === p.id ? 'Hide' : 'Instructions'}
-            </button>
-            <button className="btn small danger" onClick={async () => {
-              try { await del(`/api/v1/personas/${p.id}`); reloadPersonas(); } catch (e: any) { onError(e); }
-            }}>Delete</button>
-          </div>
-          {expanded === p.id && (
-            <PersonaDetail persona={p} onError={onError} allSkills={allSkills ?? []} reload={reloadPersonas} />
-          )}
-        </div>
-      ))}
-      {!personas?.length && <div className="kv" style={{ padding: '4px 0 10px' }}>No personas for this role.</div>}
-
-      <div className="section-title">Model bindings</div>
-      {(bindings ?? []).map((b) => (
-        <div key={b.id} className="list-row">
-          <div className="grow">
-            <span className="mono">{b.provider_model_id}</span> <span className="kv">@ {b.gateway_name}</span>
-          </div>
-          <button className="btn small danger" onClick={async () => {
-            try { await del(`/api/v1/model-bindings/${b.id}`); reloadBindings(); } catch (e: any) { onError(e); }
-          }}>Remove</button>
-        </div>
-      ))}
-      {!bindings?.length && <div className="kv" style={{ padding: '4px 0 10px' }}>No model binding — agents need one to run.</div>}
-
-      {modal === 'persona' && (
-        <PersonaForm roleId={role.id} onClose={() => setModal(null)}
-          onSaved={() => { setModal(null); reloadPersonas(); }} />
-      )}
-      {modal === 'binding' && (
-        <BindingForm roleId={role.id} gateways={gateways ?? []} onClose={() => setModal(null)}
-          onSaved={() => { setModal(null); reloadBindings(); }} />
-      )}
     </div>
   );
 }
 
-function PersonaDetail({ persona, allSkills, onError, reload }: any) {
-  const { data: attached, reload: reloadAttached } = useAsyncData<any[]>(() => get(`/api/v1/personas/${persona.id}/skills`), [persona.id]);
-  const [instr, setInstr] = React.useState(persona.instructions);
-  const [cons, setCons] = React.useState(persona.constraints_text);
-  const [dirty, setDirty] = React.useState(false);
-  React.useEffect(() => { setInstr(persona.instructions); setCons(persona.constraints_text); setDirty(false); }, [persona]);
-
+function SkillsPanel({ roleId, allSkills, onError, onChanged }:
+  { roleId: string; allSkills: any[]; onError: (e: any) => void; onChanged: () => void }) {
+  const { data: attached, reload } = useAsyncData<any[]>(() => get(`/api/v1/roles/${roleId}/skills`), [roleId]);
+  const available = allSkills.filter((s) => !(attached ?? []).some((a) => a.id === s.id));
+  const toggle = async (sid: string, on: boolean) => {
+    try {
+      if (on) await del(`/api/v1/roles/${roleId}/skills/${sid}`);
+      else await post(`/api/v1/roles/${roleId}/skills/${sid}`);
+      reload(); onChanged();
+    } catch (e: any) { onError(e); }
+  };
   return (
-    <div style={{ width: '100%', marginTop: 8 }}>
-      <Field label={`Instructions (immutable versions — saving creates v${persona.version + 1})`}>
-        <textarea value={instr} rows={5} onChange={(e) => { setInstr(e.target.value); setDirty(true); }} />
-      </Field>
-      <Field label="Constraints">
-        <textarea value={cons} rows={2} onChange={(e) => { setCons(e.target.value); setDirty(true); }} />
-      </Field>
-      <div className="btn-row" style={{ marginBottom: 10 }}>
-        <button className="btn small primary" disabled={!dirty} onClick={async () => {
-          try { await patch(`/api/v1/personas/${persona.id}`, { instructions: instr, constraints_text: cons }); reload(); }
-          catch (e: any) { onError(e); }
-        }}>Save as new version</button>
+    <>
+      <div className="mem-card-title">Attached Skills</div>
+      <div className="row" style={{ marginBottom: 14 }}>
+        {(attached ?? []).map((s) => (
+          <span key={s.id} className="skill-chip on" onClick={() => toggle(s.id, true)}>
+            {s.name} <b>✕</b>
+          </span>
+        ))}
+        {!attached?.length && <span className="kv">No skills attached yet.</span>}
       </div>
-      <div className="kv" style={{ marginBottom: 6 }}>Skills attached:</div>
+      <div className="mem-card-title">Available Skills</div>
       <div className="row">
-        {(allSkills ?? []).map((s) => {
-          const on = (attached ?? []).some((a: any) => a.id === s.id);
-          return (
-            <button key={s.id} className={`btn small ${on ? 'primary' : ''}`} onClick={async () => {
-              try {
-                if (on) await del(`/api/v1/personas/${persona.id}/skills/${s.id}`);
-                else await post(`/api/v1/personas/${persona.id}/skills/${s.id}`);
-                reloadAttached();
-              } catch (e: any) { onError(e); }
-            }}>{s.name}{on ? ' ✓' : ''}</button>
-          );
-        })}
+        {available.map((s) => (
+          <span key={s.id} className="skill-chip" onClick={() => toggle(s.id, false)} title={s.description}>
+            + {s.name}
+          </span>
+        ))}
+        {!available.length && <span className="kv">All skills attached.</span>}
       </div>
-    </div>
+    </>
   );
 }
 
-function PersonaForm({ roleId, onClose, onSaved }: any) {
-  const [f, setF] = React.useState({ name: '', description: '', instructions: '', constraints_text: '' });
-  const upd = (k: string) => (e: any) => setF({ ...f, [k]: e.target.value });
+function InstructionForm({ roleId, onClose, onSaved }: any) {
+  const [f, setF] = React.useState({ filename: '', description: '', content: '# New Instruction\n\n- Point one\n- Point two' });
   return (
-    <Modal title="New Persona" onClose={onClose}>
-      <Field label="Name"><input value={f.name} onChange={upd('name')} /></Field>
-      <Field label="Description"><input value={f.description} onChange={upd('description')} /></Field>
-      <Field label="Instructions"><textarea value={f.instructions} rows={6} onChange={upd('instructions')} /></Field>
-      <Field label="Constraints"><textarea value={f.constraints_text} rows={2} onChange={upd('constraints_text')} /></Field>
-      <button className="btn primary" disabled={!f.name} onClick={async () => {
-        try { await post(`/api/v1/roles/${roleId}/personas`, f); onSaved(); }
-        catch (e: any) { alert(e.message); }
-      }}>Create Persona</button>
-    </Modal>
-  );
-}
-
-function BindingForm({ roleId, gateways, onClose, onSaved }: any) {
-  const [gw, setGw] = React.useState('');
-  const [modelId, setModelId] = React.useState('');
-  const { data: models } = useAsyncData<any[]>(() => (gw ? get(`/api/v1/gateways/${gw}/models`) : Promise.resolve([])), [gw]);
-  return (
-    <Modal title="Bind Role to Model" onClose={onClose}>
-      <Field label="Gateway">
-        <select value={gw} onChange={(e) => { setGw(e.target.value); setModelId(''); }}>
-          <option value="">— select gateway —</option>
-          {(gateways ?? []).map((g: any) => <option key={g.id} value={g.id}>{g.name} ({g.provider})</option>)}
-        </select>
-      </Field>
-      <Field label="Model">
-        <select value={modelId} onChange={(e) => setModelId(e.target.value)} disabled={!gw}>
-          <option value="">— select model —</option>
-          {(models ?? []).map((m: any) => <option key={m.id} value={m.id}>{m.display_name} ({m.provider_model_id})</option>)}
-        </select>
-      </Field>
-      <button className="btn primary" disabled={!gw || !modelId} onClick={async () => {
-        try { await post('/api/v1/model-bindings', { role_id: roleId, gateway_id: gw, model_id: modelId }); onSaved(); }
-        catch (e: any) { alert(e.message); }
-      }}>Create Binding</button>
-    </Modal>
-  );
-}
-
-function RoleForm({ onClose, onSaved }: any) {
-  const [f, setF] = React.useState({ name: '', description: '' });
-  return (
-    <Modal title="New Role" onClose={onClose}>
-      <Field label="Role name"><input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></Field>
+    <Modal title="New Instruction File" onClose={onClose}>
+      <Field label="File name"><input value={f.filename} onChange={(e) => setF({ ...f, filename: e.target.value })} placeholder="coding-standards" /></Field>
       <Field label="Description"><input value={f.description} onChange={(e) => setF({ ...f, description: e.target.value })} /></Field>
-      <button className="btn primary" disabled={!f.name} onClick={async () => {
-        try { await post('/api/v1/roles', f); onSaved(); } catch (e: any) { alert(e.message); }
-      }}>Create Role</button>
+      <Field label="Markdown content"><textarea value={f.content} rows={8} onChange={(e) => setF({ ...f, content: e.target.value })} /></Field>
+      <button className="btn primary" disabled={!f.filename} onClick={async () => {
+        try {
+          const instr = await post(`/api/v1/roles/${roleId}/instructions`, f);
+          onSaved(instr.id);
+        } catch (e: any) { alert(e.message); }
+      }}>Create Instruction</button>
     </Modal>
   );
 }
 
-function SkillForm({ skill, onClose, onSaved }: any) {
-  const [f, setF] = React.useState({
-    name: skill?.name ?? '', description: skill?.description ?? '',
-    content: skill?.content ?? '# Skill\nDescribe the procedure…',
-  });
+function RoleGroupForm({ role, onClose, onSaved }: { role?: any; onClose: () => void; onSaved: () => void }) {
+  const [f, setF] = React.useState({ name: role?.name ?? '', description: role?.description ?? '' });
   return (
-    <Modal title={skill ? `Edit Skill: ${skill.name}` : 'New Skill'} onClose={onClose}>
-      {!skill && <Field label="Name"><input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></Field>}
+    <Modal title={role ? `Edit Group: ${role.name}` : 'New Role Group'} onClose={onClose}>
+      <Field label="Group name"><input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></Field>
       <Field label="Description"><input value={f.description} onChange={(e) => setF({ ...f, description: e.target.value })} /></Field>
-      <Field label="Markdown source"><textarea value={f.content} rows={10} onChange={(e) => setF({ ...f, content: e.target.value })} /></Field>
       <button className="btn primary" disabled={!f.name} onClick={async () => {
         try {
-          if (skill) await patch(`/api/v1/skills/${skill.id}`, { description: f.description, content: f.content });
-          else await post('/api/v1/skills', f);
+          if (role) await patch(`/api/v1/roles/${role.id}`, f);
+          else await post('/api/v1/roles', f);
           onSaved();
         } catch (e: any) { alert(e.message); }
-      }}>{skill ? 'Save (bumps version)' : 'Create Skill'}</button>
+      }}>{role ? 'Save Group' : 'Create Group'}</button>
+    </Modal>
+  );
+}
+
+function AssignAgentModal({ role, agents, onClose, onSaved, onError }: any) {
+  const candidates = agents.filter((a: any) => a.role_id !== role.id);
+  const [agentId, setAgentId] = React.useState('');
+  const agent = agents.find((a: any) => a.id === agentId);
+  const { data: personas } = useAsyncData<any[]>(
+    () => (agentId ? get(`/api/v1/personas?role_id=${role.id}`) : Promise.resolve([])), [agentId, role.id]);
+  return (
+    <Modal title={`Assign Agent to ${role.name}`} onClose={onClose}>
+      <Field label="Agent">
+        <select value={agentId} onChange={(e) => setAgentId(e.target.value)}>
+          <option value="">— select agent —</option>
+          {candidates.map((a: any) => <option key={a.id} value={a.id}>{a.name} (currently {a.role_name})</option>)}
+        </select>
+      </Field>
+      {agentId && (
+        <Field label="Persona for this role">
+          <select defaultValue="">
+            <option value="">— first persona of role —</option>
+            {(personas ?? []).map((p: any) => <option key={p.id} value={p.id}>{p.name} (v{p.version})</option>)}
+          </select>
+        </Field>
+      )}
+      <button className="btn primary" disabled={!agentId} onClick={async () => {
+        try {
+          const persona = (personas ?? [])[0];
+          await patch(`/api/v1/agents/${agentId}`, { role_id: role.id, persona_id: persona?.id ?? agent?.persona_id });
+          onSaved();
+        } catch (e: any) { onError(e); }
+      }}>Assign Agent</button>
+      {!candidates.length && <div className="kv" style={{ marginTop: 10 }}>All agents already use this role.</div>}
     </Modal>
   );
 }

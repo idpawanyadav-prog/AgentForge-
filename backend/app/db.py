@@ -315,6 +315,24 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS instruction_files (
+  id TEXT PRIMARY KEY,
+  role_id TEXT NOT NULL REFERENCES roles(id),
+  filename TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '',
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(role_id, filename)
+);
+
+CREATE TABLE IF NOT EXISTS role_skills (
+  role_id TEXT NOT NULL REFERENCES roles(id),
+  skill_id TEXT NOT NULL REFERENCES skills(id),
+  PRIMARY KEY (role_id, skill_id)
+);
+
 CREATE TABLE IF NOT EXISTS pending_commands (
   id TEXT PRIMARY KEY,
   conversation_id TEXT NOT NULL,
@@ -367,6 +385,49 @@ def init_db():
     db.executescript(SCHEMA)
     db.commit()
     seed_if_empty()
+    seed_instruction_files()
+
+
+def seed_instruction_files():
+    """Seed role-group instruction files and role-level skill attachments."""
+    ts = now()
+    if not query_one("SELECT id FROM instruction_files LIMIT 1"):
+        files = {
+            "Senior Developer": [
+                ("coding-standards.md", "General coding standards and best practices",
+                 "# Coding Standards for Senior Developers\n\n## General Principles\n- Write clean, maintainable, and well-documented code\n- Follow SOLID principles\n- Prefer simplicity over cleverness\n- Ensure test coverage for critical logic\n\n## Error Handling\n- Implement proper error handling\n- Use structured logging\n- Provide meaningful error messages\n\n## Performance\n- Optimize for readability first, then performance\n- Avoid premature optimization\n- Use profiling tools for bottlenecks"),
+                ("code-review.md", "Code review guidelines and checklist",
+                 "# Code Review Guidelines\n\n## Checklist\n- Correctness: does the change do what it claims?\n- Tests: are new paths covered by meaningful assertions?\n- Security: no secrets, no injection risks, no unsafe deserialization\n- Readability: clear names, small functions, helpful comments\n\n## Etiquette\n- Review within one business day\n- Comment on code, never on people"),
+            ],
+            "Solution Architect": [
+                ("architecture-guidelines.md", "System design and architecture guidelines",
+                 "# Architecture Guidelines\n\n## Principles\n- Prefer boring, proven technology\n- Document decisions and trade-offs (ADRs)\n- Design for the failure modes you actually expect\n- Version every external contract\n\n## Review Gates\n- No new dependency without a documented rationale"),
+            ],
+            "Business Analyst": [
+                ("requirements-playbook.md", "How to write backlog items and acceptance criteria",
+                 "# Requirements Playbook\n\n## Writing Stories\n- INVEST-check every story\n- Acceptance criteria in Given / When / Then form\n- Surface assumptions explicitly\n\n## Prioritization\n- P1: blocks release\n- P2: core value\n- P3: polish"),
+            ],
+            "QA Engineer": [
+                ("test-charter.md", "Risk-based testing charter",
+                 "# Test Charter\n\n## Approach\n- Test risk, not coverage vanity\n- Every acceptance criterion gets an explicit check\n- Report severity and reproduction steps\n\n## Gates\n- Never mark an item done with a failing criterion"),
+            ],
+            "DevOps Engineer": [
+                ("release-checklist.md", "Deployment and release checklist",
+                 "# Release Checklist\n\n## Before deploy\n- Pipeline green on main\n- Rollback plan documented\n- Budget/cost alerts armed\n\n## After deploy\n- Health checks verified\n- Error budget reviewed"),
+            ],
+        }
+        for role in query("SELECT * FROM roles"):
+            for fn, desc, content in files.get(role["name"], []):
+                insert("instruction_files", {
+                    "id": new_id(), "role_id": role["id"], "filename": fn,
+                    "description": desc, "content": content, "version": 1,
+                    "created_at": ts, "updated_at": ts,
+                })
+    if not query_one("SELECT role_id FROM role_skills LIMIT 1"):
+        for r in query("SELECT DISTINCT p.role_id AS role_id, ps.skill_id AS skill_id "
+                       "FROM persona_skills ps JOIN personas p ON p.id = ps.persona_id"):
+            execute("INSERT OR IGNORE INTO role_skills (role_id, skill_id) VALUES (?,?)",
+                    (r["role_id"], r["skill_id"]))
 
 
 def seed_if_empty():
@@ -377,7 +438,7 @@ def seed_if_empty():
                   "usage_records", "workflow_runs", "task_dependencies", "tasks", "sprints",
                   "backlog_items", "projects", "team_agents", "teams", "agents", "model_bindings",
                   "persona_skills", "skills", "persona_versions", "personas", "roles",
-                  "gateway_models", "gateways", "audit_events"):
+                  "gateway_models", "gateways", "audit_events", "instruction_files", "role_skills"):
         execute(f"DELETE FROM {table}")
     ts = now()
 

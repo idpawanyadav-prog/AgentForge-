@@ -33,6 +33,20 @@ export function fmtDateTime(iso: string): string {
   return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
+export function fmtRel(iso: string): string {
+  if (!iso) return '';
+  const ms = Date.now() - new Date(iso).getTime();
+  const min = Math.floor(ms / 60000);
+  if (min < 1) return 'just now';
+  if (min < 60) return `${min}m ago`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 7) return `${d} day${d > 1 ? 's' : ''} ago`;
+  const w = Math.floor(d / 7);
+  return `${w} week${w > 1 ? 's' : ''} ago`;
+}
+
 // Minimal markdown renderer: bold + inline code + newlines (escaped).
 export function md(text: string): string {
   const esc = text

@@ -269,6 +269,76 @@ def discover_models(gid: str):
 
 # ------------------------------- agent memory -------------------------------
 
+@app.get("/api/v1/roles/memory")
+def roles_memory():
+    out = []
+    for r in query("SELECT * FROM roles ORDER BY name"):
+        ic = query_one("SELECT COUNT(*) AS n FROM instruction_files WHERE role_id=?", (r["id"],))["n"]
+        sc = query_one("SELECT COUNT(*) AS n FROM role_skills WHERE role_id=?", (r["id"],))["n"]
+        out.append({**r, "instruction_count": ic, "skill_count": sc})
+    return out
+
+
+class InstructionIn(BaseModel):
+    filename: str
+    description: str = ""
+    content: str = ""
+
+
+@app.get("/api/v1/roles/{rid}/instructions")
+def list_instructions(rid: str):
+    return query("SELECT * FROM instruction_files WHERE role_id=? ORDER BY filename", (rid,))
+
+
+@app.post("/api/v1/roles/{rid}/instructions")
+def create_instruction(rid: str, body: InstructionIn):
+    _or_404(query_one("SELECT id FROM roles WHERE id=?", (rid,)), "Role")
+    filename = body.filename if body.filename.endswith(".md") else body.filename + ".md"
+    if query_one("SELECT id FROM instruction_files WHERE role_id=? AND lower(filename)=lower(?)", (rid, filename)):
+        raise HTTPException(409, "An instruction file with that name already exists in this group")
+    ts = now()
+    iid = new_id()
+    insert("instruction_files", {"id": iid, "role_id": rid, "filename": filename,
+                                 "description": body.description, "content": body.content,
+                                 "version": 1, "created_at": ts, "updated_at": ts})
+    audit("create_instruction", "instruction_file", iid, f"Created instruction '{filename}'")
+    return query_one("SELECT * FROM instruction_files WHERE id = ?", (iid,))
+
+
+@app.patch("/api/v1/instructions/{iid}")
+def update_instruction(iid: str, body: dict):
+    instr = _or_404(query_one("SELECT * FROM instruction_files WHERE id=?", (iid,)), "Instruction")
+    allowed = {k: v for k, v in body.items() if k in ("filename", "description", "content")}
+    if "content" in allowed and allowed["content"] != instr["content"]:
+        allowed["version"] = instr["version"] + 1
+    allowed["updated_at"] = now()
+    update("instruction_files", iid, allowed)
+    return query_one("SELECT * FROM instruction_files WHERE id = ?", (iid,))
+
+
+@app.delete("/api/v1/instructions/{iid}")
+def delete_instruction(iid: str):
+    execute("DELETE FROM instruction_files WHERE id=?", (iid,))
+    return {"ok": True}
+
+
+@app.get("/api/v1/roles/{rid}/skills")
+def list_role_skills(rid: str):
+    return query("SELECT s.* FROM role_skills rs JOIN skills s ON s.id = rs.skill_id WHERE rs.role_id=? ORDER BY s.name", (rid,))
+
+
+@app.post("/api/v1/roles/{rid}/skills/{sid}")
+def attach_role_skill(rid: str, sid: str):
+    execute("INSERT OR IGNORE INTO role_skills (role_id, skill_id) VALUES (?,?)", (rid, sid))
+    return {"ok": True}
+
+
+@app.delete("/api/v1/roles/{rid}/skills/{sid}")
+def detach_role_skill(rid: str, sid: str):
+    execute("DELETE FROM role_skills WHERE role_id=? AND skill_id=?", (rid, sid))
+    return {"ok": True}
+
+
 @app.get("/api/v1/roles")
 def list_roles():
     return query("SELECT * FROM roles ORDER BY name")
@@ -302,6 +372,8 @@ def delete_role(rid: str):
         update("roles", rid, {"active": 0, "updated_at": now()})
         audit("deactivate_role", "role", rid, "Role in use; deactivated instead of deleted")
         return {"ok": True, "deactivated": True}
+    execute("DELETE FROM instruction_files WHERE role_id=?", (rid,))
+    execute("DELETE FROM role_skills WHERE role_id=?", (rid,))
     execute("DELETE FROM personas WHERE role_id=?", (rid,))
     execute("DELETE FROM model_bindings WHERE role_id=?", (rid,))
     execute("DELETE FROM roles WHERE id=?", (rid,))
@@ -469,7 +541,7 @@ def create_agent(body: AgentIn):
 @app.patch("/api/v1/agents/{aid}")
 def update_agent(aid: str, body: dict):
     _or_404(query_one("SELECT id FROM agents WHERE id=?", (aid,)), "Agent")
-    allowed = {k: v for k, v in body.items() if k in ("name", "persona_id", "model_binding_id")}
+    allowed = {k: v for k, v in body.items() if k in ("name", "role_id", "persona_id", "model_binding_id")}
     allowed["updated_at"] = now()
     update("agents", aid, allowed)
     return query_one("SELECT * FROM agents WHERE id = ?", (aid,))
