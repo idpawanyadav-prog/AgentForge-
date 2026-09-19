@@ -267,14 +267,32 @@ def _norm_title(title: str) -> str:
     return " ".join(str(title or "").lower().split())
 
 
+_DUPLICATE_STOPWORDS = {"add", "implement", "build", "create", "make", "setup", "set up",
+                        "the", "a", "an", "with", "and", "for", "to", "in", "of", "or"}
+
+
+def _title_tokens(title: str) -> set:
+    return {t for t in _norm_title(title).replace("°", "").split()
+            if t and t not in _DUPLICATE_STOPWORDS}
+
+
 def _duplicate_task_exists(project_id: str, title: str) -> bool:
-    """True when a task with the same normalized title already exists in any
-    sprint of this project — blocks the PO from re-creating completed work."""
+    """True when an equivalent task already exists in any sprint of this
+    project — blocks the PO from re-creating completed work. Matches exact
+    normalized titles AND near-duplicates (reworded titles like 'Add X' vs
+    'Implement X' whose content tokens overlap heavily)."""
     norm = _norm_title(title)
     if not norm:
         return False
+    tokens = _title_tokens(title)
     for t in query("SELECT title FROM tasks WHERE project_id = ?", (project_id,)):
         if _norm_title(t["title"]) == norm:
+            return True
+        other = _title_tokens(t["title"])
+        if not tokens or not other:
+            continue
+        overlap = len(tokens & other) / max(1, min(len(tokens), len(other)))
+        if overlap >= 0.75:
             return True
     return False
 

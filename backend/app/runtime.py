@@ -920,14 +920,19 @@ def stop_sprint_execution(project_id: str):
 
 
 def recover_orphans():
-    """Called at startup: mark interrupted runs as failed and free agents."""
+    """Called at startup: mark interrupted runs as failed and free agents.
+    Interrupted tasks go back to Ready (kept assignment) so the loop re-runs
+    them — a service restart is not a work blocker."""
     for run in query("SELECT * FROM workflow_runs WHERE status IN ('Running','Paused')"):
         update("workflow_runs", run["id"], {"status": "Failed", "completed_at": now(),
                                             "current_step": "interrupted (service restart)"})
         if run["task_id"]:
             update("tasks", run["task_id"],
-                   {"status": "Blocked", "blocked_reason": "Interrupted by service restart",
+                   {"status": "Ready", "blocked_reason": "",
                     "updated_at": now()})
+            _emit(run["project_id"], "task.status_changed",
+                  {"task_id": run["task_id"], "status": "Ready",
+                   "note": "re-queued after service restart"})
         _emit(run["project_id"], "workflow.failed",
               {"run_id": run["id"], "error": "Service restarted; run marked recoverable",
                "recoverable": True}, workflow_run_id=run["id"])
