@@ -286,7 +286,7 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
   }, [poMode, activeProject]);
   React.useEffect(() => { if (poMode) poEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [poMessages]);
   // If the project has no Product Owner (or it was removed), drop out of PO chat mode.
-  React.useEffect(() => { if (poMode && s && !s.po?.has_po) setPoMode(false); }, [poMode, s]);
+  React.useEffect(() => { if (poMode && summary && !summary.po?.has_po) setPoMode(false); }, [poMode, summary]);
 
   const togglePo = async () => {
     if (!activeProject || !s?.po?.has_po) return;
