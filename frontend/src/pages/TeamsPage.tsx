@@ -6,7 +6,7 @@ import { AGENT_STATE_CLASS } from '../api';
 export default function TeamsPage() {
   const { data: teams, reload } = useAsyncData<any[]>(() => get('/api/v1/teams'), []);
   const { data: agents, reload: reloadAgents } = useAsyncData<any[]>(() => get('/api/v1/agents'), []);
-  const [modal, setModal] = React.useState<'agent' | 'team' | null>(null);
+  const [modal, setModal] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const fail = (e: any) => setError(e.message || String(e));
 
@@ -39,6 +39,7 @@ export default function TeamsPage() {
             </div>
             {a.current_activity && <div className="agent-activity">{a.current_activity}</div>}
             <div className="btn-row" style={{ marginTop: 10 }}>
+              <button className="btn small" onClick={() => setModal('agent-edit-' + a.id)}>Edit</button>
               <button className="btn small danger" onClick={async () => {
                 try { await del(`/api/v1/agents/${a.id}`); reloadAgents(); } catch (e: any) { fail(e); }
               }}>Delete</button>
@@ -78,6 +79,10 @@ export default function TeamsPage() {
       {modal === 'agent' && (
         <AgentForm onClose={() => setModal(null)} onSaved={() => { setModal(null); reloadAgents(); }} />
       )}
+      {modal?.startsWith('agent-edit-') && (
+        <AgentForm agent={agents?.find((a) => a.id === modal.slice(11))} teams={teams ?? []}
+          onClose={() => setModal(null)} onSaved={() => { setModal(null); reloadAgents(); reload(); }} />
+      )}
       {modal === 'team' && (
         <TeamForm agents={agents ?? []} onClose={() => setModal(null)} onSaved={() => { setModal(null); reload(); }} />
       )}
@@ -89,16 +94,35 @@ export default function TeamsPage() {
   );
 }
 
-function AgentForm({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
+function AgentForm({ agent, teams = [], onClose, onSaved }: {
+  agent?: any; teams?: any[]; onClose: () => void; onSaved: () => void;
+}) {
   const { data: roles } = useAsyncData<any[]>(() => get('/api/v1/roles'), []);
   const { data: personas } = useAsyncData<any[]>(() => get('/api/v1/personas'), []);
   const { data: bindings } = useAsyncData<any[]>(() => get('/api/v1/model-bindings'), []);
-  const [f, setF] = React.useState({ name: '', role_id: '', persona_id: '', model_binding_id: '' });
+  const [f, setF] = React.useState({
+    name: agent?.name ?? '', role_id: agent?.role_id ?? '',
+    persona_id: agent?.persona_id ?? '', model_binding_id: agent?.model_binding_id ?? '',
+    lifecycle_state: agent?.lifecycle_state ?? 'Idle',
+  });
   const upd = (k: string) => (e: any) => setF({ ...f, [k]: e.target.value });
   const rolePersonas = (personas ?? []).filter((p) => p.role_id === f.role_id);
   const roleBindings = (bindings ?? []).filter((b) => b.role_id === f.role_id);
+  const memberOf = (agent ? teams.filter((t) => (t.agents ?? []).some((m: any) => m.id === agent.id)) : []);
+  const save = async () => {
+    const personaId = f.persona_id || rolePersonas[0]?.id || '';
+    const bindingId = f.model_binding_id || roleBindings[0]?.id || null;
+    try {
+      if (agent) {
+        await patch(`/api/v1/agents/${agent.id}`, { ...f, persona_id: personaId, model_binding_id: bindingId });
+      } else {
+        await post('/api/v1/agents', { ...f, persona_id: personaId, model_binding_id: bindingId });
+      }
+      onSaved();
+    } catch (e: any) { alert(e.message); }
+  };
   return (
-    <Modal title="Create Agent" onClose={onClose}>
+    <Modal title={agent ? `Edit Agent: ${agent.name}` : 'Create Agent'} onClose={onClose}>
       <Field label="Agent name"><input value={f.name} onChange={upd('name')} /></Field>
       <Field label="Role">
         <select value={f.role_id} onChange={(e) => setF({ ...f, role_id: e.target.value, persona_id: '', model_binding_id: '' })}>
@@ -118,12 +142,25 @@ function AgentForm({ onClose, onSaved }: { onClose: () => void; onSaved: () => v
           {roleBindings.map((b) => <option key={b.id} value={b.id}>{b.provider_model_id} @ {b.gateway_name}</option>)}
         </select>
       </Field>
-      <button className="btn primary" disabled={!f.name || !f.role_id} onClick={async () => {
-        try {
-          await post('/api/v1/agents', { ...f, persona_id: f.persona_id || (rolePersonas[0]?.id ?? ''), model_binding_id: f.model_binding_id || roleBindings[0]?.id || null });
-          onSaved();
-        } catch (e: any) { alert(e.message); }
-      }}>Create Agent</button>
+      {agent && (
+        <Field label="Lifecycle state (set to Idle to unstick a busy agent)">
+          <select value={f.lifecycle_state} onChange={upd('lifecycle_state')}>
+            {['Idle', 'Working', 'Waiting', 'Blocked', 'Paused', 'Completed', 'Failed'].map((s) => <option key={s}>{s}</option>)}
+          </select>
+        </Field>
+      )}
+      {agent && (
+        <Field label="Teams">
+          <div className="row">
+            {memberOf.length
+              ? memberOf.map((t) => <span key={t.id} className="stat-chip"><b>{t.name}</b></span>)
+              : <span className="muted small">Not assigned to any team</span>}
+          </div>
+        </Field>
+      )}
+      <button className="btn primary" disabled={!f.name || !f.role_id} onClick={save}>
+        {agent ? 'Save Agent' : 'Create Agent'}
+      </button>
     </Modal>
   );
 }

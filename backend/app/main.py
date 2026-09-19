@@ -666,8 +666,16 @@ def create_agent(body: AgentIn):
 def update_agent(aid: str, body: dict):
     _or_404(query_one("SELECT id FROM agents WHERE id=?", (aid,)), "Agent")
     allowed = {k: v for k, v in body.items() if k in ("name", "role_id", "persona_id", "model_binding_id")}
+    if "lifecycle_state" in body:
+        state = body["lifecycle_state"]
+        if state not in ("Idle", "Working", "Waiting", "Blocked", "Paused", "Completed", "Failed"):
+            raise HTTPException(422, f"Invalid lifecycle state: {state}")
+        allowed["lifecycle_state"] = state
+        if state == "Idle":
+            allowed["current_activity"] = ""
     allowed["updated_at"] = now()
     update("agents", aid, allowed)
+    audit("update_agent", "agent", aid, f"Updated agent fields: {', '.join(allowed)}")
     return query_one("SELECT * FROM agents WHERE id = ?", (aid,))
 
 
