@@ -87,6 +87,9 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
   // Chat windowing: show only the most recent messages; older ones load in
   // batches of 12 via the "Load previous chat history" button.
   const [visibleMsgs, setVisibleMsgs] = React.useState(12);
+  // Activity windowing: show the most recent 15 events; older ones load in
+  // batches of 15 via the "Load earlier activity" button.
+  const [visibleEvents, setVisibleEvents] = React.useState(15);
   const [tab, setTab] = React.useState<'team' | 'activity' | 'tasks'>(() => {
     const saved = loadUi('ao.tab', 'team');
     return saved === 'activity' || saved === 'tasks' ? saved : 'team';
@@ -138,6 +141,7 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
     setPending(null);
   }, []);
 
+  React.useEffect(() => { setVisibleEvents(15); }, [activeProject]);
   React.useEffect(() => { if (activeConv) loadMessages(activeConv); }, [activeConv, loadMessages]);
   React.useEffect(() => { msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
@@ -530,7 +534,7 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
                   <div className="small muted" style={{ marginBottom: 8 }}>
                     <span className={`live-dot ${s?.scheduler_running || running > 0 ? '' : 'idle'}`} /> Live event stream
                   </div>
-                  {[...liveEvents].sort((a, b) => b.seq - a.seq).map((e) => (
+                  {[...liveEvents].sort((a, b) => b.seq - a.seq).slice(0, visibleEvents).map((e) => (
                     <div key={e.seq} className="event-item">
                       <span className={`event-dot ${eventColor(e.event_type)}`} />
                       <div>
@@ -541,6 +545,14 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
                       <span className="event-time">{fmtTime(e.created_at)}</span>
                     </div>
                   ))}
+                  {liveEvents.length > visibleEvents && (
+                    <button
+                      className="btn small"
+                      style={{ alignSelf: 'center', margin: '8px 0 2px' }}
+                      onClick={() => setVisibleEvents((n) => n + 15)}>
+                      ↓ Load earlier activity ({liveEvents.length - visibleEvents} older)
+                    </button>
+                  )}
                   {!liveEvents.length && <div className="empty">No activity yet. Start a task to see live events.</div>}
                 </>
               )}
