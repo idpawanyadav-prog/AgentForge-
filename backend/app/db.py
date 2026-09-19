@@ -493,9 +493,13 @@ def init_db():
     instr_cols = {r["name"] for r in query("PRAGMA table_info(instruction_files)")}
     if "active" not in instr_cols:
         execute("ALTER TABLE instruction_files ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    proj_cols = {r["name"] for r in query("PRAGMA table_info(projects)")}
+    if "po_enabled" not in proj_cols:
+        execute("ALTER TABLE projects ADD COLUMN po_enabled INTEGER NOT NULL DEFAULT 0")
     db.commit()
     seed_if_empty()
     seed_instruction_files()
+    ensure_product_owner()
 
 
 def _mask(key_value: str) -> str:
@@ -560,6 +564,99 @@ def seed_instruction_files():
                        "FROM persona_skills ps JOIN personas p ON p.id = ps.persona_id"):
             execute("INSERT OR IGNORE INTO role_skills (role_id, skill_id) VALUES (?,?)",
                     (r["role_id"], r["skill_id"]))
+
+
+PO_CHARTER = """# Product Owner Charter
+
+## Authority
+- When enabled, the Product Owner acts with the project owner's full authority:
+  review and rewrite requirements, shape the backlog, plan sprints, assign or
+  reassign tasks, unblock escalated items and start/stop sprint execution.
+- Decisions are logged to the audit trail; the owner can disable the takeover
+  at any time and every open task is left untouched.
+
+## Duties
+- Keep a single, coherent requirement set: project goal, backlog and sprint
+  tasks must never contradict each other.
+- Plan sprints as vertical slices that end in working, testable software.
+- Write tasks for the right specialist: development work for developers, test
+  plans for QA, architecture for the Solution Architect, requirements for the BA.
+- Unblock escalated tasks when the fix is obvious; escalate to the owner only
+  for genuine product ambiguity or missing tooling.
+
+## Constraints
+- Never invent agents that are not on the team roster.
+- Never mark a task Done without QA evidence.
+- Scope added mid-sprint goes through the backlog first unless it is urgent.
+"""
+
+
+def ensure_product_owner():
+    """Idempotently seed the Product Owner role (persona, skill, instruction
+    file, model binding) so it exists on fresh and existing databases alike."""
+    ts = now()
+    role = query_one("SELECT * FROM roles WHERE lower(name) = lower('Product Owner')")
+    if not role:
+        rid = new_id()
+        insert("roles", {"id": rid, "name": "Product Owner",
+                         "description": "Owns requirements and product decisions; can run the "
+                                        "project autonomously when enabled.",
+                         "active": 1, "created_at": ts, "updated_at": ts})
+        role = query_one("SELECT * FROM roles WHERE id = ?", (rid,))
+        audit("seed_po_role", "role", rid, "Seeded Product Owner role")
+    rid = role["id"]
+
+    if not query_one("SELECT id FROM instruction_files WHERE role_id = ?", (rid,)):
+        insert("instruction_files", {
+            "id": new_id(), "role_id": rid, "filename": "product-owner-charter.md",
+            "description": "Authority, duties and constraints of the Product Owner agent",
+            "content": PO_CHARTER, "version": 1, "created_at": ts, "updated_at": ts,
+        })
+
+    skill = query_one("SELECT * FROM skills WHERE name = 'product-ownership'")
+    if not skill:
+        sid = new_id()
+        insert("skills", {"id": sid, "name": "product-ownership",
+                          "description": "Turn owner intent into backlog, sprints and task assignments.",
+                          "content": ("# Product Ownership\n"
+                                      "- Maintain a prioritized, INVEST-clean backlog\n"
+                                      "- Slice work into vertical, testable increments\n"
+                                      "- Assign tasks by role family; unblock quickly\n"
+                                      "- Decide with the owner's authority; log everything"),
+                          "version": 1, "active": 1, "created_at": ts, "updated_at": ts})
+        skill = query_one("SELECT * FROM skills WHERE id = ?", (sid,))
+    execute("INSERT OR IGNORE INTO role_skills (role_id, skill_id) VALUES (?,?)", (rid, skill["id"]))
+
+    persona = query_one("SELECT * FROM personas WHERE role_id = ? ORDER BY created_at LIMIT 1", (rid,))
+    if not persona:
+        pid = new_id()
+        instr = ("You are the Product Owner with the owner's full authority. Review the whole "
+                 "requirement set, keep goal, backlog and sprint tasks coherent, plan sprints as "
+                 "vertical slices and direct the team decisively. Log every decision.")
+        insert("personas", {"id": pid, "role_id": rid, "name": "Vision Keeper",
+                            "description": "Decisive product owner who runs projects end to end.",
+                            "instructions": instr,
+                            "constraints_text": "Never invent agents; never mark tasks Done without QA evidence.",
+                            "version": 1, "active": 1, "created_at": ts, "updated_at": ts})
+        insert("persona_versions", {"id": new_id(), "persona_id": pid, "version": 1,
+                                    "instructions": instr, "constraints_text": "",
+                                    "checksum": checksum(instr), "created_at": ts})
+        execute("INSERT INTO persona_skills (persona_id, skill_id) VALUES (?,?)", (pid, skill["id"]))
+        execute("INSERT OR IGNORE INTO role_skills (role_id, skill_id) VALUES (?,?)", (rid, skill["id"]))
+        audit("seed_po_persona", "persona", pid, "Seeded Product Owner persona 'Vision Keeper'")
+
+    if not query_one("SELECT id FROM model_bindings WHERE role_id = ? AND active = 1", (rid,)):
+        gw = query_one("SELECT id FROM gateways WHERE status = 'Active' ORDER BY created_at LIMIT 1")
+        model = query_one(
+            "SELECT id FROM gateway_models WHERE gateway_id = ? AND active = 1 "
+            "AND provider_model_id LIKE '%mini%' LIMIT 1", (gw["id"],)) if gw else None
+        if not model and gw:
+            model = query_one("SELECT id FROM gateway_models WHERE gateway_id = ? AND active = 1 LIMIT 1",
+                              (gw["id"],))
+        if gw and model:
+            insert("model_bindings", {"id": new_id(), "role_id": rid, "gateway_id": gw["id"],
+                                      "model_id": model["id"],
+                                      "settings_json": json.dumps({"temperature": 0.3}), "active": 1})
 
 
 def seed_if_empty():

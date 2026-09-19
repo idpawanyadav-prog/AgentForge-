@@ -9,7 +9,7 @@ the demo works without provider credentials.
 import json
 import re
 
-from . import db, runtime, toolchains
+from . import db, runtime, toolchains, po
 from .db import audit, execute, insert, new_id, now, query, query_one, update
 
 HELP_TEXT = """I can execute these typed commands:
@@ -45,6 +45,11 @@ HELP_TEXT = """I can execute these typed commands:
 - `start task <title>`
 - `start sprint execution` / `stop sprint execution`
 - `pause execution` / `cancel execution` / `retry last failed task`
+
+**Product Owner**
+- `hire product owner` — add a Product Owner agent to the project's team
+- `enable product owner` — the PO takes over with your full authority (autonomous mode)
+- `disable product owner` — control returns to you; all open tasks remain untouched
 
 **Info**
 - `status` — project summary
@@ -1153,6 +1158,26 @@ def _execute_command(project_id, command, args) -> str:
             return f"Retry failed: {result['error']}"
         return "Retrying the most recent failed execution — it will restart from a clean task boundary."
 
+    if command == "enable_po":
+        result = po.set_po_enabled(project_id, True)
+        if "error" in result:
+            return f"Cannot enable the Product Owner agent: {result['error']}"
+        msg = (f"**{result['agent']}** (Product Owner) now acts with your full authority on this "
+               "project: requirements, backlog, sprint planning, task assignment and unblocking "
+               "all run autonomously. Every decision is logged to the audit trail.")
+        if result.get("sprint_started"):
+            msg += f" Sprint **{result['sprint_started']}** is running under PO control."
+        msg += " Say `disable product owner` (or flip the toggle) at any time to take back control."
+        return msg
+
+    if command == "disable_po":
+        result = po.set_po_enabled(project_id, False)
+        if "error" in result:
+            return f"Cannot disable the Product Owner agent: {result['error']}"
+        return ("Product Owner authority disabled — control is back with you. All existing tasks "
+                "remain open exactly as they are; say `stop sprint execution` if you also want the "
+                "run halted.")
+
     return f"Command `{command}` is not implemented."
 
 
@@ -1195,6 +1220,8 @@ INTENTS = [
     ("resume_execution", r"resume\s+(?:the )?execution\s*$"),
     ("cancel_execution", r"cancel\s+(?:the )?execution\s*$"),
     ("retry_failed", r"retry\s+(?:the )?(?:last )?(?:failed )?(?:task|execution)\s*$"),
+    ("enable_po", r"^\s*enable\s+(?:the\s+)?product\s+owner(?:\s+agent(?:\s+mode)?)?\s*$"),
+    ("disable_po", r"^\s*disable\s+(?:the\s+)?product\s+owner(?:\s+agent(?:\s+mode)?)?\s*$"),
 ]
 
 SENSITIVE = {"create_gateway", "create_agent", "create_team", "build_team",
@@ -1312,6 +1339,8 @@ SUGGESTIONS = {
     "resume_execution": ["Status", "Pause execution", "What are the agents doing?"],
     "cancel_execution": ["Status", "Retry last failed task", "Create sprint"],
     "retry_failed": ["Status", "Pause execution", "What are the agents doing?"],
+    "enable_po": ["Status", "Disable product owner", "Chat with Product Owner"],
+    "disable_po": ["Status", "Enable product owner", "Start sprint execution"],
     "create_gateway": ["Test gateway", "Status", "Help"],
     "test_gateway": ["Create agent", "Status", "Help"],
     "install_toolchain": ["Status", "Help"],
@@ -1406,6 +1435,11 @@ def _context_brief(project_id) -> str:
         lines.append(line)
     lines.append("Agents:")
     lines.extend(_agent_status_lines() or ["- (none yet)"])
+    po_state = po.po_status(project_id)
+    if po_state["has_po"]:
+        lines.append(f"Product Owner agent: {po_state['agent_name']} — authority "
+                     + ("ENABLED (running the project autonomously)" if po_state["po_enabled"]
+                       else "disabled (you make the decisions)"))
     return "\n".join(lines)
 
 
@@ -1438,6 +1472,8 @@ Available commands (name: args):
 - resume_execution: {}
 - cancel_execution: {}
 - retry_failed: {}
+- enable_po: {} — enable the project's Product Owner agent to act autonomously with the user's full authority (requires a Product Owner agent on the team; if missing, offer `hire_agent` with role "Product Owner" first)
+- disable_po: {} — hand control back to the user; existing tasks remain open
 - install_toolchain: {stack: "dotnet"|"go"|"node"|"python"} — when a task or QA report says a build toolchain is unavailable, offer to install it (e.g. `dotnet` for WPF/.NET, `go`, `node`/npm). A plan is proposed and the user must confirm before anything runs on the machine.
 
 Rules:

@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import chatbot, db, runtime, workspace
+from . import chatbot, db, po, runtime, workspace
 from .db import audit, execute, insert, new_id, now, query, query_one, update
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "static")
@@ -818,7 +818,10 @@ def update_project(pid: str, body: dict):
     _or_404(query_one("SELECT id FROM projects WHERE id=?", (pid,)), "Project")
     allowed = {k: v for k, v in body.items() if k in ("name", "goal", "description", "technology_stack",
                                                       "repository_url", "workspace_path",
-                                                      "default_gateway_id", "team_id", "status")}
+                                                      "default_gateway_id", "team_id", "status",
+                                                      "po_enabled")}
+    if "po_enabled" in allowed:
+        allowed["po_enabled"] = 1 if allowed["po_enabled"] else 0
     allowed["updated_at"] = now()
     update("projects", pid, allowed)
     emit = db.emit_event(pid, "project.updated", {"note": "Project configuration updated"})
@@ -1064,7 +1067,53 @@ def control_summary(pid: str):
         "active_runs": active_runs,
         "backlog_count": backlog_count,
         "scheduler_running": pid in runtime._schedulers,
+        "po": po.po_status(pid),
     }
+
+
+# ------------------------------- product owner -------------------------------
+
+class PoChatIn(BaseModel):
+    content: str
+    attachments: list = []
+
+
+@app.post("/api/v1/projects/{pid}/po/enable")
+def enable_po_agent(pid: str):
+    _or_404(query_one("SELECT id FROM projects WHERE id=?", (pid,)), "Project")
+    result = po.set_po_enabled(pid, True)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@app.post("/api/v1/projects/{pid}/po/disable")
+def disable_po_agent(pid: str):
+    _or_404(query_one("SELECT id FROM projects WHERE id=?", (pid,)), "Project")
+    result = po.set_po_enabled(pid, False)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@app.get("/api/v1/projects/{pid}/po/messages")
+def po_messages(pid: str):
+    _or_404(query_one("SELECT id FROM projects WHERE id=?", (pid,)), "Project")
+    conv = query_one("SELECT id FROM conversations WHERE project_id=? AND title='Product Owner' "
+                     "ORDER BY created_at LIMIT 1", (pid,))
+    if not conv:
+        return []
+    return query("SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at, rowid", (conv["id"],))
+
+
+@app.post("/api/v1/projects/{pid}/po/chat")
+async def po_chat(pid: str, body: PoChatIn):
+    _or_404(query_one("SELECT id FROM projects WHERE id=?", (pid,)), "Project")
+    if not body.content.strip() and not body.attachments:
+        raise HTTPException(400, "Message content is required")
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, po.handle_po_message, pid, body.content.strip(), body.attachments)
+    return result
 
 
 @app.get("/api/v1/projects/{pid}/events")

@@ -17,6 +17,7 @@ interface TaskRow {
 interface Summary {
   project: any; agents: AgentRow[]; sprint: any; sprint_tasks: TaskRow[];
   events: EventRow[]; usage: any; active_runs: any[]; backlog_count: number; scheduler_running: boolean;
+  po?: { has_po: boolean; po_enabled: boolean; agent_name: string | null };
 }
 
 function eventColor(t: string): string {
@@ -86,6 +87,16 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
   const [error, setError] = React.useState<string | null>(null);
   const msgEndRef = React.useRef<HTMLDivElement>(null);
   const lastSeqRef = React.useRef(0);
+
+  // Product Owner chat mode + autonomous-authority toggle
+  const [poMode, setPoMode] = React.useState<boolean>(() => loadUi('ao.pomode', 'chat') === 'po');
+  React.useEffect(() => { saveUi('ao.pomode', poMode ? 'po' : 'chat'); }, [poMode]);
+  const [poMessages, setPoMessages] = React.useState<Msg[]>([]);
+  const [poInput, setPoInput] = React.useState('');
+  const [poSending, setPoSending] = React.useState(false);
+  const [poFiles, setPoFiles] = React.useState<{ name: string; content: string }[]>([]);
+  const poEndRef = React.useRef<HTMLDivElement>(null);
+  const fileRef = React.useRef<HTMLInputElement>(null);
 
   React.useEffect(() => {
     get('/api/v1/projects').then(setProjects).catch(() => undefined);
@@ -216,6 +227,52 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
     if (!rest[0]) setMessages([]);
   };
 
+  // Product Owner conversation (dedicated endpoint, survives sessions)
+  React.useEffect(() => {
+    if (!poMode || !activeProject) { setPoMessages([]); return; }
+    get(`/api/v1/projects/${activeProject}/po/messages`).then(setPoMessages).catch(() => undefined);
+  }, [poMode, activeProject]);
+  React.useEffect(() => { if (poMode) poEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [poMessages]);
+
+  const togglePo = async () => {
+    if (!activeProject || !s?.po?.has_po) return;
+    setError(null);
+    try {
+      await post(`/api/v1/projects/${activeProject}/po/${s.po.po_enabled ? 'disable' : 'enable'}`);
+    } catch (e: any) { setError(e.message); }
+  };
+
+  const attachFiles = (files: FileList | null) => {
+    if (!files?.length) return;
+    Array.from(files).slice(0, 5 - poFiles.length).forEach((f) => {
+      if (f.size > 200 * 1024) { setError(`${f.name} is too large (max 200 KB)`); return; }
+      const reader = new FileReader();
+      reader.onload = () => {
+        setPoFiles((cur) => cur.length < 5
+          ? [...cur, { name: f.name, content: String(reader.result ?? '') }]
+          : cur);
+      };
+      reader.readAsText(f);
+    });
+    if (fileRef.current) fileRef.current.value = '';
+  };
+
+  const poSend = async (text?: string) => {
+    const content = (text ?? poInput).trim();
+    if ((!content && !poFiles.length) || !activeProject || poSending) return;
+    setPoSending(true); setError(null); setPoInput('');
+    setPoMessages((m) => [...m, { id: 'tmp-po', role: 'user', content: content || '(files only)', meta: '', created_at: '' }]);
+    try {
+      const res = await post(`/api/v1/projects/${activeProject}/po/chat`, { content, attachments: poFiles });
+      setPoMessages(res.messages ?? []);
+      setPoFiles([]);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setPoSending(false);
+    }
+  };
+
   const startTask = async (tid: string) => {
     setError(null);
     try { await post('/api/v1/executions', { project_id: activeProject, task_id: tid }); }
@@ -263,8 +320,26 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
             {convos.map((c) => <option key={c.id} value={c.id}>{c.title}</option>)}
           </select>
           <button className="btn small" onClick={newConversation}>+ New chat</button>
-          {activeConv && <button className="btn small danger" onClick={() => deleteConversation(activeConv)}>Delete</button>}
+          {activeConv && !poMode && <button className="btn small danger" onClick={() => deleteConversation(activeConv)}>Delete</button>}
           <span style={{ flex: 1 }} />
+          {s?.po?.has_po && (
+            <button
+              className={`btn small ${s.po.po_enabled ? 'danger' : 'primary'}`}
+              onClick={togglePo}
+              title={s.po.po_enabled
+                ? 'Product Owner authority is ON — click to disable and take back control'
+                : `Enable ${s.po.agent_name} (Product Owner) to run this project autonomously`}
+            >
+              🤖 Product Owner: {s.po.po_enabled ? 'On' : 'Off'}
+            </button>
+          )}
+          <button
+            className={`btn small ${poMode ? 'primary' : ''}`}
+            onClick={() => setPoMode((m) => !m)}
+            title="Talk to the Product Owner agent about requirements (supports file attachments)"
+          >
+            👑 Chat with Product Owner
+          </button>
           {s?.sprint && (
             s.scheduler_running
               ? <button className="btn small danger" onClick={() => sprintAction('stop')}>⏹ Stop sprint execution</button>
@@ -279,41 +354,93 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
           )}
         </div>
         <div className="chat-messages">
-          {messages.length === 0 && (
-            <div className="empty">Ask the assistant to create roles, agents, teams, backlog items, or to start work. Type <b>help</b> for the command catalog.</div>
+          {poMode ? (
+            <>
+              {poMessages.length === 0 && (
+                <div className="empty">
+                  This is the direct line to the <b>Product Owner</b> agent. Share requirements here —
+                  plain text or attached files (.md, .txt, .json, source code). Enable the Product Owner
+                  toggle to let it act autonomously on your behalf.
+                </div>
+              )}
+              {poMessages.map((m) => (
+                <div key={m.id} className={`msg ${m.role}`}
+                  dangerouslySetInnerHTML={{ __html: md(m.content) }} />
+              ))}
+              <div ref={poEndRef} />
+            </>
+          ) : (
+            <>
+              {messages.length === 0 && (
+                <div className="empty">Ask the assistant to create roles, agents, teams, backlog items, or to start work. Type <b>help</b> for the command catalog.</div>
+              )}
+              {messages.map((m) => (
+                <div key={m.id} className={`msg ${m.role}`}
+                  dangerouslySetInnerHTML={{ __html: md(m.content) }} />
+              ))}
+              {pending && (
+                <div className="row" style={{ alignSelf: 'flex-start', gap: 6 }}>
+                  <button className="btn small primary" onClick={() => send('confirm')}>✓ Confirm</button>
+                  <button className="btn small danger" onClick={() => send('cancel that')}>✕ Cancel</button>
+                </div>
+              )}
+              <div ref={msgEndRef} />
+            </>
           )}
-          {messages.map((m) => (
-            <div key={m.id} className={`msg ${m.role}`}
-              dangerouslySetInnerHTML={{ __html: md(m.content) }} />
-          ))}
-          {pending && (
-            <div className="row" style={{ alignSelf: 'flex-start', gap: 6 }}>
-              <button className="btn small primary" onClick={() => send('confirm')}>✓ Confirm</button>
-              <button className="btn small danger" onClick={() => send('cancel that')}>✕ Cancel</button>
-            </div>
-          )}
-          <div ref={msgEndRef} />
         </div>
         {error && <div style={{ padding: '0 14px 6px' }}><Badge kind="err">{error}</Badge></div>}
-        {!pending && suggestions.length > 0 && (
-          <div className="row" style={{ padding: '4px 14px 8px', gap: 6, flexWrap: 'wrap' }}>
-            {suggestions.map((s) => (
-              <button key={s} className="btn small" disabled={sending}
-                onClick={() => send(s)} title={`Send: ${s}`}>{s}</button>
-            ))}
-          </div>
+        {poMode ? (
+          <>
+            {poFiles.length > 0 && (
+              <div className="row" style={{ padding: '4px 14px 0', gap: 6, flexWrap: 'wrap' }}>
+                {poFiles.map((f, i) => (
+                  <span key={`${f.name}-${i}`} className="btn small" style={{ cursor: 'default' }}>
+                    📎 {f.name}
+                    <button className="btn small danger" style={{ marginLeft: 6, padding: '0 6px' }}
+                      onClick={() => setPoFiles((cur) => cur.filter((_, j) => j !== i))}>✕</button>
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className="chat-input">
+              <input ref={fileRef} type="file" multiple style={{ display: 'none' }}
+                onChange={(e) => attachFiles(e.target.files)} />
+              <button className="btn" disabled={poSending || poFiles.length >= 5}
+                onClick={() => fileRef.current?.click()} title="Attach requirement files">📎</button>
+              <textarea
+                value={poInput}
+                placeholder="Message the Product Owner… (share requirements; attach files with 📎)"
+                onChange={(e) => setPoInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); poSend(); } }}
+              />
+              <button className="btn primary" disabled={poSending || (!poInput.trim() && !poFiles.length)} onClick={() => poSend()}>
+                {poSending ? '…' : 'Send'}
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            {!pending && suggestions.length > 0 && (
+              <div className="row" style={{ padding: '4px 14px 8px', gap: 6, flexWrap: 'wrap' }}>
+                {suggestions.map((s) => (
+                  <button key={s} className="btn small" disabled={sending}
+                    onClick={() => send(s)} title={`Send: ${s}`}>{s}</button>
+                ))}
+              </div>
+            )}
+            <div className="chat-input">
+              <textarea
+                value={input}
+                placeholder="Message Project Control assistant… (help for commands)"
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }}
+              />
+              <button className="btn primary" disabled={sending || !input.trim()} onClick={() => send()}>
+                {sending ? '…' : 'Send'}
+              </button>
+            </div>
+          </>
         )}
-        <div className="chat-input">
-          <textarea
-            value={input}
-            placeholder="Message Project Control assistant… (help for commands)"
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }}
-          />
-          <button className="btn primary" disabled={sending || !input.trim()} onClick={() => send()}>
-            {sending ? '…' : 'Send'}
-          </button>
-        </div>
       </div>
 
       {/* ------------- right operations pane ------------- */}

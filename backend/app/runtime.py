@@ -11,7 +11,7 @@ import json
 import random
 import re
 
-from . import db, workspace, codegen, toolchains
+from . import db, workspace, codegen, toolchains, po
 from .db import emit_event, execute, insert, now, new_id, query_one, query, update, audit
 
 # run_id -> {"task": asyncio.Task, "paused": bool, "cancelled": bool}
@@ -445,6 +445,15 @@ async def _finish_qa_run(run_id, ctrl, project_id, task_id, agent_id, task,
               workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
         audit("qa_escalated", "task", task_id,
               f"Task '{task['title']}' escalated to human after {rework} QA rejections")
+        if po.po_enabled(project_id):
+            # Full autonomy: the Product Owner reviews the escalation right
+            # away instead of leaving it for a human.
+            async def _po_review():
+                try:
+                    await asyncio.to_thread(po.po_autonomy_tick, project_id)
+                except Exception:
+                    pass
+            _spawn(_po_review())
     else:
         update("tasks", task_id, {"status": "Rework",
                                   "assigned_agent_id": dev_agent_id,
@@ -572,10 +581,21 @@ async def _run_sprint(project_id: str, ctrl: dict):
             # Nothing runnable right now: tasks may exist unassigned (newly
             # drafted or freed by a state change). Re-attempt role-based
             # assignment instead of giving up; give up only after a stretch
-            # with no progress at all.
+            # with no progress at all. With the Product Owner enabled, the PO
+            # periodically reviews and unblocks/replans, so the loop persists
+            # much longer instead of surfacing to a human.
             auto_assign_tasks(project_id)
             idle_rounds += 1
-            if idle_rounds > 60:
+            if po.po_enabled(project_id):
+                if idle_rounds % 10 == 0:
+                    try:
+                        await asyncio.to_thread(po.po_autonomy_tick, project_id)
+                    except Exception:
+                        pass
+                give_up_after = 600
+            else:
+                give_up_after = 60
+            if idle_rounds > give_up_after:
                 _emit(project_id, "project.updated",
                       {"note": "No eligible tasks: blocked/waiting items remain",
                        "remaining_tasks": remaining})
