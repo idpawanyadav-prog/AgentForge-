@@ -31,9 +31,9 @@ export default function SettingsPage() {
       ))}
       {!gateways?.length && <div className="empty">No gateways configured.</div>}
 
-      <ModelPlayground gateways={gateways ?? []} onError={fail} />
-
       <AuditTrail audit={audit ?? []} />
+
+      <ModelPlayground gateways={gateways ?? []} onError={fail} />
 
       {modal === 'newGateway' && (
         <GatewayForm onClose={() => setModal(null)} onSaved={() => { setModal(null); reload(); }} />
