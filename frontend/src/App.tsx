@@ -33,6 +33,7 @@ export default function App() {
     return saved === 'bright' ? 'bright' : 'dark';
   });
   const [activeProject, setActiveProject] = React.useState<string | null>(() => loadUi('ao.project', '') || null);
+  const [collapsed, setCollapsed] = React.useState<boolean>(() => loadUi('ao.sidebar', '') === 'collapsed');
 
   React.useEffect(() => {
     get('/api/v1/settings')
@@ -54,6 +55,7 @@ export default function App() {
   }, [theme]);
 
   React.useEffect(() => { saveUi('ao.page', page); }, [page]);
+  React.useEffect(() => { saveUi('ao.sidebar', collapsed ? 'collapsed' : 'open'); }, [collapsed]);
   React.useEffect(() => { if (activeProject) saveUi('ao.project', activeProject); }, [activeProject]);
 
   const toggleTheme = () => {
@@ -65,25 +67,45 @@ export default function App() {
 
   return (
     <div className="app">
-      <aside className="sidebar">
-        <div className="brand">Agent<span>Office</span></div>
+      <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`}>
+        <div className="sidebar-head">
+          {collapsed
+            ? <div className="brand mini" title="AgentOffice">A<span>O</span></div>
+            : <div className="brand">Agent<span>Office</span></div>}
+          <button
+            className="sidebar-toggle"
+            onClick={() => setCollapsed((c) => !c)}
+            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            {collapsed ? '»' : '«'}
+          </button>
+        </div>
         {NAV.map((n) => (
           <button
             key={n.id}
             className={`nav-item ${page === n.id ? 'active' : ''}`}
             onClick={() => setPage(n.id)}
+            title={n.label}
           >
-            <span>{n.icon}</span> {n.label}
+            <span className="nav-icon">{n.icon}</span>
+            {!collapsed && <span className="nav-label">{n.label}</span>}
           </button>
         ))}
         <div className="sidebar-footer">
-          <button className="theme-toggle" onClick={toggleTheme}>
-            <span>{theme === 'dark' ? '🌙 Dark' : '☀️ Bright'}</span>
-            <span className="small muted">switch</span>
+          <button className="theme-toggle" onClick={toggleTheme} title={`Switch to ${theme === 'dark' ? 'bright' : 'dark'} theme`}>
+            <span>{theme === 'dark' ? '🌙' : '☀️'}</span>
+            {!collapsed && (
+              <>
+                <span className="nav-label">{theme === 'dark' ? 'Dark' : 'Bright'}</span>
+                <span className="small muted">switch</span>
+              </>
+            )}
           </button>
-          <div style={{ marginTop: 12 }}>
-            {activeProject ? 'Project session active' : 'No project selected'}
-          </div>
+          {!collapsed && (
+            <div style={{ marginTop: 12 }}>
+              {activeProject ? 'Project session active' : 'No project selected'}
+            </div>
+          )}
         </div>
       </aside>
       <main className="main">
