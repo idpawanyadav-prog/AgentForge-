@@ -253,7 +253,7 @@ function InstructionsPanel({ roleId, selected, onSelect, onError, onOpenModal, r
 }
 
 function EditorPanel({ roleId, selectedId, onSelect, onError, refreshKey, onChanged }:
-  { roleId: string | null; selectedId: string | null; onSelect: (id: string) => void; onError: (e: any) => void;
+  { roleId: string | null; selectedId: string | null; onSelect: (id: string | null) => void; onError: (e: any) => void;
     refreshKey: number; onChanged: () => void }) {
   const { data: instructions, reload } = useAsyncData<any[]>(
     () => (roleId ? get(`/api/v1/roles/${roleId}/instructions`) : Promise.resolve([])), [roleId, refreshKey]);
