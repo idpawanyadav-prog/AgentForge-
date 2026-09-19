@@ -84,6 +84,9 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
   const [sprints, setSprints] = React.useState<any[]>([]);
   const [selectedSprint, setSelectedSprint] = React.useState<string>('');
   const [sprintTasks, setSprintTasks] = React.useState<TaskRow[]>([]);
+  // Chat windowing: show only the most recent messages; older ones load in
+  // batches of 12 via the "Load previous chat history" button.
+  const [visibleMsgs, setVisibleMsgs] = React.useState(12);
   const [tab, setTab] = React.useState<'team' | 'activity' | 'tasks'>(() => {
     const saved = loadUi('ao.tab', 'team');
     return saved === 'activity' || saved === 'tasks' ? saved : 'team';
@@ -130,6 +133,7 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
 
   const loadMessages = React.useCallback((cid: string) => {
     get(`/api/v1/conversations/${cid}/messages`).then(setMessages).catch(() => undefined);
+    setVisibleMsgs(12);
     setSuggestions([]);
     setPending(null);
   }, []);
@@ -398,7 +402,15 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
               {messages.length === 0 && (
                 <div className="empty">Ask the assistant to create roles, agents, teams, backlog items, or to start work. Type <b>help</b> for the command catalog.</div>
               )}
-              {messages.map((m) => (
+              {messages.length > visibleMsgs && (
+                <button
+                  className="btn small"
+                  style={{ alignSelf: 'center', margin: '4px 0 8px' }}
+                  onClick={() => setVisibleMsgs((n) => n + 12)}>
+                  ↑ Load previous chat history ({messages.length - visibleMsgs} older)
+                </button>
+              )}
+              {messages.slice(-visibleMsgs).map((m) => (
                 <div key={m.id} className={`msg ${m.role}`}
                   dangerouslySetInnerHTML={{ __html: md(m.content) }} />
               ))}
