@@ -57,6 +57,31 @@ def _find_persona(name):
     return query_one("SELECT * FROM personas WHERE lower(name) = lower(?)", (name,))
 
 
+def _ensure_role_persona(role):
+    """Return the role's first persona, synthesizing one from its Agent Memory
+    instruction files (or a generic template) when none exists yet."""
+    persona = query_one("SELECT * FROM personas WHERE role_id = ? ORDER BY created_at LIMIT 1", (role["id"],))
+    if persona:
+        return persona
+    now_ts = now()
+    files = query("SELECT filename, content FROM instruction_files WHERE role_id = ? ORDER BY filename", (role["id"],))
+    body = "\n\n".join(f"## {f['filename']}\n{f['content']}".strip() for f in files).strip()
+    if not body:
+        body = (f"You are a {role['name']} on a simulated delivery team. Follow standard professional practices "
+                "for your role, coordinate with teammates, and produce concrete artifacts for every task.")
+    pid = new_id()
+    insert("personas", {"id": pid, "role_id": role["id"], "name": f"Default {role['name']}",
+                        "description": f"Auto-generated from Agent Memory instructions for {role['name']}.",
+                        "instructions": body, "constraints_text": "",
+                        "version": 1, "active": 1, "created_at": now_ts, "updated_at": now_ts})
+    insert("persona_versions", {"id": new_id(), "persona_id": pid, "version": 1,
+                                "instructions": body, "constraints_text": "",
+                                "checksum": db.checksum(body), "created_at": now_ts})
+    audit("ensure_persona", "persona", pid,
+          f"Auto-created persona 'Default {role['name']}' from {len(files)} Agent Memory instruction file(s)")
+    return query_one("SELECT * FROM personas WHERE id = ?", (pid,))
+
+
 def _find_agent(name):
     n = str(name or "").lower().strip().removeprefix("a ").removeprefix("the ").strip()
     if not n:
@@ -231,9 +256,7 @@ def _execute_command(project_id, command, args) -> str:
         if not role:
             return f"Role **{args.get('role')}** not found."
         if not persona:
-            persona = query_one("SELECT * FROM personas WHERE role_id = ? ORDER BY created_at LIMIT 1", (role["id"],))
-            if not persona:
-                return f"Role **{role['name']}** has no persona yet. Create one first."
+            persona = _ensure_role_persona(role)
         binding = query_one("SELECT * FROM model_bindings WHERE role_id = ? AND active = 1", (role["id"],))
         aid = new_id()
         insert("agents", {"id": aid, "name": args["name"], "role_id": role["id"],
@@ -319,10 +342,7 @@ def _execute_command(project_id, command, args) -> str:
                 reused.append(f"{pick['name']} ({role['name']})")
             else:
                 # Hire: create a fresh agent for this role (same internals as create_agent).
-                persona = query_one("SELECT * FROM personas WHERE role_id = ? ORDER BY created_at LIMIT 1", (role["id"],))
-                if not persona:
-                    return (f"Cannot hire for **{role['name']}** — the role has no persona yet. "
-                            "Create one first with `create persona ...`.")
+                persona = _ensure_role_persona(role)
                 existing_count = query_one("SELECT COUNT(*) AS n FROM agents WHERE role_id = ?", (role["id"],))["n"]
                 # Pick a human-style name from the free pool; fall back to numbered role names.
                 taken = {r["name"].lower() for r in query("SELECT name FROM agents")}
