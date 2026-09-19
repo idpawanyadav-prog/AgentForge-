@@ -476,11 +476,16 @@ def _apply_actions(project_id: str, actions) -> list[str]:
                 reason = str(a.get("reason") or "").strip()
                 ws = workspace.get_workspace(project_id)
                 if ws and os.path.isdir(ws):
-                    # Install into the PROJECT-LOCAL environment (.venv) that
-                    # the generated start_server.bat activates and QA reuses —
-                    # requirements.txt is synced and named packages added on top.
+                    # Primary: the PROJECT-LOCAL environment (.venv) that the
+                    # generated start_server.bat activates and QA reuses.
                     result = toolchains.ensure_project_env(ws, extra_packages=pkgs)
                     where = "project-local .venv"
+                    if not result.get("ok"):
+                        # Fallback: install into <workspace>/lib/ and LINK it
+                        # (.pth / PYTHONPATH / NODE_PATH / GOPATH / nuget).
+                        stack = toolchains.detect_stack(None, ws)
+                        result = toolchains.lib_install(ws, pkgs, stack=stack)
+                        where = f"project lib/ folder ({stack}, linked)"
                 else:
                     result = toolchains.pip_install(pkgs)
                     where = "AgentForge environment"

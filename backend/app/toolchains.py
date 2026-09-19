@@ -87,6 +87,157 @@ def project_python(ws_dir: str | None) -> str | None:
     return exe if os.path.isfile(exe) else None
 
 
+# ------------------------------------------------------------ project lib/ folder
+#
+# During development, a library that is unavailable (or fails to install)
+# in the project environment gets installed into `<workspace>/lib/` and
+# LINKED back into the toolchain so imports resolve:
+#   python : pip install --target lib + a .pth file in the venv site-packages
+#            (plus PYTHONPATH for runs without a venv)
+#   node   : npm install --prefix lib + NODE_PATH=lib/node_modules
+#   go     : dependencies vendored into lib/go (GOPATH-style tree)
+#   dotnet : dotnet add package + restore --packages lib/nuget
+
+def lib_dir(ws_dir: str) -> str:
+    return os.path.join(ws_dir, "lib")
+
+
+def _link_python(ws_dir: str, py: str | None) -> str:
+    """Drop a .pth file into the venv site-packages so `<ws>/lib` is on
+    sys.path for every venv run (app, QA build, tests)."""
+    if not py:
+        return "no venv to link into (PYTHONPATH covers direct runs)"
+    try:
+        probe = subprocess.run([py, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+                               capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace")
+        target = probe.stdout.strip()
+        if probe.returncode != 0 or not target:
+            sub = "Scripts" if os.name == "nt" else "bin"
+            target = os.path.normpath(os.path.join(os.path.dirname(py), "..",
+                                                   "Lib" if os.name == "nt" else "lib", "site-packages"))
+        if not os.path.isdir(target):
+            os.makedirs(target, exist_ok=True)
+        with open(os.path.join(target, "agentforge_project_lib.pth"), "w", encoding="utf-8") as fh:
+            fh.write(lib_dir(ws_dir))
+        return f"linked via .pth in {os.path.basename(target)}"
+    except Exception as exc:
+        return f".pth link failed ({exc}); PYTHONPATH still applies"
+
+
+def lib_install(ws_dir: str | None, packages, stack: str = "python", timeout: int = 900) -> dict:
+    """Install unavailable libraries into `<workspace>/lib/` and link them.
+    Never fakes success: the real tool verdict is returned with a step log."""
+    pkgs = [str(p).strip() for p in (packages or []) if str(p).strip()]
+    if not ws_dir or not os.path.isdir(ws_dir):
+        return {"ok": False, "packages": pkgs, "output": "workspace missing"}
+    if not pkgs:
+        return {"ok": False, "packages": [], "output": "no packages given"}
+    lib = lib_dir(ws_dir)
+    os.makedirs(lib, exist_ok=True)
+    steps: list[str] = [f"created {os.path.relpath(lib, ws_dir)}/"]
+    ok = True
+
+    if stack == "python":
+        py = project_python(ws_dir)
+        runner = py or sys.executable
+        try:
+            proc = subprocess.run([runner, "-m", "pip", "install", "--disable-pip-version-check",
+                                   "--target", lib, "--upgrade", *pkgs],
+                                  cwd=ws_dir, capture_output=True, text=True, timeout=timeout,
+                                  encoding="utf-8", errors="replace")
+            out = ((proc.stdout or "") + (proc.stderr or "")).strip().splitlines()
+            steps.append("pip --target lib: " + ("ok" if proc.returncode == 0 else "FAILED")
+                         + (f" — {out[-1][:160]}" if out else ""))
+            ok = proc.returncode == 0
+        except Exception as exc:
+            steps.append(f"pip --target lib FAILED: {exc}")
+            ok = False
+        steps.append(_link_python(ws_dir, py))
+
+    elif stack == "node":
+        npm = shutil.which("npm")
+        if not npm:
+            return {"ok": False, "packages": pkgs, "output": "npm not available"}
+        try:
+            proc = subprocess.run([npm, "install", "--no-audit", "--no-fund", "--prefix", lib, *pkgs],
+                                  cwd=ws_dir, capture_output=True, text=True, timeout=timeout,
+                                  encoding="utf-8", errors="replace")
+            out = ((proc.stdout or "") + (proc.stderr or "")).strip().splitlines()
+            steps.append("npm --prefix lib: " + ("ok" if proc.returncode == 0 else "FAILED")
+                         + (f" — {out[-1][:160]}" if out else ""))
+            ok = proc.returncode == 0
+        except Exception as exc:
+            steps.append(f"npm --prefix lib FAILED: {exc}")
+            ok = False
+        steps.append("linked via NODE_PATH=lib/node_modules at run time")
+
+    elif stack == "go":
+        go = shutil.which("go")
+        if not go:
+            return {"ok": False, "packages": pkgs, "output": "go not available"}
+        try:
+            env = {**os.environ, "GOPATH": lib, "GOFLAGS": "-mod=mod"}
+            proc = subprocess.run([go, "get", *pkgs], cwd=ws_dir, capture_output=True,
+                                  text=True, timeout=timeout, env=env,
+                                  encoding="utf-8", errors="replace")
+            out = ((proc.stdout or "") + (proc.stderr or "")).strip().splitlines()
+            steps.append("go get (GOPATH=lib): " + ("ok" if proc.returncode == 0 else "FAILED")
+                         + (f" — {out[-1][:160]}" if out else ""))
+            ok = proc.returncode == 0
+        except Exception as exc:
+            steps.append(f"go get FAILED: {exc}")
+            ok = False
+        steps.append("linked via GOPATH=lib at run time")
+
+    elif stack == "dotnet":
+        dotnet = shutil.which("dotnet")
+        proj = _find_dotnet_proj(ws_dir)
+        if not dotnet:
+            return {"ok": False, "packages": pkgs, "output": "dotnet not available"}
+        if not proj:
+            return {"ok": False, "packages": pkgs, "output": "no .sln or .csproj in workspace"}
+        try:
+            for p in pkgs:
+                proc = subprocess.run([dotnet, "add", proj, "package", p], cwd=ws_dir,
+                                      capture_output=True, text=True, timeout=timeout,
+                                      encoding="utf-8", errors="replace")
+                out = ((proc.stdout or "") + (proc.stderr or "")).strip().splitlines()
+                steps.append(f"dotnet add {p}: " + ("ok" if proc.returncode == 0 else "FAILED")
+                             + (f" — {out[-1][:140]}" if out else ""))
+                ok &= proc.returncode == 0
+            pkgdir = os.path.join(lib, "nuget")
+            proc2 = subprocess.run([dotnet, "restore", proj, "--packages", pkgdir], cwd=ws_dir,
+                                   capture_output=True, text=True, timeout=timeout,
+                                   encoding="utf-8", errors="replace")
+            steps.append("restore --packages lib/nuget: " + ("ok" if proc2.returncode == 0 else "FAILED"))
+            ok &= proc2.returncode == 0
+        except Exception as exc:
+            steps.append(f"dotnet lib install FAILED: {exc}")
+            ok = False
+    else:
+        return {"ok": False, "packages": pkgs, "output": f"unsupported stack '{stack}'"}
+
+    return {"ok": ok, "packages": pkgs, "stack": stack, "lib": lib,
+            "output": "\n".join(steps)[-1500:]}
+
+
+def _lib_env(ws_dir: str | None) -> dict:
+    """Env additions that LINK the project lib/ folder into tool runs:
+    PYTHONPATH for python, NODE_PATH for node, GOPATH for go."""
+    env = {}
+    if not ws_dir or not os.path.isdir(ws_dir):
+        return env
+    lib = lib_dir(ws_dir)
+    if os.path.isdir(lib):
+        env["PYTHONPATH"] = lib + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
+        nm = os.path.join(lib, "node_modules")
+        if os.path.isdir(nm):
+            env["NODE_PATH"] = nm
+        if os.path.isdir(os.path.join(lib, "go")):
+            env["GOPATH"] = lib
+    return env
+
+
 def ensure_project_env(ws_dir: str | None, extra_packages=None, timeout: int = 600) -> dict:
     """Create and fill the project-local environment: `<workspace>/.venv`
     with everything from the workspace requirements.txt plus any explicitly
@@ -222,12 +373,13 @@ def detect_stack(project, ws_dir: str | None = None) -> str:
 def _run(cmd: list[str], ws_dir: str, timeout: int) -> tuple[int, str]:
     """Run a toolchain command; returns (returncode, combined-output-tail).
     Resolves the executable via PATH (needed for npm/npx which are .cmd
-    shims on Windows and invisible to a shell-less subprocess)."""
+    shims on Windows and invisible to a shell-less subprocess). The project
+    lib/ folder is linked in via PYTHONPATH/NODE_PATH/GOPATH when present."""
     exe = shutil.which(cmd[0]) or cmd[0]
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **_lib_env(ws_dir)}
     try:
         proc = subprocess.run([exe, *cmd[1:]], cwd=ws_dir, capture_output=True, text=True,
-                              timeout=timeout,
-                              env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+                              timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return 124, f"timed out after {timeout}s"
     except OSError as exc:
@@ -318,7 +470,7 @@ def _python_build(ws_dir: str) -> tuple[bool, str]:
         proc = subprocess.run(
             [py, "-c", _BUILD_DRIVER],
             cwd=ws_dir, capture_output=True, text=True, timeout=120,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **_lib_env(ws_dir)})
     except subprocess.TimeoutExpired:
         return False, "build smoke timed out after 120s"
     line = ""
