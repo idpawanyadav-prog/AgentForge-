@@ -375,6 +375,79 @@ def checksum(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+# Provider model catalogs used to auto-populate a gateway's model catalog.
+# In production these are fetched live from each provider's list-models
+# endpoint; the shape of the sync logic is identical.
+PROVIDER_CATALOGS: dict[str, list[tuple[str, str, str]]] = {
+    "openai": [
+        ("gpt-4.1", "GPT-4.1", "reasoning,coding"),
+        ("gpt-4.1-mini", "GPT-4.1 Mini", "fast,coding"),
+        ("gpt-4.1-nano", "GPT-4.1 Nano", "fast"),
+        ("gpt-4o", "GPT-4o", "reasoning,vision"),
+        ("gpt-4o-mini", "GPT-4o Mini", "fast,vision"),
+        ("o4-mini", "o4-mini", "reasoning,fast"),
+        ("o3", "o3", "reasoning"),
+        ("text-embedding-3-small", "Embedding 3 Small", "embedding"),
+        ("text-embedding-3-large", "Embedding 3 Large", "embedding"),
+        ("dall-e-3", "DALL-E 3", "image"),
+        ("whisper-1", "Whisper", "audio"),
+    ],
+    "azure-openai": [
+        ("gpt-4.1", "GPT-4.1", "reasoning,coding"),
+        ("gpt-4.1-mini", "GPT-4.1 Mini", "fast,coding"),
+        ("gpt-4o", "GPT-4o", "reasoning,vision"),
+        ("gpt-4o-mini", "GPT-4o Mini", "fast,vision"),
+        ("o4-mini", "o4-mini", "reasoning,fast"),
+        ("text-embedding-3-small", "Embedding 3 Small", "embedding"),
+    ],
+    "anthropic": [
+        ("claude-opus-4-5", "Claude Opus 4.5", "reasoning,coding"),
+        ("claude-sonnet-4-5", "Claude Sonnet 4.5", "reasoning,coding,fast"),
+        ("claude-haiku-4-5", "Claude Haiku 4.5", "fast"),
+        ("claude-3-5-haiku-latest", "Claude 3.5 Haiku", "fast"),
+    ],
+    "ollama": [
+        ("llama3.2", "Llama 3.2", "reasoning"),
+        ("llama3.2:1b", "Llama 3.2 1B", "fast"),
+        ("qwen2.5-coder", "Qwen2.5 Coder", "coding"),
+        ("qwen2.5", "Qwen2.5", "reasoning"),
+        ("mistral", "Mistral", "fast"),
+        ("phi4", "Phi-4", "reasoning"),
+        ("gemma2", "Gemma 2", "fast"),
+        ("nomic-embed-text", "Nomic Embed", "embedding"),
+    ],
+    "custom": [
+        ("default", "Default Model", ""),
+        ("default-mini", "Default Mini", "fast"),
+    ],
+}
+
+
+def sync_gateway_models(gateway_id: str) -> int:
+    """Fetch the provider's available models into the gateway catalog.
+
+    Idempotent: existing provider_model_ids are left untouched, new ones are
+    registered. Returns the number of models added.
+    """
+    gw = query_one("SELECT provider FROM gateways WHERE id=?", (gateway_id,))
+    if not gw:
+        return 0
+    catalog = PROVIDER_CATALOGS.get(gw["provider"], PROVIDER_CATALOGS["custom"])
+    added = 0
+    for provider_model_id, display_name, capabilities in catalog:
+        exists = query_one(
+            "SELECT id FROM gateway_models WHERE gateway_id=? AND provider_model_id=?",
+            (gateway_id, provider_model_id))
+        if not exists:
+            insert("gateway_models", {
+                "id": new_id(), "gateway_id": gateway_id,
+                "provider_model_id": provider_model_id,
+                "display_name": display_name, "capabilities": capabilities, "active": 1,
+            })
+            added += 1
+    return added
+
+
 SCENARIO = """
 CREATE TABLE IF NOT EXISTS persona_version_seed_marker (id TEXT PRIMARY KEY);
 """
@@ -468,6 +541,8 @@ def seed_if_empty():
             "id": m_id, "gateway_id": gw, "provider_model_id": mid,
             "display_name": name, "capabilities": caps, "active": 1,
         })
+    # Auto-fetch the remaining provider catalog so the demo starts complete.
+    sync_gateway_models(gw)
 
     # --- Roles ---
     role_defs = [

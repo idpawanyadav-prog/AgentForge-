@@ -192,8 +192,10 @@ def create_gateway(body: GatewayIn):
         "status": "Active", "key_mask": _mask(body.api_key) if body.api_key else None,
         "created_at": ts, "updated_at": ts,
     })
-    audit("create_gateway", "gateway", gid, f"Created gateway '{body.name}'")
-    return query_one("SELECT * FROM gateways WHERE id = ?", (gid,))
+    added = db.sync_gateway_models(gid)
+    audit("create_gateway", "gateway", gid,
+          f"Created gateway '{body.name}'; auto-fetched {added} models")
+    return {**query_one("SELECT * FROM gateways WHERE id = ?", (gid,)), "models_fetched": added}
 
 
 @app.patch("/api/v1/gateways/{gid}")
@@ -204,8 +206,11 @@ def update_gateway(gid: str, body: dict):
         allowed["key_mask"] = _mask(body["api_key"])
     allowed["updated_at"] = now()
     update("gateways", gid, allowed)
+    models_fetched = 0
+    if "provider" in allowed:
+        models_fetched = db.sync_gateway_models(gid)
     audit("update_gateway", "gateway", gid, f"Updated gateway fields: {', '.join(allowed)}")
-    return query_one("SELECT * FROM gateways WHERE id = ?", (gid,))
+    return {**query_one("SELECT * FROM gateways WHERE id = ?", (gid,)), "models_fetched": models_fetched}
 
 
 @app.delete("/api/v1/gateways/{gid}")
@@ -226,8 +231,11 @@ def test_gateway(gid: str):
     diag = ("Connection OK (simulated probe): TLS handshake and auth schema accepted"
             if ok else "Invalid Base URL scheme; expected http(s)")
     update("gateways", gid, {"last_tested_at": ts, "test_status": result, "test_diagnostic": diag})
-    audit("test_gateway", "gateway", gid, f"Gateway test: {result}")
-    return {"status": result, "diagnostic": diag, "tested_at": ts}
+    models_fetched = 0
+    if ok:
+        models_fetched = db.sync_gateway_models(gid)
+    audit("test_gateway", "gateway", gid, f"Gateway test: {result}; {models_fetched} models synced")
+    return {"status": result, "diagnostic": diag, "tested_at": ts, "models_fetched": models_fetched}
 
 
 @app.get("/api/v1/gateways/{gid}/models")
@@ -255,16 +263,9 @@ def delete_model(gid: str, mid: str):
 @app.post("/api/v1/gateways/{gid}/discover")
 def discover_models(gid: str):
     _or_404(query_one("SELECT id FROM gateways WHERE id=?", (gid,)), "Gateway")
-    catalog = [("gpt-4.1", "GPT-4.1", "reasoning,coding"), ("gpt-4.1-mini", "GPT-4.1 Mini", "fast,coding"),
-               ("gpt-4o", "GPT-4o", "reasoning,vision"), ("o4-mini", "o4-mini", "reasoning,fast")]
-    added = 0
-    for pid, name, caps in catalog:
-        exists = query_one("SELECT id FROM gateway_models WHERE gateway_id=? AND provider_model_id=?", (gid, pid))
-        if not exists:
-            insert("gateway_models", {"id": new_id(), "gateway_id": gid, "provider_model_id": pid,
-                                      "display_name": name, "capabilities": caps, "active": 1})
-            added += 1
-    return {"discovered": len(catalog), "added": added}
+    added = db.sync_gateway_models(gid)
+    total = query_one("SELECT COUNT(*) AS n FROM gateway_models WHERE gateway_id=?", (gid,))["n"]
+    return {"discovered": added, "added": added, "total": total}
 
 
 # ------------------------------- agent memory -------------------------------

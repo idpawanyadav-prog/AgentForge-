@@ -67,7 +67,7 @@ function GatewayCard({ gw, reload, onError }: { gw: any; reload: () => void; onE
         </div>
         <div className="btn-row">
           <button className="btn small" onClick={async () => {
-            try { await post(`/api/v1/gateways/${gw.id}/test`); reload(); } catch (e: any) { onError(e); }
+            try { await post(`/api/v1/gateways/${gw.id}/test`); reload(); reloadModels(); } catch (e: any) { onError(e); }
           }}>Test connection</button>
           <button className="btn small" onClick={async () => {
             try { await post(`/api/v1/gateways/${gw.id}/discover`); reloadModels(); } catch (e: any) { onError(e); }
