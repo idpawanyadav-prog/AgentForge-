@@ -47,3 +47,33 @@ export function ErrorNote({ error }: { error: string | null }) {
   if (!error) return null;
   return <div className="badge err" style={{ marginBottom: 10 }}>{error}</div>;
 }
+
+/**
+ * Modern collapsible card: clickable header row (title/status/actions on the
+ * left, animated chevron on the right) with a smooth height transition on the
+ * body. Body is unmounted while collapsed (async content loads on expand).
+ */
+export function Collapse({
+  header, sub, right, defaultOpen = false, children,
+}: {
+  header: React.ReactNode;
+  sub?: React.ReactNode;
+  right?: React.ReactNode;
+  defaultOpen?: boolean;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = React.useState(defaultOpen);
+  return (
+    <div className={`card collapse-card ${open ? 'open' : ''}`}>
+      <button className="collapse-head" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+        <span className={`collapse-chevron ${open ? 'open' : ''}`} aria-hidden>▸</span>
+        <span className="collapse-title">
+          <span className="collapse-header">{header}</span>
+          {sub && <span className="collapse-sub">{sub}</span>}
+        </span>
+        <span className="collapse-right" onClick={(e) => e.stopPropagation()}>{right}</span>
+      </button>
+      {open && <div className="collapse-body">{children}</div>}
+    </div>
+  );
+}

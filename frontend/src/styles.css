@@ -184,6 +184,30 @@ textarea { resize: vertical; min-height: 70px; font-family: var(--mono); }
 @media (max-width: 1100px) { .settings-grid { grid-template-columns: 1fr; } }
 .settings-grid .playground-card { margin: 0; }
 
+/* ---------- modern collapsible cards ---------- */
+.collapse-card { padding: 0; margin-bottom: 10px; overflow: hidden; transition: border-color .2s ease, box-shadow .2s ease; }
+.collapse-card.open { border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+.collapse-head {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 12px 14px; background: transparent; border: none; cursor: pointer;
+  color: inherit; text-align: left; font: inherit;
+}
+.collapse-head:hover { background: var(--bg3); }
+.collapse-chevron {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 6px; flex-shrink: 0;
+  background: var(--bg3); color: var(--text-dim); font-size: 12px;
+  transition: transform .25s ease, background .2s ease, color .2s ease;
+}
+.collapse-card.open .collapse-chevron,
+.collapse-chevron.open { transform: rotate(90deg); background: var(--accent-soft); color: var(--accent); }
+.collapse-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.collapse-header { font-weight: 600; font-size: 14px; }
+.collapse-sub { font-size: 12px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.collapse-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.collapse-body { padding: 4px 14px 14px; animation: collapseIn .22s ease; }
+@keyframes collapseIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+
 .agent-card { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; background: var(--panel); cursor: pointer; }
 .agent-card .head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .agent-activity {

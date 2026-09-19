@@ -1,6 +1,6 @@
 import React from 'react';
 import { get, post, put, patch, del, fmtDateTime, md } from '../api';
-import { Badge, Field, Modal, useAsyncData, ErrorNote } from '../components';
+import { Badge, Field, Modal, useAsyncData, ErrorNote, Collapse } from '../components';
 
 export default function SettingsPage() {
   const { data: gateways, reload } = useAsyncData<any[]>(() => get('/api/v1/gateways'), []);
@@ -47,36 +47,24 @@ export default function SettingsPage() {
 }
 
 function AuditTrail({ audit }: { audit: any[] }) {
-  const [open, setOpen] = React.useState(false);
   return (
-    <>
-      <div className="spread" style={{ margin: '18px 0 8px' }}>
-        <button
-          className="section-title"
-          style={{ margin: 0, cursor: 'pointer', background: 'none', border: 'none', padding: 0, color: 'inherit', font: 'inherit' }}
-          onClick={() => setOpen((o) => !o)}
-          title={open ? 'Hide audit trail' : 'Show audit trail'}
-        >
-          {open ? '▾' : '▸'} Audit trail (latest {Math.min(40, audit.length)})
-        </button>
-      </div>
-      {open && (
-        <div className="card">
-          {audit.map((a) => (
-            <div key={a.audit_seq} className="event-item">
-              <span className={`event-dot ${/delete|cancel|fail/.test(a.action) ? 'dot-err' : /create|start/.test(a.action) ? 'dot-ok' : 'dot-info'}`} />
-              <div>
-                <div><span className="mono">{a.action}</span> — {a.summary}</div>
-                <div className="kv">{a.resource_type}{a.resource_id ? ` · ${a.resource_id.slice(0, 8)}` : ''} · by {a.actor_id}</div>
-              </div>
-              <span style={{ flex: 1 }} />
-              <span className="event-time">{fmtDateTime(a.created_at)}</span>
+    <Collapse header={`Audit trail (latest ${Math.min(40, audit.length)})`}
+      sub="Configuration and command history — click to expand">
+      <div>
+        {audit.map((a) => (
+          <div key={a.audit_seq} className="event-item">
+            <span className={`event-dot ${/delete|cancel|fail/.test(a.action) ? 'dot-err' : /create|start/.test(a.action) ? 'dot-ok' : 'dot-info'}`} />
+            <div>
+              <div><span className="mono">{a.action}</span> — {a.summary}</div>
+              <div className="kv">{a.resource_type}{a.resource_id ? ` · ${a.resource_id.slice(0, 8)}` : ''} · by {a.actor_id}</div>
             </div>
-          ))}
-          {!audit.length && <div className="empty">No audit events yet.</div>}
-        </div>
-      )}
-    </>
+            <span style={{ flex: 1 }} />
+            <span className="event-time">{fmtDateTime(a.created_at)}</span>
+          </div>
+        ))}
+        {!audit.length && <div className="empty">No audit events yet.</div>}
+      </div>
+    </Collapse>
   );
 }
 
@@ -270,28 +258,27 @@ function GatewayCard({ gw, reload, onError, onEdit }: { gw: any; reload: () => v
   const [newModel, setNewModel] = React.useState('');
   const hasKey = !!gw.key_mask;
   return (
-    <div className="card">
-      <div className="spread">
-        <div>
-          <h3 style={{ margin: 0 }}>{gw.name} <Badge kind={gw.status === 'Active' ? 'ok' : 'dim'}>{gw.status}</Badge></h3>
-          <div className="kv mono" style={{ marginTop: 4 }}>{gw.provider} · {gw.base_url} · {gw.api_type}</div>
-          <div className="kv">API key: <span className="mono">{gw.key_mask ?? 'not set'}</span> {hasKey ? '(stored encrypted)' : ''} · last test: {gw.test_status ?? 'never'} {gw.last_tested_at ? `at ${fmtDateTime(gw.last_tested_at)}` : ''}</div>
-          {gw.test_diagnostic && <div className="kv">{gw.test_diagnostic}</div>}
-        </div>
-        <div className="btn-row">
-          <button className="btn small" onClick={onEdit}>Edit</button>
-          <button className="btn small" onClick={async () => {
-            try { await post(`/api/v1/gateways/${gw.id}/test`); reload(); reloadModels(); } catch (e: any) { onError(e); }
-          }}>Test connection</button>
-          <button className="btn small" onClick={async () => {
-            try { await post(`/api/v1/gateways/${gw.id}/discover`); reloadModels(); } catch (e: any) { onError(e); }
-          }}>Discover models</button>
-          <button className="btn small" onClick={() => reload()}>Refresh</button>
-          <button className="btn small danger" onClick={async () => {
-            if (!confirm(`Delete gateway "${gw.name}"?`)) return;
-            try { await del(`/api/v1/gateways/${gw.id}`); reload(); } catch (e: any) { onError(e); }
-          }}>Delete</button>
-        </div>
+    <Collapse
+      header={<span>{gw.name} <Badge kind={gw.status === 'Active' ? 'ok' : 'dim'}>{gw.status}</Badge></span>}
+      sub={<span className="mono">{gw.provider} · {gw.base_url} · {gw.api_type} · key: {gw.key_mask ?? 'not set'} · last test: {gw.test_status ?? 'never'}</span>}
+    >
+      <div className="kv">
+        API key: <span className="mono">{gw.key_mask ?? 'not set'}</span> {hasKey ? '(stored encrypted)' : ''} · last test: {gw.test_status ?? 'never'} {gw.last_tested_at ? `at ${fmtDateTime(gw.last_tested_at)}` : ''}
+      </div>
+      {gw.test_diagnostic && <div className="kv">{gw.test_diagnostic}</div>}
+      <div className="btn-row" style={{ margin: '10px 0' }}>
+        <button className="btn small" onClick={onEdit}>Edit</button>
+        <button className="btn small" onClick={async () => {
+          try { await post(`/api/v1/gateways/${gw.id}/test`); reload(); reloadModels(); } catch (e: any) { onError(e); }
+        }}>Test connection</button>
+        <button className="btn small" onClick={async () => {
+          try { await post(`/api/v1/gateways/${gw.id}/discover`); reloadModels(); } catch (e: any) { onError(e); }
+        }}>Discover models</button>
+        <button className="btn small" onClick={() => reload()}>Refresh</button>
+        <button className="btn small danger" onClick={async () => {
+          if (!confirm(`Delete gateway "${gw.name}"?`)) return;
+          try { await del(`/api/v1/gateways/${gw.id}`); reload(); } catch (e: any) { onError(e); }
+        }}>Delete</button>
       </div>
 
       <div className="section-title">Model catalog</div>
@@ -317,7 +304,7 @@ function GatewayCard({ gw, reload, onError, onEdit }: { gw: any; reload: () => v
           } catch (e: any) { onError(e); }
         }}>+ Register model</button>
       </div>
-    </div>
+    </Collapse>
   );
 }
 
