@@ -208,6 +208,32 @@ textarea { resize: vertical; min-height: 70px; font-family: var(--mono); }
 .collapse-body { padding: 4px 14px 14px; animation: collapseIn .22s ease; }
 @keyframes collapseIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
 
+/* ---------- custom dropdown (scrollable model picker) ---------- */
+.mselect { position: relative; width: 230px; }
+.mselect.disabled { opacity: 0.55; }
+.mselect-btn {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  width: 100%; padding: 8px 10px; font: inherit; font-size: 13px; color: var(--text);
+  background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+}
+.mselect-btn:hover:not(:disabled) { border-color: var(--accent); }
+.mselect-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mselect-caret { color: var(--text-dim); font-size: 11px; }
+.mselect-list {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 60;
+  max-height: calc(6 * 38px); overflow-y: auto;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.mselect-item {
+  display: block; width: 100%; text-align: left; padding: 8px 10px; font: inherit; font-size: 13px;
+  color: var(--text); background: transparent; border: none; cursor: pointer;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mselect-item:hover { background: var(--bg3); }
+.mselect-item.selected { background: var(--accent-soft); color: var(--accent); }
+.mselect-empty { padding: 10px; font-size: 12.5px; color: var(--text-dim); }
+
 .agent-card { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; background: var(--panel); cursor: pointer; }
 .agent-card .head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .agent-activity {

@@ -225,10 +225,7 @@ function ModelPlayground({ gateways, onError }: { gateways: any[]; onError: (e: 
           <select style={{ width: 190 }} value={gid} onChange={(e) => setGid(e.target.value)}>
             {gateways.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
           </select>
-          <select style={{ width: 220 }} value={modelId} onChange={(e) => setModelId(e.target.value)} disabled={!gid}>
-            <option value="">— select model —</option>
-            {(models ?? []).map((m) => <option key={m.id} value={m.id}>{m.display_name} ({m.provider_model_id})</option>)}
-          </select>
+          <ModelDropdown models={models ?? []} value={modelId} onChange={setModelId} disabled={!gid} />
         </div>
       </div>
       <div className="playground-msgs">
@@ -305,6 +302,44 @@ function GatewayCard({ gw, reload, onError, onEdit }: { gw: any; reload: () => v
         }}>+ Register model</button>
       </div>
     </Collapse>
+  );
+}
+
+/**
+ * Custom model picker: dropdown list scrolls, showing at most 6 items at a
+ * time (native <select> popups can't limit visible options).
+ */
+function ModelDropdown({ models, value, onChange, disabled }:
+  { models: any[]; value: string; onChange: (id: string) => void; disabled?: boolean }) {
+  const [open, setOpen] = React.useState(false);
+  const ref = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [open]);
+  const selected = models.find((m) => m.id === value);
+  return (
+    <div className={`mselect ${disabled ? 'disabled' : ''}`} ref={ref}>
+      <button type="button" className="mselect-btn" disabled={disabled}
+        onClick={() => setOpen((o) => !o)} title={selected ? `${selected.display_name} (${selected.provider_model_id})` : 'Select model'}>
+        <span className="mselect-label">{selected ? `${selected.display_name} (${selected.provider_model_id})` : '— select model —'}</span>
+        <span className="mselect-caret">▾</span>
+      </button>
+      {open && !disabled && (
+        <div className="mselect-list" role="listbox">
+          {models.map((m) => (
+            <button key={m.id} type="button"
+              className={`mselect-item ${m.id === value ? 'selected' : ''}`}
+              onClick={() => { onChange(m.id); setOpen(false); }}>
+              <b>{m.display_name}</b> <span className="mono">{m.provider_model_id}</span>
+            </button>
+          ))}
+          {!models.length && <div className="mselect-empty">No models registered for this gateway.</div>}
+        </div>
+      )}
+    </div>
   );
 }
 
