@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local database
+*.db
+*.db-wal
+*.db-shm
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Built static assets (produced by Docker build)
+/static/
+
+# Local env / secrets
+.env
+*.local
+
+# OS
+.DS_Store
+Thumbs.db
