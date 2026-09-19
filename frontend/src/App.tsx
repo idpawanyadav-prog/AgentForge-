@@ -70,15 +70,13 @@ export default function App() {
       <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`}>
         <div className="sidebar-head">
           {collapsed
-            ? <div className="brand mini" title="AgentOffice">A<span>O</span></div>
-            : <div className="brand">Agent<span>Office</span></div>}
-          <button
-            className="sidebar-toggle"
-            onClick={() => setCollapsed((c) => !c)}
-            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-          >
-            {collapsed ? '»' : '«'}
-          </button>
+            ? <img className="brand-logo" src="/logo.png" alt="AgentForge" title="AgentForge" />
+            : (
+              <div className="brand">
+                <img className="brand-logo" src="/logo.png" alt="" />
+                <span>Agent<em>Forge</em></span>
+              </div>
+            )}
         </div>
         {NAV.map((n) => (
           <button
@@ -106,6 +104,13 @@ export default function App() {
               {activeProject ? 'Project session active' : 'No project selected'}
             </div>
           )}
+          <button
+            className="sidebar-toggle"
+            onClick={() => setCollapsed((c) => !c)}
+            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            {collapsed ? '»' : '« Collapse'}
+          </button>
         </div>
       </aside>
       <main className="main">

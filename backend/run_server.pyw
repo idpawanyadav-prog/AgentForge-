@@ -1,4 +1,4 @@
-"""Windowless Agent Office server launcher.
+"""Windowless AgentForge server launcher.
 
 Run with pythonw.exe (no console) from start.bat. Logging goes to
 server.log in the repo root; stderr/stdout are never touched, so the

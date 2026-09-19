@@ -1,4 +1,4 @@
-"""Agent Office API — FastAPI application.
+"""AgentForge API — FastAPI application.
 
 CQRS-lite: query endpoints return read models for Project Control; command
 endpoints validate, mutate durable state and emit realtime events. Static
@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Agent Office API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="AgentForge API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
