@@ -519,7 +519,6 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
                 Activity {(s?.scheduler_running || running > 0) && <span className="live-dot" title="Live" />}
               </button>
               <button className={`pane-tab ${tab === 'tasks' ? 'active' : ''}`} onClick={() => setTab('tasks')}>Sprint Tasks</button>
-              <button className="pane-tab" style={{ flex: 0, padding: '10px 10px' }} onClick={() => setPaneOpen(false)}>»</button>
             </div>
             <div className="pane-body">
               <ErrorNote error={error} />
@@ -634,11 +633,23 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
                 </>
               )}
             </div>
+            <button
+              className="pane-toggle"
+              onClick={() => setPaneOpen(false)}
+              title="Collapse pane"
+            >
+              Collapse »
+            </button>
           </>
         ) : (
-          <button className="pane-tab" style={{ height: '100%', writingMode: 'vertical-rl' }} onClick={() => setPaneOpen(true)}>
-            « Operations pane
-          </button>
+          <>
+            <button className="pane-tab" style={{ flex: 1, writingMode: 'vertical-rl' }} onClick={() => setPaneOpen(true)}>
+              « Operations pane
+            </button>
+            <button className="pane-toggle" onClick={() => setPaneOpen(true)} title="Expand pane">
+              «
+            </button>
+          </>
         )}
       </div>
     </div>
