@@ -27,6 +27,7 @@ HELP_TEXT = """I can execute these typed commands:
 - `create agent <name> role <role> persona <persona>`
 - `build team <name> with <role1>, <role2>, ...` — reuses only uncommitted agents; hires new agents for roles with nobody free
 - `create team <name> with agents <a>, <b>, ...`
+- `align team <name> to this project` — aligns a team to the current project (name optional: newest unaligned team)
 
 **Agile**
 - `add backlog item <title> points <n>`
@@ -654,6 +655,35 @@ def _execute_command(project_id, command, args) -> str:
         where = f" to sprint **{sprint['name']}**" if sprint else " (no sprint found — create one and re-add if needed)"
         return f"Task **{title}** added{where} ({points} pts, priority {priority})."
 
+    if command == "align_team":
+        team = None
+        team_ref = str(args.get("team") or "").strip()
+        if team_ref:
+            teams = query("SELECT * FROM teams ORDER BY created_at DESC")
+            team = next((t for t in teams if t["name"].lower() == team_ref.lower()
+                         or team_ref.lower() in t["name"].lower()), None)
+            if not team:
+                return ("Team matching **" + team_ref + "** not found. Teams: "
+                        + ", ".join(t["name"] for t in teams) + ".")
+        else:
+            aligned_ids = {r["team_id"] for r in query("SELECT team_id FROM projects WHERE team_id IS NOT NULL")}
+            team = query_one("SELECT * FROM teams ORDER BY created_at DESC")
+            for t in query("SELECT * FROM teams ORDER BY created_at DESC"):
+                if t["id"] not in aligned_ids:
+                    team = t
+                    break
+        if not team:
+            return "No teams exist yet. Build or create one first."
+        project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+        if project["team_id"] == team["id"]:
+            return f"Team **{team['name']}** is already aligned to **{project['name']}**."
+        prev = query_one("SELECT name FROM teams WHERE id = ?", (project["team_id"],)) if project["team_id"] else None
+        update("projects", project_id, {"team_id": team["id"], "updated_at": ts})
+        audit("align_team", "project", project_id,
+              f"Aligned project '{project['name']}' to team '{team['name']}'")
+        note = f" (previous team **{prev['name']}** stays active but unaligned)" if prev else ""
+        return f"**{project['name']}** is now aligned to team **{team['name']}**.{note}"
+
     if command == "assign_task":
         task = _find_task(project_id, args.get("task", ""))
         agent = _find_agent(args.get("agent", ""))
@@ -747,6 +777,8 @@ INTENTS = [
     ("add_backlog_item", r"add (?:a )?backlog item\s+(?P<title>.+?)(?:\s+points?\s+(?P<points>\d+))?(?:\s+priority\s+(?P<priority>\d+))?\s*$"),
     ("add_task", r"add (?:a )?task\s+(?P<title>.+?)(?:\s+to\s+(?:the\s+)?(?:sprint\s+)?(?P<sprint>.+?))?(?:\s+points?\s+(?P<points>\d+))?(?:\s+priority\s+(?P<priority>\d+))?\s*$"),
     ("create_sprint", r"create (?:a )?sprint\s+(?P<name>.+?)\s*$"),
+    ("align_team", r"align(?:ed)?\s+(?:it|that team|the new team|the team)?\s*(?:to|in|with)?\s*(?:this\s+)?project\s*$"),
+    ("align_team", r"(?:align|link|attach|assign)\s+(?:the\s+)?team\s+(?P<team>.+?)\s+(?:to|with)\s+(?:this\s+)?project\s*$"),
     ("assign_task", r"assign(?: task)?\s+(?P<task>.+?)\s+to\s+(?P<agent>.+?)\s*$"),
     ("start_task", r"(?:start|run|execute)\s+(?:the )?task\s+(?P<task>.+?)\s*$"),
     ("start_sprint", r"start\s+(?:the )?sprint(?: execution)?\s*$"),
@@ -766,11 +798,12 @@ SUGGESTIONS = {
     "create_persona": ["Create agent with this persona", "Show agent memory", "Status"],
     "create_skill": ["Attach skill to a role", "Create another skill", "Status"],
     "create_agent": ["Build a team with this agent", "Status", "Create another agent"],
-    "create_team": ["Add backlog item", "Create sprint", "Status"],
-    "build_team": ["Add backlog item", "Create sprint", "Start sprint execution"],
+    "create_team": ["Align this team to the project", "Add backlog item", "Status"],
+    "build_team": ["Align this team to the project", "Add backlog item", "Status"],
     "add_backlog_item": ["Create a sprint for these items", "Assign task to an agent", "Status"],
     "add_task": ["Create a sprint", "Assign task to an agent", "Start sprint execution"],
     "create_sprint": ["Add backlog item", "Start sprint execution", "Status"],
+    "align_team": ["Status", "Assign task to an agent", "Start sprint execution"],
     "assign_task": ["Start task", "Start sprint execution", "Agent status"],
     "start_task": ["Status", "Pause execution", "What are the agents doing?"],
     "start_sprint": ["Status", "Pause execution", "Stop sprint execution"],
@@ -890,6 +923,7 @@ Available commands (name: args):
 - add_backlog_item: {title, points?, priority?} — for the product backlog
 - add_task: {title, sprint?, points?, priority?} — creates a task IN a sprint; use this (not add_backlog_item) when the user wants items added to a sprint
 - create_sprint: {name, goal?, capacity?}
+- align_team: {team?} — aligns a team to the CURRENT project; team name optional (defaults to the newest team not aligned to any project). Use when the user says things like "align it in this project" after building a team.
 - assign_task: {task, agent}
 - start_task: {task}
 - start_sprint: {}
@@ -977,13 +1011,20 @@ def _call_llm(gw, model, system_prompt: str, user_text: str, max_tokens: int = 7
 def _ai_route(project_id: str, conversation_id: str, text: str) -> dict:
     """LLM-driven intent routing over the typed command engine."""
     gw, model = _bot_config()
-    try:
-        raw = _call_llm(gw, model, AI_SYSTEM_PROMPT + _context_brief(project_id), text)
-        parsed = _extract_json(raw)
-        if not parsed or "reply" not in parsed:
+    parsed = None
+    last_exc = None
+    for attempt in range(2):
+        try:
+            raw = _call_llm(gw, model, AI_SYSTEM_PROMPT + _context_brief(project_id), text)
+            parsed = _extract_json(raw)
+            if parsed and "reply" in parsed:
+                last_exc = None
+                break
             raise RuntimeError("The model did not return a valid response.")
-    except RuntimeError as exc:
-        reply = (f"AI routing failed — falling back to typed commands. ({exc})\n\n"
+        except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+            last_exc = exc
+    if parsed is None or "reply" not in parsed:
+        reply = (f"AI routing failed — falling back to typed commands. ({last_exc})\n\n"
                  "Try `help` for the command catalog.")
         _save_message(conversation_id, "assistant", reply)
         return {"reply": reply, "suggestions": ["Status", "Help"]}
