@@ -30,6 +30,7 @@ HELP_TEXT = """I can execute these typed commands:
 
 **Agile**
 - `add backlog item <title> points <n>`
+- `add task <title> to sprint <name>` — puts a task directly into a sprint
 - `create sprint <name>`
 - `assign task <title> to <agent>`
 - `start task <title>`
@@ -341,6 +342,30 @@ def _generate_role_kit(role) -> str:
         return f"kit generation failed ({exc}) — add persona/instructions manually"
 
 
+def _coerce_int(value, default: int = 0) -> int:
+    """Coerce AI-supplied values like 'high', 'P1', '8 points' to an int."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip().lower()
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    words = {
+        "critical": 1, "urgent": 1, "asap": 1, "highest": 1, "p0": 1,
+        "high": 2, "important": 2, "p1": 2,
+        "medium": 3, "normal": 3, "moderate": 3, "mid": 3, "p2": 3,
+        "low": 4, "minor": 4, "p3": 4,
+        "lowest": 5, "trivial": 5, "nice to have": 5, "p4": 5,
+    }
+    if text in words:
+        return words[text]
+    m = re.search(r"\d+", text)
+    return int(m.group()) if m else default
+
+
 def _execute_command(project_id, command, args) -> str:
     ts = now()
     if command == "create_gateway":
@@ -580,22 +605,54 @@ def _execute_command(project_id, command, args) -> str:
 
     if command == "add_backlog_item":
         bid = new_id()
+        priority = max(1, min(5, _coerce_int(args.get("priority"), 2)))
+        points = max(0, _coerce_int(args.get("points"), 3))
         insert("backlog_items", {
             "id": bid, "project_id": project_id, "title": args["title"],
-            "description": args.get("description", ""), "priority": int(args.get("priority", 2)),
+            "description": args.get("description", ""), "priority": priority,
             "acceptance_criteria": args.get("acceptance_criteria", ""),
-            "story_points": int(args.get("points", 3)), "status": "Backlog", "created_at": ts,
+            "story_points": points, "status": "Backlog", "created_at": ts,
         })
         audit("add_backlog_item", "backlog_item", bid, f"Added backlog item '{args['title']}'")
-        return f"Backlog item **{args['title']}** added ({args.get('points', 3)} pts, priority {args.get('priority', 2)})."
+        return f"Backlog item **{args['title']}** added ({points} pts, priority {priority})."
 
     if command == "create_sprint":
         sid = new_id()
         insert("sprints", {"id": sid, "project_id": project_id, "name": args["name"],
-                           "goal": args.get("goal", ""), "capacity": int(args.get("capacity", 40)),
+                           "goal": args.get("goal", ""), "capacity": max(0, _coerce_int(args.get("capacity"), 40)),
                            "status": "Planned", "created_at": ts})
         audit("create_sprint", "sprint", sid, f"Created sprint '{args['name']}'")
         return f"Sprint **{args['name']}** created (Planned). Activate it from the Sprints panel to commit tasks."
+
+    if command == "add_task":
+        title = str(args.get("title") or "").strip()
+        if not title:
+            return "Task title is required. Use `add task <title> to sprint <name>`."
+        sprint = None
+        sprints = query("SELECT * FROM sprints WHERE project_id = ? ORDER BY created_at DESC", (project_id,))
+        sprint_ref = str(args.get("sprint") or "").strip()
+        if sprint_ref:
+            sprint = next((s for s in sprints if s["name"].lower() == sprint_ref.lower()
+                           or sprint_ref.lower() in s["name"].lower()), None)
+            if not sprint:
+                return ("Sprint matching **" + sprint_ref + "** not found. Sprints in this project: "
+                        + (", ".join(s["name"] for s in sprints) if sprints else "(none yet)") + ".")
+        if not sprint:
+            sprint = next((s for s in sprints if s["status"] == "Active"), None)
+        if not sprint:
+            sprint = next((s for s in sprints if s["status"] == "Planned"), None)
+        priority = max(1, min(5, _coerce_int(args.get("priority"), 2)))
+        points = max(0, _coerce_int(args.get("points"), 3))
+        tid = new_id()
+        insert("tasks", {"id": tid, "project_id": project_id,
+                         "sprint_id": sprint["id"] if sprint else None,
+                         "title": title, "description": args.get("description", ""),
+                         "acceptance_criteria": "", "story_points": points, "priority": priority,
+                         "status": "Todo", "created_at": ts, "updated_at": ts})
+        audit("add_task", "task", tid,
+              f"Added task '{title}'" + (f" to sprint '{sprint['name']}'" if sprint else " (no sprint)"))
+        where = f" to sprint **{sprint['name']}**" if sprint else " (no sprint found — create one and re-add if needed)"
+        return f"Task **{title}** added{where} ({points} pts, priority {priority})."
 
     if command == "assign_task":
         task = _find_task(project_id, args.get("task", ""))
@@ -688,6 +745,7 @@ INTENTS = [
     ("build_team", r"build (?:a |the )?team\s+(?:called\s+|named\s+)?(?P<name>.+?)\s+(?:with|staffed with|using)\s+(?P<roles>.+?)\s*$"),
     ("build_team", r"build (?:a |the )?team\s+(?:for|to)\s+(?:this\s+)?project\s*$"),
     ("add_backlog_item", r"add (?:a )?backlog item\s+(?P<title>.+?)(?:\s+points?\s+(?P<points>\d+))?(?:\s+priority\s+(?P<priority>\d+))?\s*$"),
+    ("add_task", r"add (?:a )?task\s+(?P<title>.+?)(?:\s+to\s+(?:the\s+)?(?:sprint\s+)?(?P<sprint>.+?))?(?:\s+points?\s+(?P<points>\d+))?(?:\s+priority\s+(?P<priority>\d+))?\s*$"),
     ("create_sprint", r"create (?:a )?sprint\s+(?P<name>.+?)\s*$"),
     ("assign_task", r"assign(?: task)?\s+(?P<task>.+?)\s+to\s+(?P<agent>.+?)\s*$"),
     ("start_task", r"(?:start|run|execute)\s+(?:the )?task\s+(?P<task>.+?)\s*$"),
@@ -711,6 +769,7 @@ SUGGESTIONS = {
     "create_team": ["Add backlog item", "Create sprint", "Status"],
     "build_team": ["Add backlog item", "Create sprint", "Start sprint execution"],
     "add_backlog_item": ["Create a sprint for these items", "Assign task to an agent", "Status"],
+    "add_task": ["Create a sprint", "Assign task to an agent", "Start sprint execution"],
     "create_sprint": ["Add backlog item", "Start sprint execution", "Status"],
     "assign_task": ["Start task", "Start sprint execution", "Agent status"],
     "start_task": ["Status", "Pause execution", "What are the agents doing?"],
@@ -828,7 +887,8 @@ Available commands (name: args):
 - create_agent: {name, role, persona?}
 - build_team: {name, roles: ["role name", ...]} — preferred way to build teams
 - create_team: {name, agents: ["agent name", ...]} — only when the user names specific FREE agents
-- add_backlog_item: {title, points?, priority?}
+- add_backlog_item: {title, points?, priority?} — for the product backlog
+- add_task: {title, sprint?, points?, priority?} — creates a task IN a sprint; use this (not add_backlog_item) when the user wants items added to a sprint
 - create_sprint: {name, goal?, capacity?}
 - assign_task: {task, agent}
 - start_task: {task}
@@ -955,7 +1015,11 @@ def _ai_route(project_id: str, conversation_id: str, text: str) -> dict:
                            "pending_command": pid, "proposal": args})
             _save_message(conversation_id, "assistant", reply, meta=json.dumps({"pending_command": pid}))
             return result
-        outcome = _execute_command(project_id, name, args)
+        try:
+            outcome = _execute_command(project_id, name, args)
+        except Exception as exc:
+            outcome = (f"⚠️ The command `{name}` failed with: {exc}. "
+                       "Try rephrasing, or use the typed command (e.g. `help`).")
         reply = f"{reply}\n\n{outcome}" if reply else outcome
         result["reply"] = reply
         if not suggestions:
