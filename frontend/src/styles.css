@@ -173,6 +173,18 @@ textarea { resize: vertical; min-height: 70px; font-family: var(--mono); }
 .dot-ok { background: var(--ok); } .dot-err { background: var(--err); }
 .dot-warn { background: var(--warn); } .dot-info { background: var(--accent); }
 
+/* ---------- live indicator ---------- */
+.live-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--ok); margin-left: 6px; vertical-align: middle;
+  animation: live-pulse 1.2s ease-in-out infinite;
+}
+.live-dot.idle { background: var(--text-dim, #888); animation: none; }
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.75); }
+}
+
 .task-row { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; background: var(--panel); }
 .progress-track { height: 6px; border-radius: 4px; background: var(--bg3); margin-top: 8px; overflow: hidden; }
 .progress-fill { height: 100%; background: var(--accent); border-radius: 4px; transition: width 0.4s; }

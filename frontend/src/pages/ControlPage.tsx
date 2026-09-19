@@ -26,6 +26,12 @@ function eventColor(t: string): string {
   return 'dot-info';
 }
 
+const TASK_ICON: Record<string, string> = {
+  'Done': '✅', 'In Progress': '🔄', 'Review': '🔍', 'Testing': '🧪',
+  'Ready': '🟡', 'Todo': '⏳', 'Blocked': '⛔', 'Cancelled': '✖️',
+};
+const taskIcon = (s: string) => TASK_ICON[s] ?? '⏳';
+
 function eventText(e: EventRow): string {
   const p = e.payload || {};
   switch (e.event_type) {
@@ -58,6 +64,10 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
   const [pending, setPending] = React.useState<string | null>(null);
   const [suggestions, setSuggestions] = React.useState<string[]>([]);
   const [summary, setSummary] = React.useState<Summary | null>(null);
+  const [liveEvents, setLiveEvents] = React.useState<EventRow[]>([]);
+  const [sprints, setSprints] = React.useState<any[]>([]);
+  const [selectedSprint, setSelectedSprint] = React.useState<string>('');
+  const [sprintTasks, setSprintTasks] = React.useState<TaskRow[]>([]);
   const [tab, setTab] = React.useState<'team' | 'activity' | 'tasks'>('team');
   const [paneOpen, setPaneOpen] = React.useState(true);
   const [expanded, setExpanded] = React.useState<Record<string, boolean>>({});
@@ -89,24 +99,66 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
   React.useEffect(() => { if (activeConv) loadMessages(activeConv); }, [activeConv, loadMessages]);
   React.useEffect(() => { msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
-  // Poll control summary + incremental events
+  // Live polling: summary (team state), incremental event stream, selected sprint tasks.
   React.useEffect(() => {
     if (!activeProject) return;
     let alive = true;
+    let busy = false;
     const poll = async () => {
+      if (busy) return;
+      busy = true;
       try {
         const s: Summary = await get(`/api/v1/projects/${activeProject}/control/summary`);
         if (!alive) return;
         setSummary(s);
+        setLiveEvents((prev) => {
+          if (!prev.length) {
+            lastSeqRef.current = Math.max(lastSeqRef.current, s.events.length ? s.events[s.events.length - 1].seq : 0);
+            return s.events;
+          }
+          return prev;
+        });
         const evs: any = await get(`/api/v1/projects/${activeProject}/events?after=${lastSeqRef.current}`);
         if (!alive) return;
-        lastSeqRef.current = evs.last_seq;
+        if (evs.events?.length) {
+          lastSeqRef.current = evs.last_seq;
+          setLiveEvents((prev) => {
+            const known = new Set(prev.map((e) => e.seq));
+            const fresh = (evs.events as EventRow[]).filter((e) => !known.has(e.seq));
+            return [...prev, ...fresh].slice(-80);
+          });
+        }
       } catch { /* transient */ }
+      finally { busy = false; }
     };
     poll();
-    const t = setInterval(poll, 2000);
-    return () => { alive = false; clearInterval(t); };
+    const timer = setInterval(poll, 1200);
+    return () => { alive = false; clearInterval(timer); };
   }, [activeProject]);
+
+  // Sprints list + default selection (active sprint first)
+  React.useEffect(() => {
+    if (!activeProject) return;
+    get(`/api/v1/projects/${activeProject}/sprints`).then((list: any[]) => {
+      setSprints(list);
+      setSelectedSprint((cur) => {
+        if (cur && list.some((x) => x.id === cur)) return cur;
+        const active = list.find((x) => x.status === 'Active');
+        return (active ?? list[0])?.id ?? '';
+      });
+    }).catch(() => undefined);
+  }, [activeProject]);
+
+  // Tasks of the selected sprint, refreshed on the same live cadence
+  React.useEffect(() => {
+    if (!activeProject || !selectedSprint) { setSprintTasks([]); return; }
+    let alive = true;
+    const load = () => get(`/api/v1/projects/${activeProject}/tasks?sprint_id=${selectedSprint}`)
+      .then((t: TaskRow[]) => { if (alive) setSprintTasks(t); }).catch(() => undefined);
+    load();
+    const t = setInterval(load, 2000);
+    return () => { alive = false; clearInterval(t); };
+  }, [activeProject, selectedSprint]);
 
   const send = async (text?: string) => {
     const content = (text ?? input).trim();
@@ -244,8 +296,12 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
         {paneOpen ? (
           <>
             <div className="pane-tabs">
-              <button className={`pane-tab ${tab === 'team' ? 'active' : ''}`} onClick={() => setTab('team')}>Team</button>
-              <button className={`pane-tab ${tab === 'activity' ? 'active' : ''}`} onClick={() => setTab('activity')}>Activity</button>
+              <button className={`pane-tab ${tab === 'team' ? 'active' : ''}`} onClick={() => setTab('team')}>
+                Team {(s?.scheduler_running || running > 0) && <span className="live-dot" title="Live" />}
+              </button>
+              <button className={`pane-tab ${tab === 'activity' ? 'active' : ''}`} onClick={() => setTab('activity')}>
+                Activity {(s?.scheduler_running || running > 0) && <span className="live-dot" title="Live" />}
+              </button>
               <button className={`pane-tab ${tab === 'tasks' ? 'active' : ''}`} onClick={() => setTab('tasks')}>Sprint Tasks</button>
               <button className="pane-tab" style={{ flex: 0, padding: '10px 10px' }} onClick={() => setPaneOpen(false)}>»</button>
             </div>
@@ -283,7 +339,10 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
 
               {tab === 'activity' && (
                 <>
-                  {(s?.events ?? []).map((e) => (
+                  <div className="small muted" style={{ marginBottom: 8 }}>
+                    <span className={`live-dot ${s?.scheduler_running || running > 0 ? '' : 'idle'}`} /> Live event stream
+                  </div>
+                  {liveEvents.map((e) => (
                     <div key={e.seq} className="event-item">
                       <span className={`event-dot ${eventColor(e.event_type)}`} />
                       <div>
@@ -294,27 +353,34 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
                       <span className="event-time">{fmtTime(e.created_at)}</span>
                     </div>
                   ))}
-                  {!s?.events.length && <div className="empty">No activity yet. Start a task to see live events.</div>}
+                  {!liveEvents.length && <div className="empty">No activity yet. Start a task to see live events.</div>}
                 </>
               )}
 
               {tab === 'tasks' && (
                 <>
-                  {s?.sprint && (
-                    <div className="small muted" style={{ marginBottom: 10 }}>
-                      Active sprint: <b>{s.sprint.name}</b> — {s.sprint.goal}
-                    </div>
-                  )}
-                  {(s?.sprint_tasks ?? []).map((t) => (
+                  <div className="row" style={{ marginBottom: 10, gap: 8 }}>
+                    <select style={{ flex: 1 }} value={selectedSprint}
+                      onChange={(e) => setSelectedSprint(e.target.value)}>
+                      <option value="">— select sprint —</option>
+                      {sprints.map((sp) => (
+                        <option key={sp.id} value={sp.id}>
+                          {sp.name} · {sp.status} · {sp.committed_points ?? 0}/{sp.capacity} pts
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  {sprintTasks.map((t) => (
                     <div key={t.id} className="task-row">
                       <div className="spread">
-                        <b style={{ fontSize: 13 }}>{t.title}</b>
+                        <b style={{ fontSize: 13 }}>{taskIcon(t.status)} {t.title}</b>
                         <Badge kind={TASK_STATE_CLASS[t.status] ?? 'dim'}>{t.status}</Badge>
                       </div>
                       <div className="row small muted" style={{ marginTop: 4, gap: 10 }}>
                         <span>{t.agent_name ?? 'unassigned'}</span>
                         <span>{t.story_points} pts</span>
-                        {t.dependencies.length > 0 && <span>deps: {t.dependencies.map((d) => d.title).join(', ')}</span>}
+                        <span>{t.progress}%</span>
+                        {t.dependencies.length > 0 && <span>deps: {t.dependencies.map((d) => `${taskIcon(d.status)} ${d.title}`).join(', ')}</span>}
                       </div>
                       {t.blocked_reason && <div className="small" style={{ color: 'var(--err)', marginTop: 4 }}>⛔ {t.blocked_reason}</div>}
                       {t.evidence && <div className="small mono" style={{ marginTop: 4, color: 'var(--ok)' }}>evidence: {t.evidence}</div>}
@@ -335,7 +401,11 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
                       </div>
                     </div>
                   ))}
-                  {!s?.sprint_tasks.length && <div className="empty">No sprint tasks. Plan a sprint on the Projects page.</div>}
+                  {!sprintTasks.length && (
+                    <div className="empty">
+                      {selectedSprint ? 'No tasks committed to this sprint.' : 'No sprints yet. Plan one on the Projects page.'}
+                    </div>
+                  )}
                 </>
               )}
             </div>
