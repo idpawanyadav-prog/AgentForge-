@@ -248,6 +248,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   story_points INTEGER NOT NULL DEFAULT 3,
   priority INTEGER NOT NULL DEFAULT 2,
   assigned_agent_id TEXT REFERENCES agents(id),
+  qa_agent_id TEXT REFERENCES agents(id),
+  rework_count INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'Todo',
   progress INTEGER NOT NULL DEFAULT 0,
   evidence TEXT NOT NULL DEFAULT '',
@@ -482,6 +484,11 @@ def init_db():
     cols = {r["name"] for r in query("PRAGMA table_info(gateways)")}
     if "api_key_enc" not in cols:
         execute("ALTER TABLE gateways ADD COLUMN api_key_enc TEXT")
+    task_cols = {r["name"] for r in query("PRAGMA table_info(tasks)")}
+    if "qa_agent_id" not in task_cols:
+        execute("ALTER TABLE tasks ADD COLUMN qa_agent_id TEXT REFERENCES agents(id)")
+    if "rework_count" not in task_cols:
+        execute("ALTER TABLE tasks ADD COLUMN rework_count INTEGER NOT NULL DEFAULT 0")
     db.commit()
     seed_if_empty()
     seed_instruction_files()

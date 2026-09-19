@@ -9,7 +9,7 @@ the demo works without provider credentials.
 import json
 import re
 
-from . import db, runtime
+from . import db, runtime, toolchains
 from .db import audit, execute, insert, new_id, now, query, query_one, update
 
 HELP_TEXT = """I can execute these typed commands:
@@ -17,6 +17,9 @@ HELP_TEXT = """I can execute these typed commands:
 **Configure**
 - `create gateway <name> provider <provider> url <base-url> key <api-key>`
 - `test gateway <name>`
+
+**Toolchains**
+- `install dotnet|go|node toolchain` — installs a build toolchain (approval-first)
 
 **Agent Memory**
 - `create role <name>`
@@ -36,6 +39,7 @@ HELP_TEXT = """I can execute these typed commands:
 **Agile**
 - `add backlog item <title> points <n>`
 - `add task <title> to sprint <name>` — puts a task directly into a sprint
+- `add urgent task <title>` — shows a plan; on approval it enters the active sprint at priority 1 and goes straight to an idle developer
 - `create sprint <name>`
 - `assign task <title> to <agent>`
 - `start task <title>`
@@ -46,7 +50,8 @@ HELP_TEXT = """I can execute these typed commands:
 - `status` — project summary
 - `help` — this message
 
-Sensitive commands (gateways, agents, teams) require your confirmation before execution."""
+Sensitive commands (gateways, agents, teams) require your confirmation before execution.
+`create sprint` shows a full sprint plan (with tasks) for your approval first — reply `confirm` to create it."""
 
 
 def _save_message(conversation_id, role, content, meta=""):
@@ -121,17 +126,48 @@ def _find_agent(name):
 
 _TASK_FILLER = {"task", "the", "a", "an", "to", "please", "assign"}
 
+# Relative references users say instead of a concrete title, e.g. "the first task".
+_TASK_ORDINALS = {"first": 0, "1st": 0, "1": 0, "second": 1, "2nd": 1, "2": 1,
+                  "third": 2, "3rd": 2, "3": 2, "fourth": 3, "4th": 3, "4": 3,
+                  "fifth": 4, "5th": 4, "5": 4, "last": -1, "latest": -1, "newest": -1}
+
+# Generic agent references that mean "any member of this project's team".
+_GENERIC_AGENT_REFS = {"agent", "the agent", "a team member", "team member", "member",
+                       "a member", "any member", "anyone", "someone", "any agent",
+                       "anybody", "whoever", "a teammate", "teammate"}
+
+
+def _pick_team_member(project_id, task=None):
+    """Pick a member of the project's aligned team for a task: prefer a
+    role-family match (idle first, least loaded), then any idle member."""
+    members = runtime._team_members(project_id)
+    if not members:
+        return None
+    family = runtime._family_for_task(task) if task else None
+    pick, _ = runtime._pick_member(members, family)
+    return pick
+
 
 def _find_task(project_id, title):
     rows = query("SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at", (project_id,))
     if not rows:
         return None
-    t = str(title or "").lower().strip()
+    t = str(title or "").lower().strip().strip(".!?;,")
     exact = [r for r in rows if r["title"].lower() == t]
     if exact:
         return exact[0]
     if t in ("", "task"):
         return rows[0]
+    # Normalize relative references: "the first task" -> "first", "task 2" -> "2".
+    ref = re.sub(r"^(?:the|a|an)\s+", "", t)
+    ref = re.sub(r"^task\s+", "", ref)
+    ref = re.sub(r"\s+task$", "", ref).strip()
+    if ref == "next":
+        return next((r for r in rows if r["status"] not in ("Done", "Cancelled")), rows[0])
+    if ref in _TASK_ORDINALS:
+        idx = _TASK_ORDINALS[ref]
+        return rows[idx] if -len(rows) <= idx < len(rows) else None
+    t = ref
     partial = [r for r in rows if t in r["title"].lower()]
     if partial:
         return partial[0]
@@ -818,6 +854,32 @@ def _execute_command(project_id, command, args) -> str:
                   " They still serve: " + ", ".join(sorted(remaining)) + ".")
         return f"**{agent['name']}** removed from team **{team['name']}**.{status}"
 
+    if command == "install_toolchain":
+        stack = _normalize_stack(args.get("stack"))
+        tc = toolchains.STACKS.get(stack)
+        if not tc:
+            return f"Unknown toolchain `{stack}` — supported: dotnet, go, node, python."
+        ok, _msg = toolchains.toolchain_available(stack)
+        if ok:
+            return f"**{tc['label']}** is already installed — nothing to do."
+        import subprocess as _sp
+        cmd = tc["install"].split()
+        audit("install_toolchain", "toolchain", stack, f"Running: {' '.join(cmd)}")
+        try:
+            proc = _sp.run(cmd, capture_output=True, text=True, timeout=1800)
+        except _sp.TimeoutExpired:
+            return (f"Install of **{tc['label']}** timed out after 30 minutes. "
+                    "Run it manually in an admin terminal if winget is waiting for input.")
+        tail = "\n".join(((proc.stdout or "") + (proc.stderr or "")).strip().splitlines()[-5:])
+        ok2, _msg2 = toolchains.toolchain_available(stack)
+        if ok2:
+            audit("install_toolchain", "toolchain", stack, f"Installed {tc['label']}")
+            return (f"**{tc['label']}** installed successfully (exit code {proc.returncode}). "
+                    "Re-run the affected task — build and QA will now use the real toolchain.")
+        return (f"Install of **{tc['label']}** finished with exit code {proc.returncode} "
+                f"but the tool is still not on PATH.\nOutput tail:\n```\n{tail[:600]}\n```\n"
+                "Restart the backend (to refresh PATH) and try again, or install manually.")
+
     if command == "add_backlog_item":
         bid = new_id()
         priority = max(1, min(5, _coerce_int(args.get("priority"), 2)))
@@ -832,15 +894,53 @@ def _execute_command(project_id, command, args) -> str:
         return f"Backlog item **{args['title']}** added ({points} pts, priority {priority})."
 
     if command == "create_sprint":
-        sid = new_id()
-        insert("sprints", {"id": sid, "project_id": project_id, "name": args["name"],
-                           "goal": args.get("goal", ""), "capacity": max(0, _coerce_int(args.get("capacity"), 40)),
-                           "status": "Planned", "created_at": ts})
-        audit("create_sprint", "sprint", sid, f"Created sprint '{args['name']}'")
-        return f"Sprint **{args['name']}** created (Planned). Activate it from the Sprints panel to commit tasks."
+        name = str(args.get("name") or args.get("title") or args.get("sprint") or "").strip()
+        if not name:
+            return ("Sprint name is required. Use `create sprint <name>`, or say e.g. "
+                    "\"create a sprint for the Weather App\" and I'll draft a full plan for your approval.")
+        dup = query_one("SELECT * FROM sprints WHERE project_id = ? AND lower(name) = lower(?)",
+                        (project_id, name))
+        tasks = args.get("tasks") if isinstance(args.get("tasks"), list) else []
+        if dup:
+            # Never create a same-named sprint twice — merge tasks into the existing one.
+            if not tasks:
+                return (f"Sprint **{dup['name']}** already exists in this project ({dup['status']}). "
+                        "Say \"start sprint\" to run it, or use a different name to create another.")
+            sid = dup["id"]
+            summary = f"Sprint **{dup['name']}** already exists — added the new task(s) to it"
+        else:
+            sid = new_id()
+            insert("sprints", {"id": sid, "project_id": project_id, "name": name,
+                               "goal": str(args.get("goal") or ""),
+                               "capacity": max(0, _coerce_int(args.get("capacity"), 40)),
+                               "status": "Planned", "created_at": ts})
+            audit("create_sprint", "sprint", sid, f"Created sprint '{name}'")
+            summary = f"Sprint **{name}** created (Planned)"
+        created, total_pts = [], 0
+        for t in tasks:
+            if not isinstance(t, dict):
+                continue
+            t_title = str(t.get("title") or t.get("task") or "").strip()
+            if not t_title:
+                continue
+            pts = max(0, _coerce_int(t.get("points"), 3))
+            priority = max(1, min(5, _coerce_int(t.get("priority"), 2)))
+            total_pts += pts
+            tid = new_id()
+            insert("tasks", {"id": tid, "project_id": project_id, "sprint_id": sid,
+                             "title": t_title, "description": str(t.get("description") or ""),
+                             "acceptance_criteria": str(t.get("acceptance_criteria") or ""),
+                             "story_points": pts, "priority": priority,
+                             "status": "Todo", "created_at": ts, "updated_at": ts})
+            created.append(f"- {t_title} ({pts} pts, priority {priority})")
+        if not created:
+            return summary + ". Say \"start sprint\" to begin autonomous execution."
+        audit("create_sprint_tasks", "sprint", sid, f"Added {len(created)} task(s) to sprint '{name}'")
+        return (summary + f" with {len(created)} task(s), {total_pts} pts:\n" + "\n".join(created)
+                + "\n\nSay \"start sprint\" to begin autonomous execution.")
 
     if command == "add_task":
-        title = str(args.get("title") or "").strip()
+        title = str(args.get("title") or args.get("task") or args.get("name") or "").strip()
         if not title:
             return "Task title is required. Use `add task <title> to sprint <name>`."
         sprint = None
@@ -868,6 +968,57 @@ def _execute_command(project_id, command, args) -> str:
               f"Added task '{title}'" + (f" to sprint '{sprint['name']}'" if sprint else " (no sprint)"))
         where = f" to sprint **{sprint['name']}**" if sprint else " (no sprint found — create one and re-add if needed)"
         return f"Task **{title}** added{where} ({points} pts, priority {priority})."
+
+    if command == "add_urgent_task":
+        title = str(args.get("title") or args.get("task") or args.get("name") or "").strip()
+        if not title:
+            return ("Urgent task title is required. Say e.g. \"add urgent task Fix login 500 error\" "
+                    "and I'll draft a plan for your approval.")
+        sprint = query_one(
+            "SELECT * FROM sprints WHERE project_id = ? AND status = 'Active' ORDER BY created_at LIMIT 1",
+            (project_id,))
+        if not sprint:
+            sprints = query("SELECT name, status FROM sprints WHERE project_id = ? ORDER BY created_at DESC", (project_id,))
+            return ("No active sprint to add the urgent task to. "
+                    + ("Active sprints: " + ", ".join(s["name"] for s in sprints if s["status"] != "Planned")
+                       if any(s["status"] != "Planned" for s in sprints)
+                       else "Sprints in this project: " + (", ".join(s["name"] for s in sprints) or "(none yet)"))
+                    + ". Say \"start sprint\" to activate one first.")
+        members = runtime._team_members(project_id) or []
+        devs = [m for m in members if runtime._family_of_role(m["role_name"]) == "dev"]
+        idle_devs = [m for m in devs if m["lifecycle_state"] == "Idle"]
+        generalists = [m for m in members if runtime._family_of_role(m["role_name"]) is None]
+        idle_generalists = [m for m in generalists if m["lifecycle_state"] == "Idle"]
+        pick = None
+        if idle_devs:
+            pick = min(idle_devs, key=lambda m: (runtime._agent_load(m["id"]), m["name"]))
+        elif devs:
+            pick = min(devs, key=lambda m: (runtime._agent_load(m["id"]), m["name"]))
+        elif idle_generalists:
+            pick = min(idle_generalists, key=lambda m: (runtime._agent_load(m["id"]), m["name"]))
+        if not pick:
+            return ("No developer is available for the urgent task — the aligned team has no developer agents "
+                    "(or they are all assigned). Hire a developer, free one up, or align a team first.")
+        points = max(0, _coerce_int(args.get("points"), 3))
+        tid = new_id()
+        insert("tasks", {"id": tid, "project_id": project_id, "sprint_id": sprint["id"],
+                         "title": title, "description": str(args.get("description") or ""),
+                         "acceptance_criteria": str(args.get("acceptance_criteria") or ""),
+                         "story_points": points, "priority": 1,
+                         "assigned_agent_id": pick["id"], "status": "Ready",
+                         "progress": 0, "evidence": "", "blocked_reason": "",
+                         "qa_agent_id": None, "rework_count": 0,
+                         "created_at": ts, "updated_at": ts})
+        db.emit_event(project_id, "task.assigned",
+                      {"task_id": tid, "task": title, "agent": pick["name"],
+                       "role": pick["role_name"], "urgent": True},
+                      task_id=tid, agent_id=pick["id"])
+        audit("add_urgent_task", "task", tid,
+              f"Urgent task '{title}' created in sprint '{sprint['name']}' and assigned to {pick['name']}")
+        slot = " (idle)" if pick["lifecycle_state"] == "Idle" else ""
+        return (f"Urgent task **{title}** added to sprint **{sprint['name']}** with priority 1 and assigned "
+                f"directly to **{pick['name']}** ({pick['role_name']}){slot}. "
+                "It runs next — no further input needed unless QA or execution blocks it.")
 
     if command == "align_team":
         team = None
@@ -899,20 +1050,48 @@ def _execute_command(project_id, command, args) -> str:
         return f"**{project['name']}** is now aligned to team **{team['name']}**.{note}"
 
     if command == "assign_task":
+        agent_ref = str(args.get("agent") or "").strip().strip(".!?;,")
+        # Compound request: "assign X to Y and start execution".
+        auto_start = False
+        tail = re.search(r"\s+(?:and|then)\s+(?:start|run|execute)\b.*$", agent_ref, re.IGNORECASE)
+        if tail:
+            agent_ref = agent_ref[:tail.start()].strip()
+            auto_start = True
         task = _find_task(project_id, args.get("task", ""))
-        agent = _find_agent(args.get("agent", ""))
         if not task:
             titles = [r["title"] for r in query(
                 "SELECT title FROM tasks WHERE project_id = ? ORDER BY created_at DESC LIMIT 8", (project_id,))]
             return (f"Task matching **{args.get('task')}** not found. Current tasks: "
                     + ("; ".join(titles) if titles else "(none yet)") + ".")
+        agent = _find_agent(agent_ref)
+        if not agent and agent_ref.lower().strip(".!?;, ") in _GENERIC_AGENT_REFS:
+            agent = _pick_team_member(project_id, task)
         if not agent:
             names = [r["name"] for r in query("SELECT name FROM agents ORDER BY name LIMIT 8")]
-            return (f"Agent **{args.get('agent')}** not found. Available agents: "
-                    + ("; ".join(names) if names else "(none yet)") + ".")
+            return (f"Agent **{agent_ref}** not found. Available agents: "
+                    + ("; ".join(names) if names else "(none yet)")
+                    + ". You can also say \"a team member\" to auto-pick one by role.")
+        agent_role = query_one(
+            "SELECT r.name AS role_name FROM agents a JOIN roles r ON r.id = a.role_id WHERE a.id = ?",
+            (agent["id"],))
+        mismatch = ""
+        if agent_role and task["status"] not in ("Waiting QA",):
+            family = runtime._family_for_task(task)
+            agent_family = runtime._family_of_role(agent_role["role_name"] or "")
+            if family and agent_family and family != agent_family:
+                mismatch = (f" Note: **{agent['name']}** is a {agent_role['role_name']} and this looks like a "
+                            f"{runtime._FAMILY_LABEL.get(family, family)} task — QA will verify regardless.")
         update("tasks", task["id"], {"assigned_agent_id": agent["id"], "updated_at": ts})
         audit("assign_task", "task", task["id"], f"Assigned '{task['title']}' to {agent['name']}")
-        return f"Task **{task['title']}** assigned to **{agent['name']}**."
+        reply = f"Task **{task['title']}** assigned to **{agent['name']}**.{mismatch}"
+        if auto_start:
+            result = runtime.start_execution(project_id, task["id"])
+            if "error" in result:
+                reply += f" Could not start execution: {result['error']}"
+            else:
+                audit("start_task", "task", task["id"], f"Auto-started '{task['title']}' after assignment")
+                reply += " Execution started — watch the Team and Activity panels for live progress."
+        return reply
 
     if command == "start_task":
         task = _find_task(project_id, args.get("task", ""))
@@ -927,8 +1106,13 @@ def _execute_command(project_id, command, args) -> str:
         result = runtime.start_sprint_execution(project_id)
         if "error" in result:
             return f"Cannot start sprint execution: {result['error']}"
-        audit("start_sprint_execution", "project", project_id, "Sprint execution started via chatbot")
-        return f"Sprint execution started: the scheduler will run eligible tasks in dependency order ({result['sprint']})."
+        audit("start_sprint_execution", "project", project_id,
+              f"Sprint execution started autonomously ({result['sprint']})")
+        assigned = result.get("auto_assigned") or 0
+        note = f" Auto-assigned {assigned} unassigned task(s) to team members by role." if assigned else ""
+        return (f"Sprint **{result['sprint']}** started in autonomous mode — tasks are assigned "
+                f"and executed in dependency order without further input.{note} "
+                "I'll only surface for help if something gets blocked.")
 
     if command == "stop_sprint":
         runtime.stop_sprint_execution(project_id)
@@ -979,6 +1163,8 @@ INTENTS = [
     ("status", r"^\s*(status|summary|project status|how are we doing)\b"),
     ("confirm", r"^\s*(confirm|yes|approve|do it|go ahead)\b"),
     ("cancel_pending", r"^\s*(cancel that|discard|no thanks?|nevermind|never mind)\b"),
+    ("show_pending", r"^\s*(?:show|share|display|see)\s+(?:me\s+)?(?:the\s+)?(?:proposed|purposed|drafted|pending|current)?\s*(?:sprint\s+)?(?:plan|proposal|sprint(?:\s+plan)?)\s*$"),
+    ("show_pending", r"^\s*what(?:'s| is)?\s+(?:the\s+)?(?:proposed|purposed|drafted|pending)\s+(?:sprint|plan)\b"),
     ("create_gateway", r"create (?:a )?gateway\s+(?P<name>.+?)(?:\s+provider\s+(?P<provider>\S+))?(?:\s+(?:url|base[_ -]?url)\s+(?P<base_url>\S+))?(?:\s+(?:key|api[_ -]?key)\s+(?P<api_key>\S+))?\s*$"),
     ("test_gateway", r"test (?:the )?gateway\s+(?P<name>.+)\s*$"),
     ("create_role", r"create (?:a )?role\s+(?P<name>.+?)\s*$"),
@@ -989,12 +1175,15 @@ INTENTS = [
     ("build_team", r"build (?:a |the )?team\s+(?:called\s+|named\s+)?(?P<name>.+?)\s+(?:with|staffed with|using)\s+(?P<roles>.+?)\s*$"),
     ("build_team", r"build (?:a |the )?team\s+(?:for|to)\s+(?:this\s+)?project\s*$"),
     ("add_backlog_item", r"add (?:a )?backlog item\s+(?P<title>.+?)(?:\s+points?\s+(?P<points>\d+))?(?:\s+priority\s+(?P<priority>\d+))?\s*$"),
+    ("add_urgent_task", r"add (?:an? )?urgent task\s+(?P<title>.+?)(?:\s+points?\s+(?P<points>\d+))?\s*$"),
+    ("add_urgent_task", r"(?:urgent|asap)(?:ly)?(?:\s+task)?\s*[:\-]\s*(?P<title>.+?)\s*$"),
     ("add_task", r"add (?:a )?task\s+(?P<title>.+?)(?:\s+to\s+(?:the\s+)?(?:sprint\s+)?(?P<sprint>.+?))?(?:\s+points?\s+(?P<points>\d+))?(?:\s+priority\s+(?P<priority>\d+))?\s*$"),
     ("create_sprint", r"create (?:a )?sprint\s+(?P<name>.+?)\s*$"),
     ("hire_agent", r"hire (?:a |an |one )?(?:new )?(?P<role>.+?)(?:\s+named\s+(?P<name>.+?))?(?:\s+(?:to|into|for)\s+(?:the\s+)?(?:team\s+)?(?P<team>.+?))?\s*$"),
     ("add_agent_to_team", r"add (?:the )?agent\s+(?P<agent>.+?)(?:\s+(?:to|into)\s+(?:the\s+)?(?:team\s+)?(?P<team>.+?))?\s*$"),
     ("add_agent_from_other_team", r"(?:move|transfer)\s+(?:the )?agent\s+(?P<agent>.+?)(?:\s+from\s+(?:the\s+)?(?:team\s+)?(?P<from_team>.+?))?(?:\s+(?:to|into)\s+(?:the\s+)?(?:team\s+)?(?P<team>.+?))?\s*$"),
     ("remove_agent", r"remove (?:the )?agent\s+(?P<agent>.+?)(?:\s+from\s+(?:the\s+)?(?:team\s+)?(?P<team>.+?))?\s*$"),
+    ("install_toolchain", r"install\s+(?:the\s+)?(?P<stack>dotnet|\.net|net|go|golang|node(?:\.?js)?|npm|python|wpf)(?:\s+(?:toolchain|sdk|runtime|framework|environment))?\s*$"),
     ("align_team", r"align(?:ed)?\s+(?:it|that team|the new team|the team)?\s*(?:to|in|with)?\s*(?:this\s+)?project\s*$"),
     ("align_team", r"(?:align|link|attach|assign)\s+(?:the\s+)?team\s+(?P<team>.+?)\s+(?:to|with)\s+(?:this\s+)?project\s*$"),
     ("assign_task", r"assign(?: task)?\s+(?P<task>.+?)\s+to\s+(?P<agent>.+?)\s*$"),
@@ -1009,6 +1198,92 @@ INTENTS = [
 
 SENSITIVE = {"create_gateway", "create_agent", "create_team", "build_team",
              "hire_agent", "add_agent_from_other_team"}
+
+# Commands that are never executed directly: a full plan is shown for approval
+# and only `confirm` creates anything.
+PROPOSAL_COMMANDS = {"create_sprint", "add_urgent_task", "install_toolchain"}
+
+
+_STACK_ALIASES = {
+    "dotnet": "dotnet", ".net": "dotnet", "net": "dotnet", "wpf": "dotnet",
+    "go": "go", "golang": "go",
+    "node": "node", "nodejs": "node", "node.js": "node", "npm": "node",
+    "python": "python",
+}
+
+
+def _normalize_stack(raw) -> str:
+    return _STACK_ALIASES.get(str(raw or "").strip().lower(), "")
+
+
+def _sprint_plan_name(args) -> str:
+    return str(args.get("name") or args.get("title") or args.get("sprint") or "").strip()
+
+
+def _sprint_proposal_text(args) -> str:
+    name = _sprint_plan_name(args) or "(unnamed)"
+    lines = [f"- **Name**: {name}"]
+    if str(args.get("goal") or "").strip():
+        lines.append(f"- **Goal**: {args['goal']}")
+    if args.get("capacity") not in (None, ""):
+        lines.append(f"- **Capacity**: {max(0, _coerce_int(args.get('capacity'), 40))} pts")
+    tasks = args.get("tasks") if isinstance(args.get("tasks"), list) else []
+    if tasks:
+        lines.append("- **Tasks**:")
+        idx = 0
+        for t in tasks:
+            t_title = str(t.get("title") or t.get("task") or "").strip() if isinstance(t, dict) else str(t).strip()
+            if not t_title:
+                continue
+            idx += 1
+            pts = _coerce_int(t.get("points"), 3) if isinstance(t, dict) else 3
+            pri = _coerce_int(t.get("priority"), 2) if isinstance(t, dict) else 2
+            desc = str(t.get("description") or "").strip() if isinstance(t, dict) else ""
+            line = f"  {idx}. **{t_title}** — {pts} pts, priority {pri}"
+            if desc:
+                line += f" — {desc[:120]}"
+            lines.append(line)
+        if idx:
+            lines.append(f"  Total: {sum(_coerce_int(t.get('points'), 3) for t in tasks if isinstance(t, dict))} pts across {idx} task(s)")
+    return "\n".join(lines)
+
+
+def _urgent_proposal_text(args) -> str:
+    lines = [f"- **Title**: {str(args.get('title') or '(untitled)').strip()}",
+             "- **Priority**: 1 (urgent) — jumps to the front of the sprint",
+             "- **Sprint**: the current active sprint",
+             "- **Assignment**: directly to an idle developer on the aligned team"]
+    if str(args.get("description") or "").strip():
+        lines.append(f"- **Description**: {args['description']}")
+    if str(args.get("acceptance_criteria") or "").strip():
+        lines.append(f"- **Acceptance criteria**: {args['acceptance_criteria']}")
+    if args.get("points") not in (None, ""):
+        lines.append(f"- **Points**: {max(0, _coerce_int(args.get('points'), 3))}")
+    return "\n".join(lines)
+
+
+def _install_proposal_text(args) -> str:
+    stack = _normalize_stack(args.get("stack"))
+    tc = toolchains.STACKS.get(stack)
+    if not tc:
+        return f"- **Unknown toolchain**: `{stack}` — supported: dotnet, go, node, python"
+    lines = [f"- **Toolchain**: {tc['label']} (`{stack}`)",
+             f"- **Action**: run `{tc['install']}` on this machine",
+             "- **Requires**: admin rights and network; the install can take several minutes"]
+    if not str(tc.get("install") or "").strip():
+        return f"- **Toolchain**: {tc['label']} — always available with the backend, nothing to install"
+    lines.append("- Until it is installed, build/QA keeps reporting **toolchain unavailable** for that stack (never a fake pass).")
+    return "\n".join(lines)
+
+
+def _proposal_text(command: str, args) -> str:
+    if command == "create_sprint":
+        return _sprint_proposal_text(args)
+    if command == "add_urgent_task":
+        return _urgent_proposal_text(args)
+    if command == "install_toolchain":
+        return _install_proposal_text(args)
+    return "\n".join(f"- **{k}**: {v}" for k, v in (args or {}).items() if k != "api_key")
 
 # Static quick replies for the deterministic (typed) command path.
 SUGGESTIONS = {
@@ -1025,6 +1300,7 @@ SUGGESTIONS = {
     "remove_agent": ["Hire an agent", "Build a team", "Status"],
     "add_backlog_item": ["Create a sprint for these items", "Assign task to an agent", "Status"],
     "add_task": ["Create a sprint", "Assign task to an agent", "Start sprint execution"],
+    "add_urgent_task": ["Start sprint execution", "Status"],
     "create_sprint": ["Add backlog item", "Start sprint execution", "Status"],
     "align_team": ["Status", "Assign task to an agent", "Start sprint execution"],
     "assign_task": ["Start task", "Start sprint execution", "Agent status"],
@@ -1037,6 +1313,7 @@ SUGGESTIONS = {
     "retry_failed": ["Status", "Pause execution", "What are the agents doing?"],
     "create_gateway": ["Test gateway", "Status", "Help"],
     "test_gateway": ["Create agent", "Status", "Help"],
+    "install_toolchain": ["Status", "Help"],
 }
 
 
@@ -1148,8 +1425,9 @@ Available commands (name: args):
 - add_agent_from_other_team: {agent, team?, from_team?} — moves an IDLE agent from their other team into this team; they leave the old team
 - remove_agent: {agent, team?} — removes an agent from a team (default: the project's aligned team)
 - add_backlog_item: {title, points?, priority?} — for the product backlog
-- add_task: {title, sprint?, points?, priority?} — creates a task IN a sprint; use this (not add_backlog_item) when the user wants items added to a sprint
-- create_sprint: {name, goal?, capacity?}
+- add_task: {title, sprint?, points?, priority?} — creates ONE task IN a sprint; use this (not add_backlog_item) when the user wants a single item added to a sprint
+- add_urgent_task: {title, description?, acceptance_criteria?, points?} — for urgent/ASAP/production-fix requests. Draft a concrete plan (title, short description, acceptance criteria, small point estimate); after user approval it is created with priority 1 in the CURRENT active sprint and assigned directly to an idle developer, running next without further input.
+- create_sprint: {name, goal?, capacity?, tasks?: [{"title", "description?", "points?", "priority?"}]} — when the user asks to create a sprint, ALWAYS draft a complete end-to-end plan: infer a sprint name, goal and capacity, and 3-6 concrete tasks from the project goal and backlog (points 1-8, priority 1-3). Nothing is created until the user approves the plan; add_task is only for a single task, not sprint planning.
 - align_team: {team?} — aligns a team to the CURRENT project; team name optional (defaults to the newest team not aligned to any project). Use when the user says things like "align it in this project" after building a team.
 - assign_task: {task, agent}
 - start_task: {task}
@@ -1159,15 +1437,20 @@ Available commands (name: args):
 - resume_execution: {}
 - cancel_execution: {}
 - retry_failed: {}
+- install_toolchain: {stack: "dotnet"|"go"|"node"|"python"} — when a task or QA report says a build toolchain is unavailable, offer to install it (e.g. `dotnet` for WPF/.NET, `go`, `node`/npm). A plan is proposed and the user must confirm before anything runs on the machine.
 
 Rules:
 - Pick a command only when the user clearly wants that action; otherwise set command to null and just answer.
 - ALIGNMENT IS FACT: each agent line in the context states which project(s) it is aligned to via its team, or "uncommitted (free)". Never claim an aligned agent is free; never assign an agent aligned to a DIFFERENT project. Teams also show their aligned project and full member roster.
 - When the user asks to build/staff a team (for this or any project), use build_team with the needed role names. build_team automatically reuses only uncommitted agents and hires new agents for roles with nobody free. Only use create_team if the user explicitly names agents AND every named agent is uncommitted (free) or aligned to the CURRENT project.
 - ONE AGENT SERVES ONE PROJECT: an agent aligned (via its team) to a project must never be added to another project's team. To staff another project: use build_team or hire_agent (new agent), reuse only free agents, or add_agent_from_other_team to transfer an IDLE agent (they leave their old team). Never add every known agent to a team — staff exactly the roles requested.
-- Reference tasks by the closest title in the context (partial titles are fine, e.g. "user authentication" for "User authentication API").
-- Reference agents by exact name, or by role when the user means "any/one <role>" (e.g. agent "a senior developer" if a developer role exists); the resolver picks the best idle agent for that role.
+- Reference tasks by the closest title in the context (partial titles are fine, e.g. "user authentication" for "User authentication API"). Resolve relative references to the concrete title: "the first task" -> the first task listed in the context, "the last/newest task" -> the most recent, "the next task" -> the first not-yet-done task.
+- Reference agents by exact name, or by role when the user means "any/one <role>" (e.g. agent "a senior developer" if a developer role exists); the resolver picks the best idle agent for that role. If the user says "a team member"/"the agent"/"anyone" without naming anyone, pick a specific IDLE member of the project's aligned team and pass their exact name.
+- "assign X to Y and start execution" -> use assign_task; the resolver handles starting the run.
 - If the user asks about status or progress, set command to null and summarize from the context.
+- Your reply is sent BEFORE the command runs; the real execution result is appended after it. Never claim an action already succeeded and never pre-announce outcomes (e.g. don't say "is now running" or "has been created") — describe what you are going to do.
+- start_sprint is fully autonomous: it auto-activates a planned sprint and auto-assigns tasks to team members by role. Never offer to assign tasks manually after starting; the run only surfaces for real blockers.
+- Workflow: tasks are matched to the agent's role family (dev/architecture/QA/BA/DevOps/design) — a development task never auto-assigns to QA or BA when a developer exists. After a developer finishes, the task moves to "Waiting QA" and a QA-role agent verifies it; QA pass -> Done, QA rejection -> "Rework" back to the developer with a defect summary; two rejections escalate to the user.
 - reply: short, friendly, concrete. suggestions: exactly 3 short follow-up messages the user might send next.
 
 Respond with ONLY a JSON object, no markdown fences:
@@ -1182,14 +1465,64 @@ def _extract_json(text: str):
     if t.startswith("```"):
         t = re.sub(r"^```(?:json)?\s*", "", t)
         t = re.sub(r"\s*```$", "", t)
-    start, end = t.find("{"), t.rfind("}")
-    if start == -1 or end <= start:
+    start = t.find("{")
+    if start == -1:
         return None
-    try:
-        data = json.loads(t[start:end + 1])
-    except ValueError:
+    end = t.rfind("}")
+    chunk = t[start:end + 1] if end > start else t[start:]  # no closing brace yet = truncated
+    candidates = [chunk]
+    pos = len(chunk)
+    for _ in range(16):
+        pos = max(chunk.rfind(c, 0, pos) for c in ('"', ",", "{", "[", "}", "]"))
+        if pos <= 1:
+            break
+        candidates.append(chunk[:pos + 1])
+        pos -= 1
+    for candidate in candidates:
+        for fixed in (candidate, _repair_json(candidate)):
+            if not fixed:
+                continue
+            try:
+                data = json.loads(fixed)
+            except ValueError:
+                continue
+            return data if isinstance(data, dict) else None
+    return None
+
+
+def _repair_json(chunk: str) -> str | None:
+    """Salvage truncated JSON (e.g. hit max_tokens) by closing open strings
+    and containers. Returns None when the chunk cannot be repaired."""
+    stack = []
+    in_str = False
+    esc = False
+    for ch in chunk:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+    if in_str:
+        chunk = chunk.rstrip()
+        while chunk.endswith("\\"):
+            chunk = chunk[:-1]
+        chunk += '"'
+    chunk = chunk.rstrip()
+    while chunk.endswith((",", ":")):
+        chunk = chunk[:-1].rstrip()
+    if not stack:
         return None
-    return data if isinstance(data, dict) else None
+    return chunk + "".join("}" if c == "{" else "]" for c in reversed(stack))
 
 
 def _call_llm(gw, model, system_prompt: str, user_text: str, max_tokens: int = 700) -> str:
@@ -1243,21 +1576,21 @@ def _ai_route(project_id: str, conversation_id: str, text: str) -> dict:
     last_exc = None
     for attempt in range(2):
         try:
-            raw = _call_llm(gw, model, AI_SYSTEM_PROMPT + _context_brief(project_id), text)
+            raw = _call_llm(gw, model, AI_SYSTEM_PROMPT + _context_brief(project_id), text, max_tokens=1500)
             parsed = _extract_json(raw)
-            if parsed and "reply" in parsed:
+            if parsed and ("reply" in parsed or parsed.get("command")):
                 last_exc = None
                 break
             raise RuntimeError("The model did not return a valid response.")
         except (RuntimeError, ValueError, KeyError, TypeError) as exc:
             last_exc = exc
-    if parsed is None or "reply" not in parsed:
+    if parsed is None or not (parsed.get("reply") or parsed.get("command")):
         reply = (f"AI routing failed — falling back to typed commands. ({last_exc})\n\n"
                  "Try `help` for the command catalog.")
         _save_message(conversation_id, "assistant", reply)
         return {"reply": reply, "suggestions": ["Status", "Help"]}
 
-    reply = parsed["reply"].strip()
+    reply = str(parsed.get("reply") or "").strip()
     suggestions = [str(s) for s in (parsed.get("suggestions") or [])][:3]
     command = parsed.get("command") or None
     result = {"reply": reply, "suggestions": suggestions or ["Status", "Help"]}
@@ -1275,11 +1608,42 @@ def _ai_route(project_id: str, conversation_id: str, text: str) -> dict:
             args.setdefault("roles", [])
             if isinstance(args["roles"], str):
                 args["roles"] = [a.strip() for a in re.split(r",| and ", args["roles"]) if a.strip()]
-        if name in SENSITIVE:
+        if name in ("create_sprint",):
+            if not _sprint_plan_name(args):
+                for alias in ("title", "sprint"):
+                    if str(args.get(alias) or "").strip():
+                        args["name"] = args[alias]
+                        break
+            if isinstance(args.get("tasks"), str):
+                args["tasks"] = [{"title": t.strip()} for t in re.split(r",| and ", args["tasks"]) if t.strip()]
+        if name in ("add_urgent_task",):
+            if not str(args.get("title") or "").strip():
+                for alias in ("task", "name", "description"):
+                    if str(args.get(alias) or "").strip():
+                        args["title"] = args[alias]
+                        break
+        if name in SENSITIVE or name in PROPOSAL_COMMANDS:
             pid = _queue_pending(conversation_id, name, args, name)
-            reply = (f"{reply}\n\n**Confirmation required** to run `{name}` with:\n"
-                     + "\n".join(f"- **{k}**: {v}" for k, v in args.items() if k != "api_key")
-                     + "\n\nReply `confirm` to execute or `cancel that` to discard.")
+            if name in PROPOSAL_COMMANDS:
+                labels = {"create_sprint": "Sprint plan for your approval",
+                          "add_urgent_task": "Urgent task plan for your approval",
+                          "install_toolchain": "Toolchain install for your approval"}
+                hints = {
+                    "create_sprint": "Reply `confirm` to create the sprint and its tasks, "
+                                     "or `cancel that` to discard.",
+                    "add_urgent_task": "Reply `confirm` to add it to the current sprint and assign an idle developer, "
+                                       "or `cancel that` to discard.",
+                    "install_toolchain": "Reply `confirm` to run the install on this machine, "
+                                         "or `cancel that` to skip it.",
+                }
+                label = labels.get(name, "Plan for your approval")
+                confirm_hint = hints.get(name, "Reply `confirm` to execute or `cancel that` to discard.")
+                reply = (f"{reply}\n\n**{label}** (`{name}`):\n"
+                         + _proposal_text(name, args) + "\n\n" + confirm_hint)
+            else:
+                reply = (f"{reply}\n\n**Confirmation required** to run `{name}` with:\n"
+                         + "\n".join(f"- **{k}**: {v}" for k, v in args.items() if k != "api_key")
+                         + "\n\nReply `confirm` to execute or `cancel that` to discard.")
             result.update({"reply": reply, "needs_confirmation": True,
                            "pending_command": pid, "proposal": args})
             _save_message(conversation_id, "assistant", reply, meta=json.dumps({"pending_command": pid}))
@@ -1309,7 +1673,9 @@ def handle_message(project_id: str, conversation_id: str, text: str) -> dict:
     lowered = text.lower()
     intent, match = None, None
     for name, pattern in INTENTS:
-        m = re.match(pattern, lowered, re.IGNORECASE)
+        # Match against the ORIGINAL text (case-insensitively) so captured
+        # titles keep their casing instead of being lowercased.
+        m = re.match(pattern, text, re.IGNORECASE)
         if m:
             intent, match = name, m
             break
@@ -1341,6 +1707,35 @@ def handle_message(project_id: str, conversation_id: str, text: str) -> dict:
         _save_message(conversation_id, "assistant", reply)
         return {"reply": reply, "suggestions": ["Status", "Help"]}
 
+    if intent == "show_pending":
+        pending = query_one(
+            "SELECT * FROM pending_commands WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 1",
+            (conversation_id,))
+        if not pending:
+            reply = ("There is no pending plan right now. Say e.g. \"create a sprint for this project\" "
+                     "and I'll draft one for your approval.")
+            _save_message(conversation_id, "assistant", reply)
+            return {"reply": reply, "suggestions": ["Create a sprint", "Status"]}
+        args = json.loads(pending["args_json"])
+        if pending["command"] == "create_sprint":
+            reply = ("**Sprint plan for your approval**:\n" + _proposal_text(pending["command"], args)
+                     + "\n\nReply `confirm` to create the sprint and its tasks, or `cancel that` to discard.")
+            _save_message(conversation_id, "assistant", reply, meta=json.dumps({"pending_command": pending["id"]}))
+            return {"reply": reply, "needs_confirmation": True, "pending_command": pending["id"],
+                    "proposal": args, "suggestions": ["confirm", "cancel that"]}
+        if pending["command"] in PROPOSAL_COMMANDS:
+            reply = ("**Urgent task plan for your approval**:\n" + _proposal_text(pending["command"], args)
+                     + "\n\nReply `confirm` to add it to the current sprint and assign an idle developer, "
+                       "or `cancel that` to discard.")
+            _save_message(conversation_id, "assistant", reply, meta=json.dumps({"pending_command": pending["id"]}))
+            return {"reply": reply, "needs_confirmation": True, "pending_command": pending["id"],
+                    "proposal": args, "suggestions": ["confirm", "cancel that"]}
+        reply = (f"Pending command `{pending['command']}` is awaiting confirmation. "
+                 "Reply `confirm` to execute or `cancel that` to discard.")
+        _save_message(conversation_id, "assistant", reply)
+        return {"reply": reply, "needs_confirmation": True, "pending_command": pending["id"],
+                "suggestions": ["confirm", "cancel that"]}
+
     if not intent and _bot_config()[0]:
         return _ai_route(project_id, conversation_id, text)
 
@@ -1364,15 +1759,33 @@ def handle_message(project_id: str, conversation_id: str, text: str) -> dict:
         args["points"] = int(args["points"])
     if intent == "add_backlog_item" and "priority" in args:
         args["priority"] = int(args["priority"])
+    if intent == "add_urgent_task" and "points" in args:
+        args["points"] = int(args["points"])
     # The raw key is kept in args so it can be stored encrypted on execution;
     # it is never echoed back into the chat.
 
-    if intent in SENSITIVE:
+    if intent in SENSITIVE or intent in PROPOSAL_COMMANDS:
         pid = _queue_pending(conversation_id, intent, args, intent)
-        reply = (f"**Confirmation required.** You asked to run `{intent}` with:\n"
-                 + "\n".join(f"- **{k}**: {v}" for k, v in args.items() if k != "api_key")
-                 + "\n\nThis is a sensitive mutation (credentials or team/cost profile). "
-                   "Reply `confirm` to execute or `cancel that` to discard.")
+        if intent in PROPOSAL_COMMANDS:
+            labels = {"create_sprint": "Sprint plan for your approval",
+                      "add_urgent_task": "Urgent task plan for your approval",
+                      "install_toolchain": "Toolchain install for your approval"}
+            hints = {
+                "create_sprint": "Reply `confirm` to create the sprint and its tasks, "
+                                 "or `cancel that` to discard.",
+                "add_urgent_task": "Reply `confirm` to add it to the current sprint and assign an idle developer, "
+                                   "or `cancel that` to discard.",
+                "install_toolchain": "Reply `confirm` to run the install on this machine, "
+                                     "or `cancel that` to skip it.",
+            }
+            label = labels.get(intent, "Plan for your approval")
+            confirm_hint = hints.get(intent, "Reply `confirm` to execute or `cancel that` to discard.")
+            reply = (f"**{label}**:\n" + _proposal_text(intent, args) + "\n\n" + confirm_hint)
+        else:
+            reply = (f"**Confirmation required.** You asked to run `{intent}` with:\n"
+                     + "\n".join(f"- **{k}**: {v}" for k, v in args.items() if k != "api_key")
+                     + "\n\nThis is a sensitive mutation (credentials or team/cost profile). "
+                       "Reply `confirm` to execute or `cancel that` to discard.")
         _save_message(conversation_id, "assistant", reply, meta=json.dumps({"pending_command": pid}))
         return {"reply": reply, "needs_confirmation": True, "pending_command": pid, "proposal": args,
                 "suggestions": ["confirm", "cancel that"]}

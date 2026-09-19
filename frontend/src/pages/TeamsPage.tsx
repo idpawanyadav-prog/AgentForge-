@@ -136,8 +136,15 @@ function AgentForm({ agent, teams = [], onClose, onSaved }: {
     }
     try {
       const payload = { name: f.name, role_id: f.role_id, persona_id: personaId, model_binding_id: bindingId };
-      if (agent) await patch(`/api/v1/agents/${agent.id}`, { ...payload, lifecycle_state: f.lifecycle_state });
-      else await post('/api/v1/agents', payload);
+      // Only send lifecycle_state when the operator actually changed it in the
+      // form — otherwise a stale snapshot would overwrite runtime state.
+      if (agent && f.lifecycle_state !== agent.lifecycle_state) {
+        await patch(`/api/v1/agents/${agent.id}`, { ...payload, lifecycle_state: f.lifecycle_state });
+      } else if (agent) {
+        await patch(`/api/v1/agents/${agent.id}`, payload);
+      } else {
+        await post('/api/v1/agents', payload);
+      }
       onSaved();
     } catch (e: any) { alert(e.message); }
   };

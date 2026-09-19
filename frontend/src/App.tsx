@@ -1,5 +1,5 @@
 import React from 'react';
-import { get, patch } from './api';
+import { get, put } from './api';
 import ControlPage from './pages/ControlPage';
 import ProjectsPage from './pages/ProjectsPage';
 import TeamsPage from './pages/TeamsPage';
@@ -7,6 +7,13 @@ import MemoryPage from './pages/MemoryPage';
 import SettingsPage from './pages/SettingsPage';
 
 type Page = 'control' | 'projects' | 'teams' | 'memory' | 'settings';
+
+const loadUi = (key: string, fallback: string) => {
+  try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
+};
+const saveUi = (key: string, value: string) => {
+  try { localStorage.setItem(key, value); } catch { /* private mode */ }
+};
 
 const NAV: { id: Page; icon: string; label: string }[] = [
   { id: 'control', icon: '◉', label: 'Project Control' },
@@ -17,13 +24,23 @@ const NAV: { id: Page; icon: string; label: string }[] = [
 ];
 
 export default function App() {
-  const [page, setPage] = React.useState<Page>('control');
-  const [theme, setTheme] = React.useState<'dark' | 'bright'>('dark');
-  const [activeProject, setActiveProject] = React.useState<string | null>(null);
+  const [page, setPage] = React.useState<Page>(() => {
+    const saved = loadUi('ao.page', 'control');
+    return (NAV.some((n) => n.id === saved) ? saved : 'control') as Page;
+  });
+  const [theme, setTheme] = React.useState<'dark' | 'bright'>(() => {
+    const saved = loadUi('ao.theme', 'dark');
+    return saved === 'bright' ? 'bright' : 'dark';
+  });
+  const [activeProject, setActiveProject] = React.useState<string | null>(() => loadUi('ao.project', '') || null);
 
   React.useEffect(() => {
     get('/api/v1/settings')
-      .then((s) => setTheme(s.theme === 'bright' ? 'bright' : 'dark'))
+      .then((s) => {
+        const t = s.theme === 'bright' ? 'bright' : 'dark';
+        setTheme(t);
+        saveUi('ao.theme', t);
+      })
       .catch(() => undefined);
     get('/api/v1/projects')
       .then((ps: any[]) => {
@@ -36,10 +53,14 @@ export default function App() {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
 
+  React.useEffect(() => { saveUi('ao.page', page); }, [page]);
+  React.useEffect(() => { if (activeProject) saveUi('ao.project', activeProject); }, [activeProject]);
+
   const toggleTheme = () => {
     const next = theme === 'dark' ? 'bright' : 'dark';
     setTheme(next);
-    patch('/api/v1/settings', { key: 'theme', value: next }).catch(() => undefined);
+    saveUi('ao.theme', next);
+    put('/api/v1/settings', { key: 'theme', value: next }).catch(() => undefined);
   };
 
   return (

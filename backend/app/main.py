@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import chatbot, db, runtime
+from . import chatbot, db, runtime, workspace
 from .db import audit, execute, insert, new_id, now, query, query_one, update
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "static")
@@ -697,11 +697,15 @@ def update_agent(aid: str, body: dict):
     allowed = {k: v for k, v in body.items() if k in ("name", "role_id", "persona_id", "model_binding_id")}
     if "lifecycle_state" in body:
         state = body["lifecycle_state"]
-        if state not in ("Idle", "Working", "Waiting", "Blocked", "Paused", "Completed", "Failed"):
-            raise HTTPException(422, f"Invalid lifecycle state: {state}")
+        # Runtime states (Working/Waiting/Completed) are owned by the execution
+        # runtime; operators may only unstick to Idle or explicitly pause.
+        if state not in ("Idle", "Paused"):
+            raise HTTPException(422, "Only 'Idle' (unstick) or 'Paused' can be set manually; "
+                                     "other states are managed by the execution runtime")
         allowed["lifecycle_state"] = state
         if state == "Idle":
             allowed["current_activity"] = ""
+            allowed["current_task_id"] = None
     allowed["updated_at"] = now()
     update("agents", aid, allowed)
     audit("update_agent", "agent", aid, f"Updated agent fields: {', '.join(allowed)}")
@@ -784,8 +788,16 @@ def create_project(body: ProjectIn):
                         "repository_url": body.repository_url, "workspace_path": body.workspace_path,
                         "default_gateway_id": body.default_gateway_id, "team_id": body.team_id,
                         "status": "Active", "created_at": ts, "updated_at": ts})
-    audit("create_project", "project", pid, f"Created project '{body.name}'")
-    return query_one("SELECT * FROM projects WHERE id = ?", (pid,))
+    project = query_one("SELECT * FROM projects WHERE id = ?", (pid,))
+    ws = workspace.prepare_workspace(project)
+    emit = db.emit_event(pid, "project.workspace_ready", {
+        "workspace_path": ws["workspace_path"], "cloned": ws["cloned"],
+        "git_init": ws["git_init"], "note": ws["note"],
+        "source": "git-clone" if ws["cloned"] else "local-projects-folder",
+    })
+    audit("create_project", "project", pid,
+          f"Created project '{body.name}' with workspace at {ws['workspace_path']}")
+    return {**project, "workspace_path": ws["workspace_path"], "_seq": emit}
 
 
 @app.get("/api/v1/projects/{pid}")
@@ -867,6 +879,9 @@ def list_sprints(pid: str):
 
 @app.post("/api/v1/projects/{pid}/sprints")
 def create_sprint(pid: str, body: SprintIn):
+    dup = query_one("SELECT id FROM sprints WHERE project_id=? AND lower(name)=lower(?)", (pid, body.name))
+    if dup:
+        raise HTTPException(409, f"A sprint named '{body.name}' already exists in this project")
     sid = new_id()
     insert("sprints", {"id": sid, "project_id": pid, "name": body.name, "goal": body.goal,
                        "capacity": body.capacity, "start_at": body.start_at, "end_at": body.end_at,
@@ -901,10 +916,12 @@ def delete_sprint(sid: str):
 TASK_TRANSITIONS = {
     "Todo": {"Ready", "Cancelled"},
     "Ready": {"In Progress", "Todo", "Cancelled"},
-    "In Progress": {"Blocked", "Review", "Testing", "Cancelled"},
-    "Blocked": {"Ready", "Todo", "Cancelled"},
-    "Review": {"Testing", "In Progress", "Done", "Cancelled"},
-    "Testing": {"Done", "In Progress", "Review", "Cancelled"},
+    "In Progress": {"Blocked", "Review", "Testing", "Waiting QA", "Cancelled"},
+    "Blocked": {"Ready", "Todo", "Rework", "Cancelled"},
+    "Review": {"Testing", "In Progress", "Done", "Waiting QA", "Cancelled"},
+    "Testing": {"Done", "In Progress", "Review", "Waiting QA", "Rework", "Cancelled"},
+    "Waiting QA": {"Testing", "Done", "Rework", "Cancelled"},
+    "Rework": {"In Progress", "Ready", "Todo", "Blocked", "Cancelled"},
     "Done": set(),
     "Cancelled": {"Todo"},
 }

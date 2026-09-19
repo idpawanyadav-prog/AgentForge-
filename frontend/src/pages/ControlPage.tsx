@@ -32,6 +32,13 @@ const TASK_ICON: Record<string, string> = {
 };
 const taskIcon = (s: string) => TASK_ICON[s] ?? '⏳';
 
+const loadUi = (key: string, fallback: string) => {
+  try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
+};
+const saveUi = (key: string, value: string) => {
+  try { localStorage.setItem(key, value); } catch { /* private mode */ }
+};
+
 function eventText(e: EventRow): string {
   const p = e.payload || {};
   switch (e.event_type) {
@@ -68,8 +75,13 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
   const [sprints, setSprints] = React.useState<any[]>([]);
   const [selectedSprint, setSelectedSprint] = React.useState<string>('');
   const [sprintTasks, setSprintTasks] = React.useState<TaskRow[]>([]);
-  const [tab, setTab] = React.useState<'team' | 'activity' | 'tasks'>('team');
-  const [paneOpen, setPaneOpen] = React.useState(true);
+  const [tab, setTab] = React.useState<'team' | 'activity' | 'tasks'>(() => {
+    const saved = loadUi('ao.tab', 'team');
+    return saved === 'activity' || saved === 'tasks' ? saved : 'team';
+  });
+  const [paneOpen, setPaneOpen] = React.useState<boolean>(() => loadUi('ao.pane', 'open') !== 'closed');
+  React.useEffect(() => { saveUi('ao.tab', tab); }, [tab]);
+  React.useEffect(() => { saveUi('ao.pane', paneOpen ? 'open' : 'closed'); }, [paneOpen]);
   const [expanded, setExpanded] = React.useState<Record<string, boolean>>({});
   const [error, setError] = React.useState<string | null>(null);
   const msgEndRef = React.useRef<HTMLDivElement>(null);
@@ -84,11 +96,18 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
     get(`/api/v1/projects/${activeProject}/conversations`)
       .then((cs: Conv[]) => {
         setConvos(cs);
-        if (cs.length && !cs.find((c) => c.id === activeConv)) setActiveConv(cs[0].id);
+        if (cs.length && !cs.find((c) => c.id === activeConv)) {
+          // Restore the last chat window of this project across sessions.
+          setActiveConv(loadUi(`ao.conv.${activeProject}`, '') || cs[0].id);
+        }
       })
       .catch(() => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProject]);
+
+  React.useEffect(() => {
+    if (activeConv && activeProject) saveUi(`ao.conv.${activeProject}`, activeConv);
+  }, [activeConv, activeProject]);
 
   const loadMessages = React.useCallback((cid: string) => {
     get(`/api/v1/conversations/${cid}/messages`).then(setMessages).catch(() => undefined);
@@ -136,18 +155,24 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
     return () => { alive = false; clearInterval(timer); };
   }, [activeProject]);
 
-  // Sprints list + default selection (active sprint first)
+  // Sprints list + default selection (last session's sprint, else active sprint)
   React.useEffect(() => {
     if (!activeProject) return;
     get(`/api/v1/projects/${activeProject}/sprints`).then((list: any[]) => {
       setSprints(list);
       setSelectedSprint((cur) => {
         if (cur && list.some((x) => x.id === cur)) return cur;
+        const saved = loadUi(`ao.sprint.${activeProject}`, '');
+        if (saved && list.some((x) => x.id === saved)) return saved;
         const active = list.find((x) => x.status === 'Active');
         return (active ?? list[0])?.id ?? '';
       });
     }).catch(() => undefined);
   }, [activeProject]);
+
+  React.useEffect(() => {
+    if (selectedSprint && activeProject) saveUi(`ao.sprint.${activeProject}`, selectedSprint);
+  }, [selectedSprint, activeProject]);
 
   // Tasks of the selected sprint, refreshed on the same live cadence
   React.useEffect(() => {
