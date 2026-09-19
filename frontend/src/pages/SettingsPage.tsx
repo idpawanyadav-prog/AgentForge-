@@ -24,7 +24,7 @@ export default function SettingsPage() {
 
       <div className="section-title">Gateways</div>
       {(gateways ?? []).map((g) => (
-        <GatewayCard key={g.id} gw={g} reload={reload} onError={fail} />
+        <GatewayCard key={g.id} gw={g} reload={reload} onError={fail} onEdit={() => setModal('editGw-' + g.id)} />
       ))}
       {!gateways?.length && <div className="empty">No gateways configured.</div>}
 
@@ -94,7 +94,7 @@ function ModelPlayground({ gateways, onError }: { gateways: any[]; onError: (e: 
       <div className="spread">
         <div>
           <h3 style={{ margin: 0 }}>🧪 Model Playground</h3>
-          <div className="muted small">Send a test message through any gateway model to verify connectivity and metering.</div>
+          <div className="muted small">Live test: messages are sent through the gateway to the selected model. Requires an API key stored on the gateway (Edit → paste key).</div>
         </div>
         <div className="row">
           <select style={{ width: 190 }} value={gid} onChange={(e) => setGid(e.target.value)}>
@@ -128,19 +128,21 @@ function ModelPlayground({ gateways, onError }: { gateways: any[]; onError: (e: 
   );
 }
 
-function GatewayCard({ gw, reload, onError }: { gw: any; reload: () => void; onError: (e: any) => void }) {
+function GatewayCard({ gw, reload, onError, onEdit }: { gw: any; reload: () => void; onError: (e: any) => void; onEdit: () => void }) {
   const { data: models, reload: reloadModels } = useAsyncData<any[]>(() => get(`/api/v1/gateways/${gw.id}/models`), [gw.id]);
   const [newModel, setNewModel] = React.useState('');
+  const hasKey = !!gw.key_mask;
   return (
     <div className="card">
       <div className="spread">
         <div>
           <h3 style={{ margin: 0 }}>{gw.name} <Badge kind={gw.status === 'Active' ? 'ok' : 'dim'}>{gw.status}</Badge></h3>
-          <div className="kv mono" style={{ marginTop: 4 }}>{gw.provider} · {gw.base_url}</div>
-          <div className="kv">API key: <span className="mono">{gw.key_mask ?? 'not set'}</span> · last test: {gw.test_status ?? 'never'} {gw.last_tested_at ? `at ${fmtDateTime(gw.last_tested_at)}` : ''}</div>
+          <div className="kv mono" style={{ marginTop: 4 }}>{gw.provider} · {gw.base_url} · {gw.api_type}</div>
+          <div className="kv">API key: <span className="mono">{gw.key_mask ?? 'not set'}</span> {hasKey ? '(stored encrypted)' : ''} · last test: {gw.test_status ?? 'never'} {gw.last_tested_at ? `at ${fmtDateTime(gw.last_tested_at)}` : ''}</div>
           {gw.test_diagnostic && <div className="kv">{gw.test_diagnostic}</div>}
         </div>
         <div className="btn-row">
+          <button className="btn small" onClick={onEdit}>Edit</button>
           <button className="btn small" onClick={async () => {
             try { await post(`/api/v1/gateways/${gw.id}/test`); reload(); reloadModels(); } catch (e: any) { onError(e); }
           }}>Test connection</button>
@@ -199,8 +201,14 @@ function GatewayForm({ gateway, onClose, onSaved }: { gateway?: any; onClose: ()
           </select>
         </Field>
       </div>
+      <Field label="API protocol">
+        <select value={f.api_type} onChange={upd('api_type')}>
+          <option value="openai-chat">OpenAI-compatible (/v1/chat/completions)</option>
+          <option value="anthropic-messages">Anthropic native (/v1/messages)</option>
+        </select>
+      </Field>
       <Field label="Base URL"><input value={f.base_url} onChange={upd('base_url')} /></Field>
-      <Field label="API key (write-only; stored as masked credential reference, never logged)">
+      <Field label="API key (stored encrypted; required for live playground testing)">
         <input type="password" value={f.api_key} onChange={upd('api_key')}
           placeholder={gateway?.key_mask ?? 'sk-…'} />
       </Field>

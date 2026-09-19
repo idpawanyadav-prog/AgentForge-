@@ -20,6 +20,7 @@ dist/
 # Local env / secrets
 .env
 *.local
+.gateway_keys.key
 
 # OS
 .DS_Store

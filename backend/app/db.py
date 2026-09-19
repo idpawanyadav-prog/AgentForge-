@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS gateways (
   api_type TEXT NOT NULL DEFAULT 'openai-chat',
   status TEXT NOT NULL DEFAULT 'Active',
   key_mask TEXT,
+  api_key_enc TEXT,
   last_tested_at TEXT,
   test_status TEXT,
   test_diagnostic TEXT,
@@ -466,9 +467,35 @@ CREATE TABLE IF NOT EXISTS persona_version_seed_marker (id TEXT PRIMARY KEY);
 def init_db():
     db = get_db()
     db.executescript(SCHEMA)
+    # lightweight column migrations for databases created before a column existed
+    cols = {r["name"] for r in query("PRAGMA table_info(gateways)")}
+    if "api_key_enc" not in cols:
+        execute("ALTER TABLE gateways ADD COLUMN api_key_enc TEXT")
     db.commit()
     seed_if_empty()
     seed_instruction_files()
+
+
+def _mask(key_value: str) -> str:
+    return "••••" + key_value[-4:] if key_value and len(key_value) >= 4 else "••••"
+
+
+def set_gateway_key(gateway_id: str, raw_key: str):
+    """Store an API key encrypted at rest. Only a mask is ever exposed."""
+    from . import secrets as _secrets
+    update("gateways", gateway_id, {"api_key_enc": _secrets.encrypt(raw_key),
+                                    "key_mask": _mask(raw_key), "updated_at": now()})
+
+
+def get_gateway_key(gateway_id: str) -> str | None:
+    from . import secrets as _secrets
+    row = query_one("SELECT api_key_enc FROM gateways WHERE id=?", (gateway_id,))
+    if not row or not row["api_key_enc"]:
+        return None
+    try:
+        return _secrets.decrypt(row["api_key_enc"])
+    except Exception:
+        return None
 
 
 def seed_instruction_files():

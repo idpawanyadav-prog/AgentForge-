@@ -112,12 +112,15 @@ def _execute_command(project_id, command, args) -> str:
             "id": gid, "name": args["name"], "provider": args.get("provider", "openai"),
             "base_url": args.get("base_url", "https://api.example.com/v1"),
             "api_type": "openai-chat", "status": "Active",
-            "key_mask": ("••••" + args["api_key"][-4:]) if args.get("api_key") else None,
             "last_tested_at": ts, "test_status": "Not tested", "test_diagnostic": "",
             "created_at": ts, "updated_at": ts,
         })
+        raw_key = args.get("api_key", "")
+        if raw_key and not raw_key.startswith("masked-ref:"):
+            db.set_gateway_key(gid, raw_key)
         audit("create_gateway", "gateway", gid, f"Created gateway '{args['name']}'")
-        return f"Gateway **{args['name']}** created ({args.get('provider', 'openai')}). API key stored as a masked credential reference — never written to prompts or logs."
+        return (f"Gateway **{args['name']}** created ({args.get('provider', 'openai')}). "
+                "API key stored encrypted — never written to prompts or logs.")
 
     if command == "test_gateway":
         gw = query_one("SELECT * FROM gateways WHERE lower(name)=lower(?)", (args["name"],))
@@ -387,9 +390,8 @@ def handle_message(project_id: str, conversation_id: str, text: str) -> dict:
         args["points"] = int(args["points"])
     if intent == "add_backlog_item" and "priority" in args:
         args["priority"] = int(args["priority"])
-    # Never retain raw credential values in chat: replace with a placeholder reference
-    if intent == "create_gateway" and "api_key" in args:
-        args["api_key"] = "masked-ref:" + args["api_key"][-4:]
+    # The raw key is kept in args so it can be stored encrypted on execution;
+    # it is never echoed back into the chat.
 
     if intent in SENSITIVE:
         pid = _queue_pending(conversation_id, intent, args, intent)

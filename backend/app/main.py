@@ -192,6 +192,8 @@ def create_gateway(body: GatewayIn):
         "status": "Active", "key_mask": _mask(body.api_key) if body.api_key else None,
         "created_at": ts, "updated_at": ts,
     })
+    if body.api_key:
+        db.set_gateway_key(gid, body.api_key)
     sync = db.sync_gateway_models(gid)
     audit("create_gateway", "gateway", gid,
           f"Created gateway '{body.name}'; auto-fetched {sync['added']} models")
@@ -202,10 +204,10 @@ def create_gateway(body: GatewayIn):
 def update_gateway(gid: str, body: dict):
     _or_404(query_one("SELECT id FROM gateways WHERE id=?", (gid,)), "Gateway")
     allowed = {k: v for k, v in body.items() if k in ("name", "provider", "base_url", "api_type", "status")}
-    if body.get("api_key"):
-        allowed["key_mask"] = _mask(body["api_key"])
     allowed["updated_at"] = now()
     update("gateways", gid, allowed)
+    if body.get("api_key"):
+        db.set_gateway_key(gid, body["api_key"])
     models_fetched = 0
     if "provider" in allowed:
         sync = db.sync_gateway_models(gid)
@@ -269,48 +271,124 @@ class TestChatIn(BaseModel):
     message: str
 
 
+def _live_chat(gw, model, message: str):
+    """Real inference call through the gateway. Returns (reply, meta)."""
+    import time as _time
+    import urllib.error as _uerr
+    import urllib.request as _ureq
+
+    api_key = db.get_gateway_key(gw["id"])
+    if not api_key:
+        raise HTTPException(409, "No API key stored for this gateway. Click Edit on the gateway card and paste the key once to enable live testing.")
+    base = gw["base_url"].rstrip("/")
+    is_anthropic = gw["api_type"] == "anthropic-messages"
+    if is_anthropic:
+        if base.endswith("/messages"):
+            url = base
+        elif base.endswith("/v1"):
+            url = base + "/messages"
+        else:
+            url = base + "/v1/messages"
+    else:
+        if "/v1" not in base:
+            base += "/v1"
+        url = base + "/chat/completions"
+    if is_anthropic:
+        payload = {"model": model["provider_model_id"], "max_tokens": 512,
+                   "messages": [{"role": "user", "content": message}]}
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                   "Content-Type": "application/json"}
+    else:
+        payload = {"model": model["provider_model_id"], "max_tokens": 512,
+                   "messages": [{"role": "user", "content": message}]}
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    started = _time.monotonic()
+    req = _ureq.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+    try:
+        with _ureq.urlopen(req, timeout=45) as resp:
+            data = json.loads(resp.read())
+    except _uerr.HTTPError as e:
+        err_body = e.read().decode(errors="replace")[:400]
+        raise HTTPException(502, f"Gateway returned HTTP {e.code}: {err_body}")
+    except Exception as exc:
+        raise HTTPException(502, f"Could not reach gateway at {url}: {exc}")
+    latency_ms = int(((_time.monotonic() - started) * 1000))
+
+    usage = data.get("usage") or {}
+    if is_anthropic:
+        reply = "\n".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+        in_t, out_t = usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+    else:
+        try:
+            reply = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            reply = json.dumps(data)[:600]
+        in_t, out_t = usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
+    if not reply:
+        raise HTTPException(502, f"Gateway returned an empty response: {json.dumps(data)[:400]}")
+    return reply.strip(), {"latency_ms": latency_ms, "input_tokens": in_t, "output_tokens": out_t}
+
+
 @app.post("/api/v1/gateways/{gid}/test-chat")
 async def gateway_test_chat(gid: str, body: TestChatIn):
-    """Simulated single-turn inference against a gateway model (playground)."""
+    """Live single-turn inference against a gateway model (playground)."""
     gw = _or_404(query_one("SELECT * FROM gateways WHERE id=?", (gid,)), "Gateway")
     model = query_one("SELECT * FROM gateway_models WHERE id=? AND gateway_id=?",
                       (body.model_id, gid))
     if not model:
         raise HTTPException(404, "Model not found on this gateway")
-    import asyncio as _aio
-    import random as _rand
-
-    def _run():
-        latency_ms = _rand.randint(350, 1600)
-        in_tokens = max(8, len(body.message.split()) + 6)
-        caps = set(filter(None, model["capabilities"].split(",")))
-        kind = ("image model" if "image" in caps else
-                "embedding model (returns a 1536-dim vector)" if "embedding" in caps else
-                "audio model (returns a transcript)" if "audio" in caps else
-                "chat model")
-        reply = (
-            f"**{model['display_name']}** (`{model['provider_model_id']}`) via **{gw['name']}** "
-            f"responds to: \"{body.message[:120]}\"\n\n"
-            f"This is a simulated {kind} response — the gateway handshake, model resolution and "
-            f"usage metering pipeline all executed. In production this call would stream live tokens "
-            f"from `{gw['base_url']}`.")
-        out_tokens = max(20, len(reply.split()) + 10)
-        return reply, latency_ms, in_tokens, out_tokens
-
-    reply, latency_ms, in_tokens, out_tokens = await _aio.get_running_loop().run_in_executor(None, _run)
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, _live_chat, gw, model, body.message)
+    reply, meta = result
     audit("test_chat", "gateway", gid,
-          f"Playground chat with {model['provider_model_id']} ({in_tokens}+{out_tokens} tokens)")
+          f"Live chat with {model['provider_model_id']} ({meta['input_tokens']}+{meta['output_tokens']} tokens, {meta['latency_ms']}ms)")
     return {"reply": reply, "model": model["provider_model_id"],
-            "gateway": gw["name"], "latency_ms": latency_ms,
-            "input_tokens": in_tokens, "output_tokens": out_tokens}
+            "gateway": gw["name"], "live": True, **meta}
+
+
+def _live_model_ids(gw) -> list[str] | None:
+    """Best-effort live fetch of the provider's model list. None on failure."""
+    import urllib.error as _uerr
+    import urllib.request as _ureq
+
+    api_key = db.get_gateway_key(gw["id"])
+    if not api_key:
+        return None
+    base = gw["base_url"].rstrip("/")
+    if "/v1" not in base:
+        base += "/v1"
+    req = _ureq.Request(base + "/models", headers={"Authorization": f"Bearer {api_key}"})
+    try:
+        with _ureq.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        ids = [m.get("id") for m in data.get("data", []) if m.get("id")]
+        return ids or None
+    except Exception:
+        return None
 
 
 @app.post("/api/v1/gateways/{gid}/discover")
 def discover_models(gid: str):
-    _or_404(query_one("SELECT id FROM gateways WHERE id=?", (gid,)), "Gateway")
+    gw = _or_404(query_one("SELECT * FROM gateways WHERE id=?", (gid,)), "Gateway")
+    live_ids = _live_model_ids(gw)
+    source = "provider-catalog"
+    if live_ids:
+        source = "live"
+        added = 0
+        for mid in live_ids:
+            exists = query_one("SELECT id FROM gateway_models WHERE gateway_id=? AND provider_model_id=?",
+                               (gid, mid))
+            if not exists:
+                insert("gateway_models", {"id": new_id(), "gateway_id": gid,
+                                          "provider_model_id": mid, "display_name": mid,
+                                          "capabilities": "", "active": 1})
+                added += 1
+        total = query_one("SELECT COUNT(*) AS n FROM gateway_models WHERE gateway_id=?", (gid,))["n"]
+        return {"source": source, "added": added, "total": total, "live_models": len(live_ids)}
     sync = db.sync_gateway_models(gid)
     total = query_one("SELECT COUNT(*) AS n FROM gateway_models WHERE gateway_id=?", (gid,))["n"]
-    return {"added": sync["added"], "removed": sync["removed"], "total": total}
+    return {"source": source, "added": sync["added"], "removed": sync["removed"], "total": total}
 
 
 # ------------------------------- agent memory -------------------------------
