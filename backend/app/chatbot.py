@@ -26,7 +26,11 @@ HELP_TEXT = """I can execute these typed commands:
 **Teams**
 - `create agent <name> role <role> persona <persona>`
 - `build team <name> with <role1>, <role2>, ...` — reuses only uncommitted agents; hires new agents for roles with nobody free
-- `create team <name> with agents <a>, <b>, ...`
+- `create team <name> with agents <a>, <b>, ...` — refused for agents already serving another project
+- `hire <role>` — hire a new agent for a role (optional: `named <name> to team <team>`)
+- `add agent <name> to team <team>` — add a free agent (team optional: project's aligned team)
+- `move agent <name> to team <team>` — transfer an Idle agent from their other team
+- `remove agent <name> from team <team>`
 - `align team <name> to this project` — aligns a team to the current project (name optional: newest unaligned team)
 
 **Agile**
@@ -367,6 +371,98 @@ def _coerce_int(value, default: int = 0) -> int:
     return int(m.group()) if m else default
 
 
+_HIRE_NAMES = ["Kai", "Mia", "Zoe", "Leo", "Ivy", "Ash", "Max", "Rue", "Finn", "Sky",
+               "Juno", "Pax", "Nia", "Orion", "Vega"]
+
+
+def _resolve_role(name):
+    role = _find_role(name)
+    if role:
+        return role
+    all_roles = query("SELECT * FROM roles WHERE active = 1")
+    n = str(name).lower().strip()
+    partial = [r for r in all_roles if n in r["name"].lower() or r["name"].lower() in n]
+    if partial:
+        return partial[0]
+    wanted = set(re.findall(r"[a-z0-9]+", n))
+
+    def overlap(r):
+        return len(wanted & set(re.findall(r"[a-z0-9]+", r["name"].lower())))
+    best = max(all_roles, key=overlap, default=None)
+    return best if best is not None and overlap(best) > 0 else None
+
+
+def _next_agent_name(role):
+    taken = {r["name"].lower() for r in query("SELECT name FROM agents")}
+    name = next((n for n in _HIRE_NAMES if n.lower() not in taken), None)
+    if not name:
+        base = role["name"].split()[0].title()
+        n = query_one("SELECT COUNT(*) AS n FROM agents WHERE role_id = ?", (role["id"],))["n"] + 1
+        name = f"{base}-{n:02d}"
+        # Exact-name uniqueness only — fuzzy _find_agent would match any agent
+        # of the same role and loop forever.
+        while query_one("SELECT id FROM agents WHERE lower(name) = lower(?)", (name,)):
+            n += 1
+            name = f"{base}-{n:02d}"
+    return name
+
+
+def _hire_agent_for_role(role, name=None):
+    """Create a fully functional agent for a role (persona + role model binding)."""
+    persona = _ensure_role_persona(role)
+    name = name or _next_agent_name(role)
+    binding = query_one("SELECT * FROM model_bindings WHERE role_id = ? AND active = 1", (role["id"],))
+    aid = new_id()
+    ts = now()
+    insert("agents", {"id": aid, "name": name, "role_id": role["id"],
+                      "persona_id": persona["id"],
+                      "model_binding_id": binding["id"] if binding else None,
+                      "lifecycle_state": "Idle", "created_at": ts, "updated_at": ts})
+    return query_one("SELECT * FROM agents WHERE id = ?", (aid,))
+
+
+def _find_agent_strict(name):
+    """Agent lookup by name only — never by role. The role fallback in _find_agent
+    would silently pick a different agent for roster operations."""
+    n = str(name or "").lower().strip()
+    if not n:
+        return None
+    exact = query_one("SELECT * FROM agents WHERE lower(name) = lower(?)", (n,))
+    if exact:
+        return exact
+    rows = query("SELECT * FROM agents WHERE lower(name) LIKE ? ORDER BY name", (f"%{n}%",))
+    return rows[0] if len(rows) == 1 else None
+
+
+def _agent_project_map(agent_id):
+    """project name -> team name for every project the agent serves via an
+    aligned team. Keyed by the 1-agent-serves-1-project rule."""
+    align = _team_alignment_map()
+    out = {}
+    for row in query(
+            "SELECT ta.team_id, t.name AS team_name FROM team_agents ta "
+            "JOIN teams t ON t.id = ta.team_id WHERE ta.agent_id = ? AND ta.active = 1", (agent_id,)):
+        proj = align.get(row["team_id"])
+        if proj:
+            out[proj] = row["team_name"]
+    return out
+
+
+def _resolve_team(project, team_ref):
+    """(team_row, error) for roster commands; defaults to the project's aligned team."""
+    if team_ref:
+        ref = str(team_ref).lower().strip()
+        for t in query("SELECT * FROM teams ORDER BY created_at DESC"):
+            if t["name"].lower() == ref or ref in t["name"].lower():
+                return t, None
+        return None, ("Team matching **" + str(team_ref) + "** not found. Teams: "
+                      + ", ".join(t["name"] for t in query("SELECT name FROM teams")) + ".")
+    if project["team_id"]:
+        return query_one("SELECT * FROM teams WHERE id = ?", (project["team_id"],)), None
+    return None, ("This project has no aligned team — name one (e.g. `to team <name>`) "
+                  "or run `build team` first.")
+
+
 def _execute_command(project_id, command, args) -> str:
     ts = now()
     if command == "create_gateway":
@@ -478,6 +574,22 @@ def _execute_command(project_id, command, args) -> str:
                 agent_rows.append(a)
         if not agent_rows:
             return "No matching agents found. Create agents first with `create agent ...`."
+        project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+        blocked, kept = [], []
+        for a in agent_rows:
+            others = [p for p in _agent_project_map(a["id"]) if not project or p != project["name"]]
+            if others:
+                blocked.append(f"{a['name']} ({', '.join(others)})")
+            else:
+                kept.append(a)
+        agent_rows = kept
+        skipped_note = ""
+        if blocked:
+            skipped_note = (" Skipped (already aligned to another project — one agent serves one project): "
+                            + ", ".join(blocked) + ".")
+        if not agent_rows:
+            return ("No usable agents: " + ", ".join(blocked)
+                    + ". One agent serves one project only — use `build team` to hire new agents instead.")
         existing = query_one("SELECT * FROM teams WHERE lower(name) = lower(?)", (str(args["name"]).strip(),))
         if existing:
             member_ids = {r["agent_id"] for r in
@@ -491,9 +603,9 @@ def _execute_command(project_id, command, args) -> str:
                   f"Added {len(added)} agent(s) to existing team '{existing['name']}'")
             if added:
                 return (f"Team **{existing['name']}** already exists — added missing agents: "
-                        + ", ".join(added) + ". No duplicate team was created.")
+                        + ", ".join(added) + ". No duplicate team was created." + skipped_note)
             return (f"Team **{existing['name']}** already exists and all requested agents "
-                    f"({', '.join(a['name'] for a in agent_rows)}) are already on it.")
+                    f"({', '.join(a['name'] for a in agent_rows)}) are already on it." + skipped_note)
         tid = new_id()
         insert("teams", {"id": tid, "name": args["name"], "description": "",
                          "status": "Active", "created_at": ts})
@@ -502,7 +614,7 @@ def _execute_command(project_id, command, args) -> str:
                     (tid, a["id"], "Member"))
         audit("create_team", "team", tid,
               f"Created team '{args['name']}' with {len(agent_rows)} agents")
-        return f"Team **{args['name']}** created with agents: {', '.join(a['name'] for a in agent_rows)}."
+        return f"Team **{args['name']}** created with agents: {', '.join(a['name'] for a in agent_rows)}." + skipped_note
 
     if command == "build_team":
         raw_roles = args.get("roles") or []
@@ -518,24 +630,9 @@ def _execute_command(project_id, command, args) -> str:
         aligned = _agent_alignment_map()          # agent_id -> [Project (Team)]
         used_ids: set = set()                     # agents already staffed in this build
         staff, reused, hired = [], [], []
-        all_roles = query("SELECT * FROM roles WHERE active = 1")
-
-        def resolve_role(name):
-            role = _find_role(name)
-            if role:
-                return role
-            n = str(name).lower().strip()
-            partial = [r for r in all_roles if n in r["name"].lower() or r["name"].lower() in n]
-            if partial:
-                return partial[0]
-            wanted = set(re.findall(r"[a-z0-9]+", n))
-            def overlap(r):
-                return len(wanted & set(re.findall(r"[a-z0-9]+", r["name"].lower())))
-            best = max(all_roles, key=overlap, default=None)
-            return best if best is not None and overlap(best) > 0 else None
 
         for role_name in roles_requested:
-            role = resolve_role(role_name)
+            role = _resolve_role(role_name)
             if not role:
                 return (f"Role **{role_name}** not found. Available roles: "
                         + ", ".join(r["name"] for r in query("SELECT name FROM roles WHERE active=1")) + ".")
@@ -557,34 +654,12 @@ def _execute_command(project_id, command, args) -> str:
                 reused.append(f"{pick['name']} ({role['name']})")
             else:
                 # Hire: create a fresh agent for this role (same internals as create_agent).
-                persona = _ensure_role_persona(role)
-                existing_count = query_one("SELECT COUNT(*) AS n FROM agents WHERE role_id = ?", (role["id"],))["n"]
-                # Pick a human-style name from the free pool; fall back to numbered role names.
-                taken = {r["name"].lower() for r in query("SELECT name FROM agents")}
-                name = next((n for n in ["Kai", "Mia", "Zoe", "Leo", "Ivy", "Ash", "Max", "Rue", "Finn", "Sky",
-                                         "Juno", "Pax", "Nia", "Orion", "Vega"]
-                             if n.lower() not in taken), None)
-                if not name:
-                    base = role["name"].split()[0].title()
-                    n = existing_count + 1
-                    name = f"{base}-{n:02d}"
-                    # Exact-name uniqueness only — fuzzy _find_agent would match any agent
-                    # of the same role and loop forever.
-                    while query_one("SELECT id FROM agents WHERE lower(name) = lower(?)", (name,)):
-                        n += 1
-                        name = f"{base}-{n:02d}"
-                binding = query_one("SELECT * FROM model_bindings WHERE role_id = ? AND active = 1", (role["id"],))
-                aid = new_id()
-                insert("agents", {"id": aid, "name": name, "role_id": role["id"],
-                                  "persona_id": persona["id"],
-                                  "model_binding_id": binding["id"] if binding else None,
-                                  "lifecycle_state": "Idle", "created_at": ts, "updated_at": ts})
-                audit("hire_agent", "agent", aid,
-                      f"Hired agent '{name}' ({role['name']} / {persona['name']}) for team '{args['name']}'")
-                hired_agent = query_one("SELECT * FROM agents WHERE id = ?", (aid,))
-                used_ids.add(aid)
+                hired_agent = _hire_agent_for_role(role)
+                audit("hire_agent", "agent", hired_agent["id"],
+                      f"Hired agent '{hired_agent['name']}' ({role['name']}) for team '{args['name']}'")
+                used_ids.add(hired_agent["id"])
                 staff.append(hired_agent)
-                hired.append(f"{name} ({role['name']})")
+                hired.append(f"{hired_agent['name']} ({role['name']})")
         project_team = query_one("SELECT * FROM teams WHERE id = ?", (project["team_id"],)) if project["team_id"] else None
         target = query_one("SELECT * FROM teams WHERE lower(name) = lower(?)", (str(args["name"]).strip(),))
         if target is None and project_team is not None:
@@ -635,6 +710,113 @@ def _execute_command(project_id, command, args) -> str:
             notes.append(f"Project already aligned to a team; **{args['name']}** left unaligned "
                          "(swap it in Projects → Settings if desired).")
         return " ".join(notes)
+
+    if command == "hire_agent":
+        project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+        role_text = re.sub(r"\s*(?:as well|too|please|also|in this project|for this project|"
+                           r"to this project|for the project|for our team|here|for me)+\s*$", "",
+                           str(args.get("role") or ""), flags=re.IGNORECASE).strip(" ,.")
+        role = _resolve_role(role_text)
+        if not role:
+            return ("Role **" + (role_text or "?") + "** not found. Available roles: "
+                    + ", ".join(r["name"] for r in query("SELECT name FROM roles WHERE active=1")) + ".")
+        name = str(args.get("name") or "").strip() or None
+        if name and query_one("SELECT id FROM agents WHERE lower(name) = lower(?)", (name,)):
+            return (f"Agent **{name}** already exists. Pick a different name, "
+                    f"or use `add agent {name} to the team` to reuse them (if free).")
+        team, err = (None, None)
+        if args.get("team") or (project and project["team_id"]):
+            team, err = _resolve_team(project, args.get("team"))
+        if err:
+            return err
+        agent = _hire_agent_for_role(role, name)
+        audit("hire_agent", "agent", agent["id"],
+              f"Hired agent '{agent['name']}' ({role['name']})")
+        note = ""
+        if team:
+            execute("INSERT OR IGNORE INTO team_agents (team_id, agent_id, role_in_team, active) VALUES (?,?,?,1)",
+                    (team["id"], agent["id"], "Member"))
+            note = f" Joined team **{team['name']}**."
+        persona_name = query_one("SELECT name FROM personas WHERE id = ?", (agent["persona_id"],))
+        return (f"Hired **{agent['name']}** as **{role['name']}**"
+                f" (persona **{persona_name['name'] if persona_name else 'default'}**).{note}")
+
+    if command == "add_agent_to_team":
+        project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+        agent = _find_agent_strict(args.get("agent"))
+        if not agent:
+            return (f"Agent **{args.get('agent')}** not found (use the agent's name). Agents: "
+                    + ", ".join(a["name"] for a in query("SELECT name FROM agents ORDER BY name")) + ".")
+        team, err = _resolve_team(project, args.get("team"))
+        if err:
+            return err
+        if query_one("SELECT 1 FROM team_agents WHERE team_id=? AND agent_id=? AND active=1",
+                     (team["id"], agent["id"])):
+            return f"**{agent['name']}** is already on team **{team['name']}**."
+        others = {p: t for p, t in _agent_project_map(agent["id"]).items() if not project or p != project["name"]}
+        if others:
+            detail = ", ".join(f"{p} ({t})" for p, t in sorted(others.items()))
+            return (f"Cannot add **{agent['name']}** — an agent serves one project only, and they are "
+                    f"aligned to {detail}. Hire a new agent via `hire <role>`, or "
+                    f"`move agent {agent['name']} to team {team['name']}` to transfer them (only if Idle).")
+        execute("INSERT OR IGNORE INTO team_agents (team_id, agent_id, role_in_team, active) VALUES (?,?,?,1)",
+                (team["id"], agent["id"], "Member"))
+        audit("add_agent_to_team", "team", team["id"],
+              f"Added {agent['name']} to team '{team['name']}'")
+        return f"**{agent['name']}** added to team **{team['name']}**."
+
+    if command == "add_agent_from_other_team":
+        project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+        agent = _find_agent_strict(args.get("agent"))
+        if not agent:
+            return f"Agent **{args.get('agent')}** not found (use the agent's name)."
+        team, err = _resolve_team(project, args.get("team"))
+        if err:
+            return err
+        if agent["lifecycle_state"] != "Idle":
+            return (f"**{agent['name']}** is currently **{agent['lifecycle_state']}** — only Idle agents "
+                    "can be moved between teams. Wait for them to finish their task first.")
+        from_ref = str(args.get("from_team") or "").strip()
+        memberships = query(
+            "SELECT ta.team_id, t.name AS team_name FROM team_agents ta JOIN teams t ON t.id = ta.team_id "
+            "WHERE ta.agent_id = ? AND ta.active = 1", (agent["id"],))
+        if from_ref:
+            memberships = [m for m in memberships if from_ref.lower() in m["team_name"].lower()]
+            if not memberships:
+                return f"**{agent['name']}** is not on a team matching **{from_ref}**."
+        sources = [m for m in memberships if m["team_id"] != team["id"]]
+        if not sources:
+            return (f"**{agent['name']}** has no other team to move from — "
+                    f"use `add agent {agent['name']} to team {team['name']}` instead.")
+        left = []
+        for m in sources:
+            execute("DELETE FROM team_agents WHERE team_id=? AND agent_id=?", (m["team_id"], agent["id"]))
+            left.append(m["team_name"])
+        execute("INSERT OR IGNORE INTO team_agents (team_id, agent_id, role_in_team, active) VALUES (?,?,?,1)",
+                (team["id"], agent["id"], "Member"))
+        audit("add_agent_from_other_team", "agent", agent["id"],
+              f"Moved {agent['name']} from {', '.join(left)} to team '{team['name']}'")
+        return (f"**{agent['name']}** moved from {', '.join(left)} to team **{team['name']}**. "
+                "They now serve this team's project only.")
+
+    if command == "remove_agent":
+        project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+        agent = _find_agent_strict(args.get("agent"))
+        if not agent:
+            return f"Agent **{args.get('agent')}** not found (use the agent's name)."
+        team, err = _resolve_team(project, args.get("team"))
+        if err:
+            return err
+        if not query_one("SELECT 1 FROM team_agents WHERE team_id=? AND agent_id=? AND active=1",
+                         (team["id"], agent["id"])):
+            return f"**{agent['name']}** is not on team **{team['name']}**."
+        execute("DELETE FROM team_agents WHERE team_id=? AND agent_id=?", (team["id"], agent["id"]))
+        audit("remove_agent", "team", team["id"],
+              f"Removed {agent['name']} from team '{team['name']}'")
+        remaining = _agent_project_map(agent["id"])
+        status = (" They are now uncommitted (free)." if not remaining else
+                  " They still serve: " + ", ".join(sorted(remaining)) + ".")
+        return f"**{agent['name']}** removed from team **{team['name']}**.{status}"
 
     if command == "add_backlog_item":
         bid = new_id()
@@ -809,6 +991,10 @@ INTENTS = [
     ("add_backlog_item", r"add (?:a )?backlog item\s+(?P<title>.+?)(?:\s+points?\s+(?P<points>\d+))?(?:\s+priority\s+(?P<priority>\d+))?\s*$"),
     ("add_task", r"add (?:a )?task\s+(?P<title>.+?)(?:\s+to\s+(?:the\s+)?(?:sprint\s+)?(?P<sprint>.+?))?(?:\s+points?\s+(?P<points>\d+))?(?:\s+priority\s+(?P<priority>\d+))?\s*$"),
     ("create_sprint", r"create (?:a )?sprint\s+(?P<name>.+?)\s*$"),
+    ("hire_agent", r"hire (?:a |an |one )?(?:new )?(?P<role>.+?)(?:\s+named\s+(?P<name>.+?))?(?:\s+(?:to|into|for)\s+(?:the\s+)?(?:team\s+)?(?P<team>.+?))?\s*$"),
+    ("add_agent_to_team", r"add (?:the )?agent\s+(?P<agent>.+?)(?:\s+(?:to|into)\s+(?:the\s+)?(?:team\s+)?(?P<team>.+?))?\s*$"),
+    ("add_agent_from_other_team", r"(?:move|transfer)\s+(?:the )?agent\s+(?P<agent>.+?)(?:\s+from\s+(?:the\s+)?(?:team\s+)?(?P<from_team>.+?))?(?:\s+(?:to|into)\s+(?:the\s+)?(?:team\s+)?(?P<team>.+?))?\s*$"),
+    ("remove_agent", r"remove (?:the )?agent\s+(?P<agent>.+?)(?:\s+from\s+(?:the\s+)?(?:team\s+)?(?P<team>.+?))?\s*$"),
     ("align_team", r"align(?:ed)?\s+(?:it|that team|the new team|the team)?\s*(?:to|in|with)?\s*(?:this\s+)?project\s*$"),
     ("align_team", r"(?:align|link|attach|assign)\s+(?:the\s+)?team\s+(?P<team>.+?)\s+(?:to|with)\s+(?:this\s+)?project\s*$"),
     ("assign_task", r"assign(?: task)?\s+(?P<task>.+?)\s+to\s+(?P<agent>.+?)\s*$"),
@@ -821,7 +1007,8 @@ INTENTS = [
     ("retry_failed", r"retry\s+(?:the )?(?:last )?(?:failed )?(?:task|execution)\s*$"),
 ]
 
-SENSITIVE = {"create_gateway", "create_agent", "create_team", "build_team"}
+SENSITIVE = {"create_gateway", "create_agent", "create_team", "build_team",
+             "hire_agent", "add_agent_from_other_team"}
 
 # Static quick replies for the deterministic (typed) command path.
 SUGGESTIONS = {
@@ -832,6 +1019,10 @@ SUGGESTIONS = {
     "create_agent": ["Build a team with this agent", "Status", "Create another agent"],
     "create_team": ["Align this team to the project", "Add backlog item", "Status"],
     "build_team": ["Align this team to the project", "Add backlog item", "Status"],
+    "hire_agent": ["Assign task to the new agent", "Status", "Build a team"],
+    "add_agent_to_team": ["Assign task to an agent", "Status", "Create sprint"],
+    "add_agent_from_other_team": ["Assign task to an agent", "Status", "Build a team"],
+    "remove_agent": ["Hire an agent", "Build a team", "Status"],
     "add_backlog_item": ["Create a sprint for these items", "Assign task to an agent", "Status"],
     "add_task": ["Create a sprint", "Assign task to an agent", "Start sprint execution"],
     "create_sprint": ["Add backlog item", "Start sprint execution", "Status"],
@@ -952,6 +1143,10 @@ Available commands (name: args):
 - create_agent: {name, role, persona?}
 - build_team: {name, roles: ["role name", ...]} — preferred way to build teams
 - create_team: {name, agents: ["agent name", ...]} — only when the user names specific FREE agents
+- hire_agent: {role, name?, team?} — creates a NEW agent for a role (persona + model binding), optionally joining a team (default: the project's aligned team)
+- add_agent_to_team: {agent, team?} — adds a FREE agent by name to a team (default: the project's aligned team); refused if the agent serves another project
+- add_agent_from_other_team: {agent, team?, from_team?} — moves an IDLE agent from their other team into this team; they leave the old team
+- remove_agent: {agent, team?} — removes an agent from a team (default: the project's aligned team)
 - add_backlog_item: {title, points?, priority?} — for the product backlog
 - add_task: {title, sprint?, points?, priority?} — creates a task IN a sprint; use this (not add_backlog_item) when the user wants items added to a sprint
 - create_sprint: {name, goal?, capacity?}
@@ -969,6 +1164,7 @@ Rules:
 - Pick a command only when the user clearly wants that action; otherwise set command to null and just answer.
 - ALIGNMENT IS FACT: each agent line in the context states which project(s) it is aligned to via its team, or "uncommitted (free)". Never claim an aligned agent is free; never assign an agent aligned to a DIFFERENT project. Teams also show their aligned project and full member roster.
 - When the user asks to build/staff a team (for this or any project), use build_team with the needed role names. build_team automatically reuses only uncommitted agents and hires new agents for roles with nobody free. Only use create_team if the user explicitly names agents AND every named agent is uncommitted (free) or aligned to the CURRENT project.
+- ONE AGENT SERVES ONE PROJECT: an agent aligned (via its team) to a project must never be added to another project's team. To staff another project: use build_team or hire_agent (new agent), reuse only free agents, or add_agent_from_other_team to transfer an IDLE agent (they leave their old team). Never add every known agent to a team — staff exactly the roles requested.
 - Reference tasks by the closest title in the context (partial titles are fine, e.g. "user authentication" for "User authentication API").
 - Reference agents by exact name, or by role when the user means "any/one <role>" (e.g. agent "a senior developer" if a developer role exists); the resolver picks the best idle agent for that role.
 - If the user asks about status or progress, set command to null and summarize from the context.
