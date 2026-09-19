@@ -22,6 +22,8 @@ export default function SettingsPage() {
 
       <ControlBotCard gateways={gateways ?? []} onError={fail} />
 
+      <PoBotCard gateways={gateways ?? []} onError={fail} />
+
       <ModelPlayground gateways={gateways ?? []} onError={fail} />
 
       <div className="section-title">Gateways</div>
@@ -92,6 +94,62 @@ function ControlBotCard({ gateways, onError }: { gateways: any[]; onError: (e: a
             {configured
               ? <> Current: <b>{bot.gateway_name}</b> → <b>{bot.model_name}</b>.</>
               : <> <b>Not configured</b> — pick a gateway and model below.</>}
+          </div>
+        </div>
+      </div>
+      <div className="row" style={{ marginTop: 10, gap: 8 }}>
+        <select style={{ width: 220 }} value={gid} onChange={(e) => { setGid(e.target.value); setModelId(''); }}>
+          <option value="">— select gateway —</option>
+          {gateways.map((g) => <option key={g.id} value={g.id}>{g.name} ({g.provider})</option>)}
+        </select>
+        <select style={{ width: 260 }} value={modelId} onChange={(e) => setModelId(e.target.value)} disabled={!gid}>
+          <option value="">— select model —</option>
+          {(models ?? []).map((m) => <option key={m.id} value={m.id}>{m.display_name} ({m.provider_model_id})</option>)}
+        </select>
+        <button className="btn primary" disabled={saving || !gid || !modelId} onClick={save}>
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+        {saved && <Badge kind="ok">Saved</Badge>}
+      </div>
+    </div>
+  );
+}
+
+function PoBotCard({ gateways, onError }: { gateways: any[]; onError: (e: any) => void }) {
+  const { data: cfg, reload } = useAsyncData<any>(() => get('/api/v1/settings'), []);
+  const bot = cfg?.po_bot ?? {};
+  const [gid, setGid] = React.useState('');
+  const [modelId, setModelId] = React.useState('');
+  const [saving, setSaving] = React.useState(false);
+  const [saved, setSaved] = React.useState(false);
+  const { data: models } = useAsyncData<any[]>(
+    () => (gid ? get(`/api/v1/gateways/${gid}/models`) : Promise.resolve([])), [gid]);
+
+  React.useEffect(() => {
+    if (bot.gateway_id) { setGid(bot.gateway_id); setModelId(bot.model_id ?? ''); }
+  }, [bot.gateway_id, bot.model_id]);
+
+  const save = async () => {
+    setSaving(true); setSaved(false);
+    try {
+      await put('/api/v1/settings/po-bot', { gateway_id: gid || null, model_id: modelId || null });
+      reload(); setSaved(true);
+    } catch (e: any) { onError(e); }
+    finally { setSaving(false); }
+  };
+
+  const configured = bot.gateway_id && bot.model_id;
+  return (
+    <div className="card playground-card">
+      <div className="spread">
+        <div>
+          <h3 style={{ margin: 0 }}>👑 Product Owner AI</h3>
+          <div className="muted small">
+            The Product Owner agent uses this gateway + model as its brain for requirement reviews,
+            sprint planning, task rewrites, assignments and unblocking — in chat and in autonomous mode.
+            {configured
+              ? <> Current: <b>{bot.gateway_name}</b> → <b>{bot.model_name}</b>.</>
+              : <> <b>Not configured</b> — falls back to the project's default model.</>}
           </div>
         </div>
       </div>

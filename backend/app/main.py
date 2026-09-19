@@ -165,14 +165,12 @@ class SettingsIn(BaseModel):
 
 # ------------------------------- settings -------------------------------
 
-@app.get("/api/v1/settings")
-def get_settings():
-    import json as _json
+def _bot_payload(key: str) -> dict:
     bot = {"gateway_id": None, "model_id": None, "gateway_name": None, "model_name": None}
-    raw = _get_setting("control_bot", "")
+    raw = _get_setting(key, "")
     if raw:
         try:
-            cfg = _json.loads(raw)
+            cfg = json.loads(raw)
             gw = query_one("SELECT name FROM gateways WHERE id = ?", (cfg.get("gateway_id", ""),))
             m = query_one("SELECT provider_model_id FROM gateway_models WHERE id = ?", (cfg.get("model_id", ""),))
             bot.update({"gateway_id": cfg.get("gateway_id"), "model_id": cfg.get("model_id"),
@@ -180,20 +178,36 @@ def get_settings():
                         "model_name": m["provider_model_id"] if m else None})
         except ValueError:
             pass
-    return {"theme": _get_setting("theme", "dark"), "control_bot": bot}
+    return bot
 
 
-@app.put("/api/v1/settings/control-bot")
-def put_control_bot(body: dict):
+@app.get("/api/v1/settings")
+def get_settings():
+    return {"theme": _get_setting("theme", "dark"),
+            "control_bot": _bot_payload("control_bot"),
+            "po_bot": _bot_payload("po_bot")}
+
+
+def _put_bot_config(key: str, body: dict, action: str):
     gid, mid = body.get("gateway_id"), body.get("model_id")
     if gid:
         _or_404(query_one("SELECT id FROM gateways WHERE id=?", (gid,)), "Gateway")
     if mid:
         _or_404(query_one("SELECT id FROM gateway_models WHERE id=? AND gateway_id=?", (mid, gid)), "Model")
-    _set_setting("control_bot", json.dumps({"gateway_id": gid, "model_id": mid}))
-    audit("configure_control_bot", "settings", "control_bot",
-          f"Project Control AI set to gateway/model ({bool(gid)}, {bool(mid)})")
+    _set_setting(key, json.dumps({"gateway_id": gid, "model_id": mid}))
+    audit(action, "settings", key,
+          f"{key.replace('_', ' ').title()} set to gateway/model ({bool(gid)}, {bool(mid)})")
     return {"ok": True}
+
+
+@app.put("/api/v1/settings/control-bot")
+def put_control_bot(body: dict):
+    return _put_bot_config("control_bot", body, "configure_control_bot")
+
+
+@app.put("/api/v1/settings/po-bot")
+def put_po_bot(body: dict):
+    return _put_bot_config("po_bot", body, "configure_po_bot")
 
 
 @app.put("/api/v1/settings")

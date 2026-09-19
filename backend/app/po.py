@@ -542,11 +542,24 @@ def _apply_actions(project_id: str, actions) -> list[str]:
 # ---------------------------------------------------------------- LLM plumbing
 
 def _po_llm(project_id: str):
-    """Brain for the Product Owner: the project's default gateway with a
-    plain chat/coding model (never the control bot's tool-calling routing
-    model, whose tool-call XML breaks JSON action parsing). Falls back to
-    the control-bot model when the project gateway has no key."""
+    """Brain for the Product Owner. Priority: the explicit PO model config
+    from Settings → Product Owner AI, then the project's default gateway
+    with a plain chat/coding model (never the control bot's tool-calling
+    routing model, whose tool-call XML breaks JSON action parsing), then
+    the control-bot model as a last resort."""
     from . import codegen
+    cfg_raw = query_one("SELECT value FROM settings WHERE key = 'po_bot'")
+    if cfg_raw and cfg_raw["value"]:
+        try:
+            import json as _json
+            cfg = _json.loads(cfg_raw["value"])
+            if cfg.get("gateway_id") and cfg.get("model_id"):
+                gw = query_one("SELECT * FROM gateways WHERE id = ?", (cfg["gateway_id"],))
+                model = query_one("SELECT * FROM gateway_models WHERE id = ?", (cfg["model_id"],))
+                if gw and model:
+                    return gw, model
+        except ValueError:
+            pass
     project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     gw, model = (None, None)
     if project:
