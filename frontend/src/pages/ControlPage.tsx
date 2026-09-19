@@ -285,6 +285,8 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
     get(`/api/v1/projects/${activeProject}/po/messages`).then(setPoMessages).catch(() => undefined);
   }, [poMode, activeProject]);
   React.useEffect(() => { if (poMode) poEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [poMessages]);
+  // If the project has no Product Owner (or it was removed), drop out of PO chat mode.
+  React.useEffect(() => { if (poMode && s && !s.po?.has_po) setPoMode(false); }, [poMode, s]);
 
   const togglePo = async () => {
     if (!activeProject || !s?.po?.has_po) return;
@@ -385,13 +387,15 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
               🤖 Product Owner: {s.po.po_enabled ? 'On' : 'Off'}
             </button>
           )}
-          <button
-            className={`btn small ${poMode ? 'primary' : ''}`}
-            onClick={() => setPoMode((m) => !m)}
-            title="Talk to the Product Owner agent about requirements (supports file attachments)"
-          >
-            👑 Chat with Product Owner
-          </button>
+          {s?.po?.has_po && (
+            <button
+              className={`btn small ${poMode ? 'primary' : ''}`}
+              onClick={() => setPoMode((m) => !m)}
+              title="Talk to the Product Owner agent about requirements (supports file attachments)"
+            >
+              👑 Chat with Product Owner
+            </button>
+          )}
           {s?.sprint && (
             s.scheduler_running
               ? <button className="btn small danger" onClick={() => sprintAction('stop')}>⏹ Stop sprint execution</button>
