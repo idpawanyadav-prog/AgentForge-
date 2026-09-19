@@ -28,3 +28,7 @@ Thumbs.db
 
 # Generated project workspaces (runtime data, each is its own git repo)
 /Projects/
+
+# Local runtime logs
+server*.log
+t1*.log
