@@ -139,7 +139,14 @@ function AgentForm({ agent, teams = [], onClose, onSaved }: {
       <Field label="Model binding (inherits role default)">
         <select value={f.model_binding_id} onChange={upd('model_binding_id')} disabled={!f.role_id}>
           <option value="">— role default —</option>
-          {roleBindings.map((b) => <option key={b.id} value={b.id}>{b.provider_model_id} @ {b.gateway_name}</option>)}
+          {Object.entries(roleBindings.reduce<Record<string, any[]>>((acc, b) => {
+            (acc[b.gateway_name] = acc[b.gateway_name] || []).push(b);
+            return acc;
+          }, {})).sort(([a], [c]) => a.localeCompare(c)).map(([gw, list]) => (
+            <optgroup key={gw} label={gw}>
+              {list.map((b) => <option key={b.id} value={b.id}>{b.provider_model_id}</option>)}
+            </optgroup>
+          ))}
         </select>
       </Field>
       {agent && (
