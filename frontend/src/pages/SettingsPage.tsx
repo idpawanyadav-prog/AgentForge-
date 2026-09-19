@@ -1,5 +1,5 @@
 import React from 'react';
-import { get, post, patch, del, fmtDateTime, md } from '../api';
+import { get, post, put, patch, del, fmtDateTime, md } from '../api';
 import { Badge, Field, Modal, useAsyncData, ErrorNote } from '../components';
 
 export default function SettingsPage() {
