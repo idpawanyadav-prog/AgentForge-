@@ -25,29 +25,15 @@ export default function SettingsPage() {
         <PoBotCard gateways={gateways ?? []} onError={fail} />
       </div>
 
-      <ModelPlayground gateways={gateways ?? []} onError={fail} />
-
       <div className="section-title">Gateways</div>
       {(gateways ?? []).map((g) => (
         <GatewayCard key={g.id} gw={g} reload={reload} onError={fail} onEdit={() => setModal('editGw-' + g.id)} />
       ))}
       {!gateways?.length && <div className="empty">No gateways configured.</div>}
 
-      <div className="section-title">Audit trail (latest {Math.min(40, audit?.length ?? 0)})</div>
-      <div className="card">
-        {(audit ?? []).map((a) => (
-          <div key={a.audit_seq} className="event-item">
-            <span className={`event-dot ${/delete|cancel|fail/.test(a.action) ? 'dot-err' : /create|start/.test(a.action) ? 'dot-ok' : 'dot-info'}`} />
-            <div>
-              <div><span className="mono">{a.action}</span> — {a.summary}</div>
-              <div className="kv">{a.resource_type}{a.resource_id ? ` · ${a.resource_id.slice(0, 8)}` : ''} · by {a.actor_id}</div>
-            </div>
-            <span style={{ flex: 1 }} />
-            <span className="event-time">{fmtDateTime(a.created_at)}</span>
-          </div>
-        ))}
-        {!audit?.length && <div className="empty">No audit events yet.</div>}
-      </div>
+      <ModelPlayground gateways={gateways ?? []} onError={fail} />
+
+      <AuditTrail audit={audit ?? []} />
 
       {modal === 'newGateway' && (
         <GatewayForm onClose={() => setModal(null)} onSaved={() => { setModal(null); reload(); }} />
@@ -57,6 +43,40 @@ export default function SettingsPage() {
           onClose={() => setModal(null)} onSaved={() => { setModal(null); reload(); }} />
       )}
     </div>
+  );
+}
+
+function AuditTrail({ audit }: { audit: any[] }) {
+  const [open, setOpen] = React.useState(false);
+  return (
+    <>
+      <div className="spread" style={{ margin: '18px 0 8px' }}>
+        <button
+          className="section-title"
+          style={{ margin: 0, cursor: 'pointer', background: 'none', border: 'none', padding: 0, color: 'inherit', font: 'inherit' }}
+          onClick={() => setOpen((o) => !o)}
+          title={open ? 'Hide audit trail' : 'Show audit trail'}
+        >
+          {open ? '▾' : '▸'} Audit trail (latest {Math.min(40, audit.length)})
+        </button>
+      </div>
+      {open && (
+        <div className="card">
+          {audit.map((a) => (
+            <div key={a.audit_seq} className="event-item">
+              <span className={`event-dot ${/delete|cancel|fail/.test(a.action) ? 'dot-err' : /create|start/.test(a.action) ? 'dot-ok' : 'dot-info'}`} />
+              <div>
+                <div><span className="mono">{a.action}</span> — {a.summary}</div>
+                <div className="kv">{a.resource_type}{a.resource_id ? ` · ${a.resource_id.slice(0, 8)}` : ''} · by {a.actor_id}</div>
+              </div>
+              <span style={{ flex: 1 }} />
+              <span className="event-time">{fmtDateTime(a.created_at)}</span>
+            </div>
+          ))}
+          {!audit.length && <div className="empty">No audit events yet.</div>}
+        </div>
+      )}
+    </>
   );
 }
 
