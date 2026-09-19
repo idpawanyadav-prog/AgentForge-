@@ -510,6 +510,8 @@ def _execute_command(project_id, command, args) -> str:
             raw_roles = [a.strip() for a in re.split(r",| and ", raw_roles) if a.strip()]
         roles_requested = [str(r).strip() for r in raw_roles if str(r).strip()]
         project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+        if not project:
+            return "Project not found for this conversation."
         if not roles_requested:
             return "No roles given. Use `build team <name> with <role1>, <role2>, …`."
         args["name"] = str(args.get("name") or "").strip() or f"{project['name']} Team"
@@ -583,6 +585,36 @@ def _execute_command(project_id, command, args) -> str:
                 used_ids.add(aid)
                 staff.append(hired_agent)
                 hired.append(f"{name} ({role['name']})")
+        project_team = query_one("SELECT * FROM teams WHERE id = ?", (project["team_id"],)) if project["team_id"] else None
+        target = query_one("SELECT * FROM teams WHERE lower(name) = lower(?)", (str(args["name"]).strip(),))
+        if target is None and project_team is not None:
+            target = project_team  # staff the project's aligned team instead of creating a rival one
+        if target:
+            tid = target["id"]
+            member_ids = {r["agent_id"] for r in
+                          query("SELECT agent_id FROM team_agents WHERE team_id = ? AND active = 1", (tid,))}
+            added = [a["name"] for a in staff if a["id"] not in member_ids]
+            for a in staff:
+                execute("INSERT OR IGNORE INTO team_agents (team_id, agent_id, role_in_team, active) VALUES (?,?,?,1)",
+                        (tid, a["id"], "Member"))
+            audit("build_team", "team", tid,
+                  f"Added {len(added)} agent(s) to existing team '{target['name']}' — hired {len(hired)}")
+            notes = [f"Staffed existing team **{target['name']}** — no duplicate created."]
+            if hired:
+                notes.append("Hired new agents: " + ", ".join(hired) + ".")
+            if added:
+                notes.append("Added to the team: " + ", ".join(added) + ".")
+            if not added and not hired:
+                notes.append("All staffed agents were already on it.")
+            if project["team_id"] == tid:
+                pass  # already the project's aligned team
+            elif not project["team_id"]:
+                update("projects", project_id, {"team_id": tid, "updated_at": ts})
+                notes.append(f"Aligned **{project['name']}** to this team.")
+            else:
+                notes.append(f"Note: **{project['name']}** is currently aligned to **{project_team['name']}** — "
+                             "say `align this team to the project` to switch.")
+            return " ".join(notes)
         tid = new_id()
         insert("teams", {"id": tid, "name": args["name"], "description": "",
                          "status": "Active", "created_at": ts})
