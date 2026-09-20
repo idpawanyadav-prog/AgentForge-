@@ -45,7 +45,12 @@ export default function App() {
       .catch(() => undefined);
     get('/api/v1/projects')
       .then((ps: any[]) => {
-        if (ps.length) setActiveProject((prev) => prev ?? ps[0].id);
+        if (!ps.length) return;
+        // Only keep a saved project id if it still exists; otherwise fall
+        // back to the first project so a stale localStorage value (e.g.
+        // after a DB restore) can't leave the Control page polling a 404.
+        setActiveProject((prev) =>
+          prev && ps.some((p) => p.id === prev) ? prev : ps[0].id);
       })
       .catch(() => undefined);
   }, []);

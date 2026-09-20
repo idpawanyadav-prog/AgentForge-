@@ -7,10 +7,13 @@ audit events. Model inference is simulated with deterministic parsing so
 the demo works without provider credentials.
 """
 import json
+import logging
 import re
 
 from . import db, runtime, toolchains, po
 from .db import audit, execute, insert, new_id, now, query, query_one, update
+
+logger = logging.getLogger(__name__)
 
 HELP_TEXT = """I can execute these typed commands:
 
@@ -343,8 +346,8 @@ def _generate_role_kit(role) -> str:
                         "charter_md": parsed.get("CHARTER_MD") or kit["charter_md"],
                         "skills": [s for s in parsed.get("skills", []) if s.get("name")] or kit["skills"],
                     }
-            except Exception:
-                pass  # fall back to template kit
+            except Exception as exc:
+                logger.debug("LLM role kit enrichment failed; using template kit", exc_info=True)
 
         # Persona
         pid = new_id()
@@ -1563,47 +1566,13 @@ def _repair_json(chunk: str) -> str | None:
 
 
 def _call_llm(gw, model, system_prompt: str, user_text: str, max_tokens: int = 700) -> str:
-    """Live inference call to the configured gateway/model. Returns raw text."""
-    import urllib.error as _uerr
-    import urllib.request as _ureq
-
-    api_key = db.get_gateway_key(gw["id"])
-    if not api_key:
-        raise RuntimeError("No API key stored for the configured gateway. "
-                           "Open Settings, edit the gateway card and paste its key.")
-    base = gw["base_url"].rstrip("/")
-    is_anthropic = gw["api_type"] == "anthropic-messages"
-    if is_anthropic:
-        if base.endswith("/messages"):
-            url = base
-        elif base.endswith("/v1"):
-            url = base + "/messages"
-        else:
-            url = base + "/v1/messages"
-        payload = {"model": model["provider_model_id"], "max_tokens": max_tokens,
-                   "system": system_prompt,
-                   "messages": [{"role": "user", "content": user_text}]}
-        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                   "Content-Type": "application/json"}
-    else:
-        if "/v1" not in base:
-            base += "/v1"
-        url = base + "/chat/completions"
-        payload = {"model": model["provider_model_id"], "max_tokens": max_tokens,
-                   "messages": [{"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_text}]}
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    req = _ureq.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+    """Live inference call. Delegates to ``codegen.GatewayClient``."""
+    from .codegen import GatewayClient
     try:
-        with _ureq.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read())
-    except _uerr.HTTPError as e:
-        raise RuntimeError(f"Gateway returned HTTP {e.code}: {e.read().decode(errors='replace')[:200]}")
-    except Exception as exc:
-        raise RuntimeError(f"Could not reach gateway: {exc}")
-    if is_anthropic:
-        return "\n".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-    return data["choices"][0]["message"]["content"]
+        result = GatewayClient.call(gw, model, user_text, system_prompt, max_tokens=max_tokens)
+        return result["text"]
+    except RuntimeError:
+        raise
 
 
 def _ai_route(project_id: str, conversation_id: str, text: str) -> dict:

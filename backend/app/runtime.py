@@ -8,21 +8,64 @@ credentials.
 """
 import asyncio
 import json
+import logging
 import random
 import re
+import threading
+import time
 
 from . import db, workspace, codegen, toolchains, po, sprint_gate
+from . import config
 from .db import emit_event, execute, insert, now, new_id, query_one, query, update, audit
+
+logger = logging.getLogger(__name__)
 
 # run_id -> {"task": asyncio.Task, "paused": bool, "cancelled": bool}
 _registry: dict = {}
+# Locks guard dict mutations from concurrent sync/async callers.
+_registry_lock = threading.Lock()
 # project_id -> {"task": asyncio.Task, "cancelled": bool}
 _schedulers: dict = {}
+_schedulers_lock = threading.Lock()
+
+# Background task tracking for fire-and-forget coroutines.
+_background_tasks: set = set()
 
 TASK_STATUSES = ["Todo", "Ready", "In Progress", "Blocked", "Review", "Testing", "Done", "Cancelled"]
 AGENT_STATES = ["Idle", "Working", "Waiting", "Blocked", "Failed", "Paused", "Completed"]
 
+# Track last-seen LLM health to avoid retrying against a dead provider.
+_llm_healthy = True
+_llm_failure_count = 0
+_LLM_HEALTH_THRESHOLD = 3  # consecutive failures -> mark unhealthy
+_llm_health_lock = threading.Lock()
+
 _loop: asyncio.AbstractEventLoop | None = None
+
+# Concurrency guard for module-cache mutations.
+_module_cache_lock = threading.Lock()
+
+# Scheduler idle thresholds (rounds of 2-second sleeps before giving up).
+IDLE_GIVE_UP_BLOCKED = config.SCHEDULER_IDLE_GIVE_UP_BLOCKED
+IDLE_GIVE_UP_CLEAN = config.SCHEDULER_IDLE_GIVE_UP_CLEAN
+
+# Event retention is intentionally bounded per project. The scheduler checks
+# this periodically without adding another long-running background service.
+_EVENT_ARCHIVE_IDLE_INTERVAL = 30
+_DEFAULT_EVENT_KEEP = 10000
+
+
+def _sanitize_exception(exc: Exception) -> str:
+    """Extract a user-friendly message from an exception — first line only,
+    no stack traces, no internal file paths."""
+    msg = str(exc).strip()
+    # Take only the first line to avoid tracebacks / chained messages
+    msg = msg.splitlines()[0].strip()
+    # Strip common internal path prefixes
+    import re as _re
+    msg = _re.sub(r'(?:\\\\|/)[^\\\\/]*agent_forge[^\\\\/]*', "", msg, flags=_re.IGNORECASE)
+    msg = msg.strip(" :;-\\/")
+    return msg or "An unexpected error occurred"
 
 
 def set_loop(loop: asyncio.AbstractEventLoop):
@@ -33,11 +76,23 @@ def set_loop(loop: asyncio.AbstractEventLoop):
 
 def _spawn(coro):
     if _loop is not None and _loop.is_running():
-        return asyncio.run_coroutine_threadsafe(coro, _loop)
-    try:
-        return asyncio.get_running_loop().create_task(coro)
-    except RuntimeError:
-        return asyncio.get_event_loop().create_task(coro)
+        fut = asyncio.run_coroutine_threadsafe(coro, _loop)
+    else:
+        try:
+            fut = asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            fut = asyncio.get_event_loop().create_task(coro)
+    # Track background tasks so failures are not silently swallowed.
+    _background_tasks.add(fut)
+
+    def _on_done(f):
+        _background_tasks.discard(f)
+        exc = f.exception()
+        if exc is not None:
+            logger.error("Background task failed", exc_info=exc)
+
+    fut.add_done_callback(_on_done)
+    return fut
 
 # (step, activity, tools, next_task_status, progress)
 PHASES = [
@@ -67,13 +122,17 @@ _QA_ISSUES = [
 ]
 
 # After this many QA rejections the task is escalated to a human.
-MAX_REWORK_CYCLES = 2
+MAX_REWORK_CYCLES = config.MAX_REWORK_CYCLES
 
 # Dev self-test: when the dev's own build/tests fail, retry the
 # implementation this many times with the exact error as feedback before
 # the task is blocked for review. Code that still fails is NEVER handed
 # to QA — QA would just bounce back the same error.
-SELF_FIX_ATTEMPTS = 3
+SELF_FIX_ATTEMPTS = config.SELF_FIX_ATTEMPTS
+
+# Per-phase timeout (seconds). A hung LLM call or subprocess must not
+# block a workflow indefinitely.
+PHASE_TIMEOUT_S = config.PHASE_TIMEOUT_S
 
 
 def _emit(project_id, event_type, payload, **kw):
@@ -106,6 +165,33 @@ def active_run_for_agent(agent_id):
     return query_one(
         "SELECT * FROM workflow_runs WHERE agent_id = ? AND status IN ('Running','Paused','Queued')",
         (agent_id,))
+
+
+def mark_llm_healthy():
+    global _llm_healthy, _llm_failure_count
+    with _llm_health_lock:
+        _llm_failure_count = 0
+        _llm_healthy = True
+
+
+def mark_llm_failed():
+    global _llm_healthy, _llm_failure_count
+    with _llm_health_lock:
+        _llm_failure_count += 1
+        if _llm_failure_count >= _LLM_HEALTH_THRESHOLD:
+            _llm_healthy = False
+
+def is_llm_healthy() -> bool:
+    with _llm_health_lock:
+        return _llm_healthy
+
+
+def reset_llm_health():
+    """Call when the provider may have recovered (e.g. after a delay)."""
+    global _llm_healthy
+    with _llm_health_lock:
+        _llm_healthy = True
+        _llm_failure_count = 0
 
 
 def dependencies_satisfied(task_id) -> tuple[bool, list]:
@@ -168,13 +254,19 @@ def start_execution(project_id: str, task_id: str, idempotency_key: str | None =
     persona = query_one("SELECT * FROM personas WHERE id = ?", (agent["persona_id"],))
     binding = None
     model_name = "unknown"
+    input_cost_per_m = config.LLM_INPUT_COST_PER_M
+    output_cost_per_m = config.LLM_OUTPUT_COST_PER_M
     if agent["model_binding_id"]:
         binding = query_one(
-            "SELECT mb.*, gm.display_name AS model_name, gm.provider_model_id FROM model_bindings mb "
+            "SELECT mb.*, gm.display_name AS model_name, gm.provider_model_id, "
+            "gm.input_cost_per_m, gm.output_cost_per_m FROM model_bindings mb "
             "JOIN gateway_models gm ON gm.id = mb.model_id WHERE mb.id = ?",
             (agent["model_binding_id"],))
         if binding:
             model_name = binding["provider_model_id"]
+            if binding.get("input_cost_per_m"):
+                input_cost_per_m = binding["input_cost_per_m"]
+                output_cost_per_m = binding["output_cost_per_m"]
 
     qa_mode = _is_qa_run(task)
     run_id = new_id()
@@ -203,7 +295,10 @@ def start_execution(project_id: str, task_id: str, idempotency_key: str | None =
 
     ctrl = {"paused": False, "cancelled": False}
     handle = _spawn(_run_phases(run_id, ctrl, qa_mode))
-    _registry[run_id] = {**ctrl, "task": handle}
+    with _registry_lock:
+        _registry[run_id] = {**ctrl, "task": handle,
+                           "input_cost_per_m": input_cost_per_m,
+                           "output_cost_per_m": output_cost_per_m}
     return {"run": get_run(run_id)}
 
 
@@ -235,6 +330,7 @@ async def _run_phases(run_id: str, ctrl: dict, qa_mode: bool = False):
                 toolchains.failing_tests, "python", project["workspace_path"],
                 health_scope)
     except Exception:
+        logger.debug("baseline test detection failed for run %s; continuing without it", run_id, exc_info=True)
         baseline_failures = None
     try:
         for step, activity, tools, next_status, progress in phases:
@@ -404,20 +500,39 @@ async def _run_phases(run_id: str, ctrl: dict, qa_mode: bool = False):
                        "status": next_status, "progress": progress},
                       workflow_run_id=run_id, task_id=task_id)
 
-        await _wait_if_paused(run_id, ctrl, project_id, task_id, agent_id)
+        # Re-fetch task at this point — rework/fix cycles may have changed
+        # blocked_reason, rework_count, or status on the DB row.
         task = query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
-        in_tokens = llm_tokens["in"] or random.randint(1800, 5200)
-        out_tokens = llm_tokens["out"] or random.randint(600, 2400)
-        cost = round(in_tokens / 1_000_000 * 2.0 + out_tokens / 1_000_000 * 8.0, 4)
-        insert("usage_records", {
-            "id": new_id(), "workflow_run_id": run_id, "agent_id": agent_id,
-            "model": "gpt-4.1", "input_tokens": in_tokens, "output_tokens": out_tokens,
-            "cost_estimate": cost, "created_at": now(),
-        })
-        _emit(project_id, "usage.recorded",
-              {"run_id": run_id, "input_tokens": in_tokens,
-               "output_tokens": out_tokens, "cost_usd": cost},
-              workflow_run_id=run_id, agent_id=agent_id)
+        in_tokens = llm_tokens["in"]
+        out_tokens = llm_tokens["out"]
+        model_name = run.get("model_used") or "scaffold"
+        if not in_tokens and not out_tokens:
+            insert("usage_records", {
+                "id": new_id(), "workflow_run_id": run_id, "agent_id": agent_id,
+                "model": model_name, "input_tokens": 0, "output_tokens": 0,
+                "cost_estimate": 0.0, "created_at": now(),
+            })
+            _emit(project_id, "usage.recorded",
+                  {"run_id": run_id, "input_tokens": 0, "output_tokens": 0,
+                   "cost_usd": 0.0, "mode": "scaffold"},
+                  workflow_run_id=run_id, agent_id=agent_id)
+        else:
+            # Use model-specific cost rates (migration 002); fall back to
+            # global config defaults when the columns are still zero.
+            with _registry_lock:
+                reg = dict(_registry.get(run_id, {}))
+            in_cost = reg.get("input_cost_per_m") or config.LLM_INPUT_COST_PER_M
+            out_cost = reg.get("output_cost_per_m") or config.LLM_OUTPUT_COST_PER_M
+            cost = round(in_tokens / 1_000_000 * in_cost + out_tokens / 1_000_000 * out_cost, 4)
+            insert("usage_records", {
+                "id": new_id(), "workflow_run_id": run_id, "agent_id": agent_id,
+                "model": model_name, "input_tokens": in_tokens, "output_tokens": out_tokens,
+                "cost_estimate": cost, "created_at": now(),
+            })
+            _emit(project_id, "usage.recorded",
+                  {"run_id": run_id, "input_tokens": in_tokens,
+                   "output_tokens": out_tokens, "cost_usd": cost},
+                  workflow_run_id=run_id, agent_id=agent_id)
 
         if qa_mode:
             await _finish_qa_run(run_id, ctrl, project_id, task_id, agent_id, task,
@@ -443,22 +558,26 @@ async def _run_phases(run_id: str, ctrl: dict, qa_mode: bool = False):
         _set_agent(agent_id, "Idle", "", task_id=None, project_id=project_id)
         audit("cancel_execution", "workflow_run", run_id, "Execution cancelled")
     except Exception as exc:  # simulated failure path
+        friendly = _sanitize_exception(exc)
+        logger.error("Workflow run %s failed: %s", run_id, friendly, exc_info=True)
         update("workflow_runs", run_id, {"status": "Failed", "completed_at": now()})
         update("tasks", task_id, {"status": "Blocked",
-                                  "blocked_reason": f"Execution failed: {exc}",
+                                  "blocked_reason": friendly,
+                                  "blocked_detail": f"{type(exc).__name__}: {str(exc)}",
                                   "updated_at": now()})
         _emit(project_id, "workflow.failed",
-              {"run_id": run_id, "error": str(exc), "recoverable": True},
+              {"run_id": run_id, "error": friendly, "recoverable": True},
               workflow_run_id=run_id, task_id=task_id)
         _emit(project_id, "task.status_changed",
-              {"task_id": task_id, "status": "Blocked", "blocked_reason": str(exc)},
+              {"task_id": task_id, "status": "Blocked", "blocked_reason": friendly},
               workflow_run_id=run_id, task_id=task_id)
         _set_agent(agent_id, "Failed", f"Failed: {task['title']}", task_id=task_id, project_id=project_id)
         await asyncio.sleep(1.2)
         _set_agent(agent_id, "Idle", "", task_id=None, project_id=project_id)
-        audit("execution_failed", "workflow_run", run_id, str(exc))
+        audit("execution_failed", "workflow_run", run_id, friendly)
     finally:
-        _registry.pop(run_id, None)
+        with _registry_lock:
+            _registry.pop(run_id, None)
 
 
 async def _finish_dev_selftest_failed(run_id, project_id, task_id, agent_id, task,
@@ -501,8 +620,9 @@ async def _finish_dev_selftest_failed(run_id, project_id, task_id, agent_id, tas
                     f"The task '{task['title']}' repeatedly failed its build/test check "
                     f"({test_summary[:200]}). Decide: rewrite or re-scope the task, reassign "
                     "it to another developer, or cancel it and note why.")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("PO review after dev self-test failure failed for project %s: %s",
+                               project_id, exc)
         _spawn(_po_review())
 
 
@@ -647,8 +767,8 @@ async def _finish_qa_run(run_id, ctrl, project_id, task_id, agent_id, task,
             async def _po_review():
                 try:
                     await asyncio.to_thread(po.po_autonomy_tick, project_id)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("PO review failed for project %s: %s", project_id, exc)
             _spawn(_po_review())
     else:
         update("tasks", task_id, {"status": "Rework",
@@ -824,8 +944,9 @@ async def _run_sprint(project_id: str, ctrl: dict):
                                         "unlocked (Ready). If backlog items or requirements "
                                         "remain, plan and start the next sprint; if the project "
                                         "is done, take no action and summarize completion.")
-                                except Exception:
-                                    pass
+                                except Exception as exc:
+                                    logger.warning("PO next-sprint tick failed for project %s: %s",
+                                                   project_id, exc)
                             _spawn(_po_next_sprint())
                         break
                     if outcome == "Failed":
@@ -853,27 +974,35 @@ async def _run_sprint(project_id: str, ctrl: dict):
             # with no progress at all. With the Product Owner enabled, the PO
             # periodically reviews and unblocks/replans, so the loop persists
             # much longer instead of surfacing to a human.
+            blocked = 0
             auto_assign_tasks(project_id)
             idle_rounds += 1
             if po.po_enabled(project_id):
                 if idle_rounds % 10 == 0:
                     try:
                         await asyncio.to_thread(po.po_autonomy_tick, project_id)
-                    except Exception:
-                        pass
-                blocked = query(
-                    "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? "
-                    "AND sprint_id IS NOT NULL AND status = 'Blocked'",
-                    (project_id,))[0]["n"]
-                # Blocked work = unfinished business: keep persisting while
-                # the PO reviews it (each review may re-scope and unblock it).
-                give_up_after = 60 if blocked else 600
+                    except Exception as exc:
+                        logger.warning("PO autonomy tick failed for project %s: %s",
+                                       project_id, exc)
+                    blocked = query(
+                        "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? "
+                        "AND sprint_id IS NOT NULL AND status = 'Blocked'",
+                        (project_id,))[0]["n"]
+                    # Blocked work = unfinished business: keep persisting while
+                    # the PO reviews it (each review may re-scope and unblock it).
+                    give_up_after = (IDLE_GIVE_UP_BLOCKED if blocked
+                                     else IDLE_GIVE_UP_CLEAN)
             else:
-                give_up_after = 60
+                give_up_after = IDLE_GIVE_UP_BLOCKED
             if idle_rounds > give_up_after:
                 _emit(project_id, "project.updated",
-                      {"note": "No eligible tasks: blocked/waiting items remain",
-                       "remaining_tasks": remaining})
+                      {"note": (f"Scheduler gave up — no eligible tasks for "
+                                f"{idle_rounds} rounds (threshold {give_up_after}). "
+                                "Tasks may be blocked or the PO may need to replan."),
+                       "remaining_tasks": remaining,
+                       "reason": "idle_no_eligible_tasks",
+                       "blocked": blocked if po.po_enabled(project_id) else None,
+                       "give_up_after": give_up_after})
                 break
             await asyncio.sleep(2.0)
             continue
@@ -897,7 +1026,21 @@ async def _run_sprint(project_id: str, ctrl: dict):
                 continue
             started_agents.add(task["assigned_agent_id"])
         await asyncio.sleep(1.0)
-    _schedulers.pop(project_id, None)
+
+        # Periodic event archive (issue 4.4): every N rounds the scheduler
+        # is alive, prune execution_events beyond the keep_count threshold so
+        # the events table stays bounded during long sprints.
+        if idle_rounds and idle_rounds % _EVENT_ARCHIVE_IDLE_INTERVAL == 0:
+            try:
+                removed = db.archive_old_events(project_id, keep_count=_DEFAULT_EVENT_KEEP)
+                if removed:
+                    logger.info("Archived %d execution events for project %s",
+                                removed, project_id)
+            except Exception as exc:
+                logger.debug("Event archive failed for project %s: %s",
+                             project_id, exc)
+    with _schedulers_lock:
+        _schedulers.pop(project_id, None)
 
 
 def _active_project_runs(project_id) -> int:
@@ -1017,9 +1160,10 @@ def _agent_load(agent_id):
 def auto_assign_tasks(project_id: str) -> dict:
     """Assign unassigned sprint tasks to team members, matching role keywords
     in the task title/description first, then least-loaded as fallback.
-    Work spreads across ALL idle agents: each task in one pass goes to a
-    distinct idle member, and busy agents are never queued — the loop
-    retries in the next round instead."""
+
+    Work spreads across ALL idle agents. Tasks whose specialist is busy are
+    placed on a pending queue and re-checked in the next assignment round
+    instead of being skipped forever."""
     sprint = query_one("SELECT * FROM sprints WHERE project_id = ? AND status = 'Active'", (project_id,))
     if not sprint:
         return {"assigned": 0, "note": "No active sprint"}
@@ -1036,11 +1180,14 @@ def auto_assign_tasks(project_id: str) -> dict:
     # for the rest of this pass so several idle devs get work in one round.
     avail = [dict(m) for m in members]
     assigned = 0
+    pending = []
     for t in tasks:
         family = _family_for_task(t)
         pick, matched = _pick_member(avail, family)
         if not pick or pick["lifecycle_state"] != "Idle":
-            continue  # busy specialist: leave for the next round, never queue
+            # Specialist is busy; queue for next round rather than skipping forever
+            pending.append(t)
+            continue
         update("tasks", t["id"], {"assigned_agent_id": pick["id"], "updated_at": now()})
         pick["lifecycle_state"] = "Working"  # reflected for the remaining tasks
         note = "" if matched else f" (no {_FAMILY_LABEL.get(family, 'matching')} specialist on the team)"
@@ -1050,7 +1197,10 @@ def auto_assign_tasks(project_id: str) -> dict:
                     "note": note.strip(), "auto": True},
                    task_id=t["id"], agent_id=pick["id"])
         assigned += 1
-    return {"assigned": assigned, "note": ""}
+    if pending:
+        logger.debug("%d task(s) pending assignment (specialist busy) for project %s",
+                     len(pending), project_id)
+    return {"assigned": assigned, "note": "", "pending": len(pending)}
 
 
 def _resolve_sprint(project_id: str, sprint_ref):
@@ -1148,8 +1298,9 @@ def start_sprint_execution(project_id: str, sprint_ref=None):
         if not planned:
             return {"error": "No sprint to start — create one first (e.g. say \"create a sprint\")"}
         sprint = planned
-    if project_id in _schedulers:
-        return {"error": "Sprint execution already running"}
+    with _schedulers_lock:
+        if project_id in _schedulers:
+            return {"error": "Sprint execution already running"}
 
     # RULE 1: only one active sprint per project. Another sprint that is
     # active or moving through gates blocks activation outright — no silent
@@ -1207,7 +1358,8 @@ def start_sprint_execution(project_id: str, sprint_ref=None):
               {"sprint": sprint["name"], "note": "Sprint activated by start command"})
     assign = auto_assign_tasks(project_id)
     ctrl = {"cancelled": False}
-    _schedulers[project_id] = ctrl  # same dict the loop watches, so stop works
+    with _schedulers_lock:
+        _schedulers[project_id] = ctrl  # same dict the loop watches, so stop works
     handle = _spawn(_run_sprint(project_id, ctrl))
     ctrl["task"] = handle
     return {"ok": True, "sprint": sprint["name"], "auto_assigned": assign["assigned"],
@@ -1215,13 +1367,15 @@ def start_sprint_execution(project_id: str, sprint_ref=None):
 
 
 def stop_sprint_execution(project_id: str):
-    ctrl = _schedulers.get(project_id)
+    with _schedulers_lock:
+        ctrl = _schedulers.get(project_id)
     if ctrl:
         ctrl["cancelled"] = True
-    for run_id, rc in list(_registry.items()):
-        run = get_run(run_id)
-        if run and run["project_id"] == project_id:
-            rc["cancelled"] = True
+    with _registry_lock:
+        for run_id, rc in list(_registry.items()):
+            run = get_run(run_id)
+            if run and run["project_id"] == project_id:
+                rc["cancelled"] = True
     return {"ok": True}
 
 
@@ -1245,3 +1399,26 @@ def recover_orphans():
     for agent in query("SELECT * FROM agents WHERE lifecycle_state NOT IN ('Idle')"):
         update("agents", agent["id"], {"lifecycle_state": "Idle", "current_activity": "",
                                        "current_task_id": None, "updated_at": now()})
+
+    # Resume sprints stuck mid-gate: after a service restart the gate pipeline
+    # is the one piece of work the in-process scheduler was responsible for.
+    # Mark it as recovered and let the runtime scheduler pick it up so the
+    # validation phases actually complete instead of staying frozen at
+    # "Development Complete" / "Functional Validation" / etc.
+    for sprint in query(
+        "SELECT * FROM sprints WHERE status IN "
+        "(?, ?, ?, ?, ?) AND project_id IS NOT NULL",
+        ("Development Complete", "Build Validation", "Automated Testing",
+         "Functional Validation", "Sprint Acceptance")):
+        pid = sprint["project_id"]
+        if not pid:
+            continue
+        logger.info("Recovering mid-gate sprint %s (%s) for project %s",
+                    sprint["name"], sprint["status"], pid)
+        # Kick off a fresh scheduler — start_sprint_execution is idempotent
+        # for already-active sprints (it resumes the gate pipeline).
+        try:
+            start_sprint_execution(pid, sprint["id"])
+        except Exception as exc:
+            logger.error("Failed to resume mid-gate sprint %s: %s",
+                         sprint["name"], exc)

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import time
 
-from . import codegen, toolchains
+from . import codegen, toolchains, config
 from .db import (audit, emit_event, execute, insert, new_id, now, query,
                  query_one, update)
 
@@ -65,9 +65,7 @@ ALLOWED_TRANSITIONS = {
 GATE_COLUMNS = ("development_status", "build_status", "test_status",
                 "functional_status", "acceptance_status")
 
-# A sprint is Failed (needs human/PO resolution) after this many failed
-# gate cycles (spec §35: no infinite automatic retries).
-MAX_GATE_CYCLES = 3
+MAX_GATE_CYCLES = config.MAX_GATE_CYCLES
 
 GATE_LABELS = {"development_status": "Development", "build_status": "Build",
                "test_status": "Tests", "functional_status": "Functional",
@@ -286,10 +284,14 @@ def _gate_failed(project, sprint_id: str, gate_column: str, reason: str,
     """A gate failed: sprint -> Rework -> Active with rework tasks, or
     -> Failed after MAX_GATE_CYCLES (spec §34/§35)."""
     sprint = query_one("SELECT * FROM sprints WHERE id = ?", (sprint_id,))
+    # The current cycle's gate execution is already recorded as 'Failed' by
+    # the caller (_finish_gate_exec runs before _gate_failed), so this count
+    # includes it. Do NOT add +1 here — that would double-count the current
+    # failure and cap the sprint one cycle early.
     prior_failures = query_one(
         "SELECT COUNT(*) AS n FROM sprint_gate_executions "
         "WHERE sprint_id = ? AND status = 'Failed'", (sprint_id,))["n"]
-    cycle = prior_failures + 1
+    cycle = prior_failures
     update("sprints", sprint_id, {"failure_reason": reason[:400]})
     _emit_gate(project["id"], sprint["name"], GATE_LABELS[gate_column], "Failed", reason)
 

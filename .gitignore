@@ -8,6 +8,10 @@ venv/
 *.db
 *.db-wal
 *.db-shm
+*.db.corrupt.bak
+
+# Windows reserved device-name artifact (zero-byte, never commit)
+NUL
 
 # Node
 node_modules/

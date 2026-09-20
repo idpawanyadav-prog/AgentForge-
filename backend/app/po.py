@@ -12,11 +12,14 @@ The user talks to the PO through a dedicated chat (with file attachments);
 disabling the toggle hands control back and leaves every open task untouched.
 """
 import json
+import logging
 import os
 import threading
 
-from . import db, workspace, runtime, toolchains, sprint_gate
+from . import db, workspace, runtime, toolchains, sprint_gate, config
 from .db import audit, emit_event, execute, insert, new_id, now, query, query_one, update
+
+logger = logging.getLogger(__name__)
 
 PO_ROLE = "Product Owner"
 PO_CONV_TITLE = "Product Owner"
@@ -567,6 +570,7 @@ def _apply_actions(project_id: str, actions) -> list[str]:
             else:
                 log.append(f"Unknown action '{act}' ignored.")
         except Exception as exc:  # one bad action must not kill the whole review
+            logger.exception("PO action '%s' failed for project %s", act, project_id)
             log.append(f"Action '{act}' failed: {exc}")
     return log
 
@@ -608,7 +612,6 @@ def _po_llm(project_id: str):
     cfg_raw = query_one("SELECT value FROM settings WHERE key = 'po_bot'")
     if cfg_raw and cfg_raw["value"]:
         try:
-            import json as _json
             cfg = _json.loads(cfg_raw["value"])
             if cfg.get("gateway_id") and cfg.get("model_id"):
                 gw = query_one("SELECT * FROM gateways WHERE id = ?", (cfg["gateway_id"],))
@@ -616,7 +619,7 @@ def _po_llm(project_id: str):
                 if gw and model:
                     return gw, model
         except ValueError:
-            pass
+            logger.warning("Failed to parse po_bot settings")
     project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     gw, model = (None, None)
     if project:
@@ -694,7 +697,7 @@ def _save_attachments(project_id: str, attachments) -> list[dict]:
                               "content": content[:_MAX_ATTACHMENT_CHARS]})
                 continue
             except OSError:
-                pass
+                logger.warning("Failed to save attachment %s for project %s", name, project_id)
         saved.append({"name": name, "path": None, "content": content[:_MAX_ATTACHMENT_CHARS]})
     return saved
 
@@ -719,6 +722,7 @@ def handle_po_message(project_id: str, text: str, attachments=None) -> dict:
     try:
         parsed = _ask_po(project_id, "\n\n".join(prompt_parts))
     except Exception as exc:
+        logger.exception("PO message handling failed for project %s", project_id)
         reply = (f"⚠️ I could not act right now: {exc}. Your message and any files are saved; "
                  "try again once the gateway is reachable.")
     if parsed:
@@ -754,6 +758,7 @@ def po_autonomy_tick(project_id: str, instruction: str | None = None,
     try:
         parsed = _ask_po(project_id, ask)
     except Exception as exc:
+        logger.warning("PO autonomy tick failed for project %s: %s", project_id, exc)
         emit_event(project_id, "po.review", {"ok": False, "error": str(exc)[:300]})
         return None
     if not parsed:

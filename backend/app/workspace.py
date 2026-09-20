@@ -64,6 +64,40 @@ def safe_dir_name(name: str) -> str:
     return cleaned or "project"
 
 
+def validate_workspace_path(path: str | None) -> str | None:
+    """Validate an explicit workspace path for a project.
+
+    Returns an error message string when the path is unusable, otherwise
+    ``None``. Empty/blank paths are always valid (the caller falls back to
+    the default location under the workspace root).
+
+    Guards against the failure modes called out in the code review:
+    a misconfigured path that points at a filesystem root, a read-only
+    directory, or a location that cannot be created — each of which would
+    otherwise fail silently during code generation.
+    """
+    path = (path or "").strip()
+    if not path:
+        return None
+    abs_path = os.path.abspath(path)
+    # Reject filesystem roots (e.g. "C:\\", "/") — nothing should be
+    # generated directly into a drive root.
+    parent = os.path.dirname(abs_path)
+    if abs_path == parent:
+        return f"workspace_path '{path}' is a filesystem root — choose a subdirectory"
+    try:
+        if os.path.isdir(abs_path):
+            if not os.access(abs_path, os.W_OK):
+                return f"workspace_path '{path}' is not writable"
+            return None
+        # Confirm the directory tree is actually creatable (and writable)
+        # before the project starts writing deliverables into it.
+        os.makedirs(abs_path, exist_ok=True)
+        return None
+    except OSError as exc:
+        return f"workspace_path '{path}' could not be created: {exc}"
+
+
 def get_workspace(project_id: str) -> str | None:
     row = query_one("SELECT workspace_path FROM projects WHERE id = ?", (project_id,))
     if row and row["workspace_path"] and os.path.isdir(row["workspace_path"]):

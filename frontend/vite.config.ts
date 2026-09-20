@@ -10,5 +10,9 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
+    sourcemap: true, // separate .map files for production builds
+  },
+  esbuild: {
+    sourcemap: 'inline', // inline source maps for dev builds
   },
 });

@@ -1,3 +1,22 @@
+/**
+ * List endpoints return a paginated envelope `{ total, items, limit, offset }`
+ * while the rest of the app consumes plain arrays. Unwrap that envelope here
+ * so every consumer keeps working without touching each call site. Anything
+ * that is not an envelope (plain arrays, single objects, summaries) passes
+ * through unchanged.
+ */
+function unwrapEnvelope<T>(data: unknown): unknown {
+  if (
+    data &&
+    typeof data === 'object' &&
+    !Array.isArray(data) &&
+    Array.isArray((data as any).items)
+  ) {
+    return (data as any).items as T;
+  }
+  return data as T;
+}
+
 export async function api<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const res = await fetch(path, {
     ...options,
@@ -14,7 +33,7 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
     } catch { /* ignore */ }
     throw new Error(String(detail));
   }
-  return res.json();
+  return unwrapEnvelope(await res.json()) as T;
 }
 
 export const get = <T = any>(path: string) => api<T>(path);

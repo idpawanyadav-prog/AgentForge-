@@ -5,14 +5,18 @@ For production deployments the spec calls for PostgreSQL; the data-access
 layer is intentionally simple SQL so it can be swapped later.
 """
 import json
+import logging
 import os
 import sqlite3
 import threading
-import time
 import uuid
 from datetime import datetime, timezone
 
-DB_PATH = os.environ.get("AGENT_OFFICE_DB", os.path.join(os.path.dirname(__file__), "..", "agent_office.db"))
+from . import config
+
+logger = logging.getLogger(__name__)
+
+DB_PATH = config.DB_PATH
 
 _local = threading.local()
 
@@ -22,9 +26,14 @@ def get_db() -> sqlite3.Connection:
     if conn is None:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
         conn.row_factory = sqlite3.Row
+        # WAL mode: concurrent readers do not block writers, dramatically
+        # better throughput for the runtime that writes events while the API
+        # serves poll requests on the same connection pool.
         conn.execute("PRAGMA journal_mode=WAL")
+        # 5s busy timeout: SQLite will wait this long for the lock to clear
+        # before raising — no app-level retry storm needed.
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=15000")
         _local.conn = conn
     return conn
 
@@ -51,19 +60,23 @@ def query_one(sql: str, params=()):
 
 
 def execute(sql: str, params=()):
+    """Execute and commit. ``busy_timeout`` handles concurrent locks; we only
+    retry twice for transient OperationalError cases (e.g. disk-full races)."""
     db = get_db()
     last_exc = None
-    for attempt in range(5):
+    for attempt in range(2):
         try:
             cur = db.execute(sql, params)
             db.commit()
             return cur
         except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+            msg = str(exc).lower()
+            if "locked" not in msg and "busy" not in msg:
                 raise
             last_exc = exc
-            time.sleep(0.3 * (attempt + 1))
-    raise last_exc
+    if last_exc:
+        raise last_exc
+    return None
 
 
 def insert(table: str, values: dict) -> str:
@@ -289,6 +302,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   progress INTEGER NOT NULL DEFAULT 0,
   evidence TEXT NOT NULL DEFAULT '',
   blocked_reason TEXT NOT NULL DEFAULT '',
+  blocked_detail TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -407,7 +421,7 @@ def audit(action: str, resource_type: str, resource_id=None, summary: str = "", 
 
 
 def emit_event(project_id: str, event_type: str, payload: dict, *,
-               workflow_run_id=None, agent_run_id=None, task_id=None, agent_id=None) -> int:
+               workflow_run_id=None, agent_run_id=None, task_id=None, agent_id=None) -> str:
     return insert("execution_events", {
         "project_id": project_id,
         "workflow_run_id": workflow_run_id,
@@ -513,10 +527,17 @@ CREATE TABLE IF NOT EXISTS persona_version_seed_marker (id TEXT PRIMARY KEY);
 """
 
 
-def init_db():
-    db = get_db()
-    db.executescript(SCHEMA)
-    # lightweight column migrations for databases created before a column existed
+def _legacy_column_migrations():
+    """Safety net for databases created before the migrations system — add
+    columns that were originally added inline by the old init_db(). New
+    deployments go through the migrations package and skip this path.
+
+    Because ``CREATE TABLE IF NOT EXISTS`` in migration 001 does not alter
+    tables that already existed under an older inline schema, this function
+    must also backfill any columns the migration system expects but that an
+    old database is missing (each guarded by a PRAGMA check so it is safe to
+    run on every startup).
+    """
     cols = {r["name"] for r in query("PRAGMA table_info(gateways)")}
     if "api_key_enc" not in cols:
         execute("ALTER TABLE gateways ADD COLUMN api_key_enc TEXT")
@@ -525,15 +546,21 @@ def init_db():
         execute("ALTER TABLE tasks ADD COLUMN qa_agent_id TEXT REFERENCES agents(id)")
     if "rework_count" not in task_cols:
         execute("ALTER TABLE tasks ADD COLUMN rework_count INTEGER NOT NULL DEFAULT 0")
+    if "blocked_detail" not in task_cols:
+        execute("ALTER TABLE tasks ADD COLUMN blocked_detail TEXT NOT NULL DEFAULT ''")
     instr_cols = {r["name"] for r in query("PRAGMA table_info(instruction_files)")}
     if "active" not in instr_cols:
         execute("ALTER TABLE instruction_files ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
     proj_cols = {r["name"] for r in query("PRAGMA table_info(projects)")}
     if "po_enabled" not in proj_cols:
         execute("ALTER TABLE projects ADD COLUMN po_enabled INTEGER NOT NULL DEFAULT 0")
-    # Sprint gating: gate status columns on pre-existing sprints.
+    # Sprint-gate columns: older databases created the sprints table before
+    # the gating system added the five gate status columns plus failure
+    # reason and start/complete timestamps. Without them, sprint_gate_summary
+    # raises KeyError and the control summary endpoint 500s for any project
+    # with an active sprint.
     sprint_cols = {r["name"] for r in query("PRAGMA table_info(sprints)")}
-    for col, ddl in (
+    _sprint_additions = (
         ("development_status", "TEXT NOT NULL DEFAULT 'Pending'"),
         ("build_status", "TEXT NOT NULL DEFAULT 'Pending'"),
         ("test_status", "TEXT NOT NULL DEFAULT 'Pending'"),
@@ -542,9 +569,98 @@ def init_db():
         ("failure_reason", "TEXT NOT NULL DEFAULT ''"),
         ("started_at", "TEXT"),
         ("completed_at", "TEXT"),
-    ):
-        if col not in sprint_cols:
-            execute(f"ALTER TABLE sprints ADD COLUMN {col} {ddl}")
+    )
+    for name, decl in _sprint_additions:
+        if name not in sprint_cols:
+            execute(f"ALTER TABLE sprints ADD COLUMN {name} {decl}")
+
+
+def archive_old_events(project_id: str, keep_count: int = 10000) -> int:
+    """Delete execution_events beyond the keep_count most recent for a project.
+
+    Called periodically by the runtime scheduler so the events table doesn't
+    grow unbounded across long-running sprints. Returns rows deleted.
+    """
+    # SQLite supports DELETE with subquery — keep the highest seq values.
+    cur = execute(
+        "DELETE FROM execution_events WHERE project_id = ? AND seq NOT IN "
+        "(SELECT seq FROM execution_events WHERE project_id = ? "
+        " ORDER BY seq DESC LIMIT ?)",
+        (project_id, project_id, keep_count))
+    return cur.rowcount or 0
+
+
+def _ensure_idempotency_table():
+    """Create the idempotency_keys table if it does not exist yet.
+
+    Defined here (rather than only in migration 001) so databases that were
+    migrated before the table was introduced still get it on startup.
+    """
+    execute(
+        "CREATE TABLE IF NOT EXISTS idempotency_keys ("
+        "  idempotency_key TEXT PRIMARY KEY,"
+        "  endpoint TEXT NOT NULL,"
+        "  response_body TEXT NOT NULL,"
+        "  status_code INTEGER NOT NULL,"
+        "  created_at TEXT NOT NULL"
+        ")"
+    )
+
+
+def idempotent_get(key: str, endpoint: str) -> dict | None:
+    """Return a stored idempotent response for (key, endpoint), else None."""
+    row = query_one(
+        "SELECT response_body, status_code FROM idempotency_keys "
+        "WHERE idempotency_key = ? AND endpoint = ?", (key, endpoint))
+    if not row:
+        return None
+    try:
+        return {"body": json.loads(row["response_body"]), "status_code": row["status_code"]}
+    except (json.JSONDecodeError, TypeError):
+        return {"body": None, "status_code": row["status_code"]}
+
+
+def idempotent_store(key: str, endpoint: str, body, status_code: int = 200):
+    insert("idempotency_keys", {
+        "idempotency_key": key, "endpoint": endpoint,
+        "response_body": json.dumps(body), "status_code": status_code,
+        "created_at": now(),
+    })
+
+
+def run_idempotent(key: str | None, endpoint: str, producer):
+    """Execute ``producer()`` once per (key, endpoint).
+
+    When ``key`` is provided and was used before for ``endpoint``, the stored
+    response is returned instead of re-running the producer — this makes
+    client retries of create endpoints safe from duplicate creation.
+    """
+    if not key:
+        return producer()
+    existing = idempotent_get(key, endpoint)
+    if existing is not None:
+        return existing["body"]
+    body = producer()
+    idempotent_store(key, endpoint, body)
+    return body
+
+
+def init_db():
+    """Apply pending migrations, then seed default content.
+
+    On a fresh database this runs every migration in order. On an existing
+    database the schema_version table records the highest version already
+    applied; only newer migrations run. Legacy column additions for very
+    old databases are kept as a safety net so they keep working.
+    """
+    db = get_db()
+    # Run the migrations system first (creates schema_version table and any
+    # pending migrations).
+    from .schema_migrations import run_migrations
+    run_migrations()
+    # Legacy column additions for DBs created before the migrations system.
+    _legacy_column_migrations()
+    _ensure_idempotency_table()
     db.commit()
     seed_if_empty()
     seed_instruction_files()
@@ -570,7 +686,8 @@ def get_gateway_key(gateway_id: str) -> str | None:
         return None
     try:
         return _secrets.decrypt(row["api_key_enc"])
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed to decrypt gateway key for %s: %s", gateway_id, exc)
         return None
 
 

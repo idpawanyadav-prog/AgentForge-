@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 import shutil
+import threading
 
 from .db import query_one
 
@@ -271,6 +272,7 @@ _SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "
 
 # (ws_dir, stack) -> modules already verified to resolve (or installed)
 _MODULE_CACHE: dict[tuple, set] = {}
+_module_cache_lock = threading.Lock()
 
 
 def _workspace_imports(ws_dir: str, stack: str) -> list[str]:
@@ -368,7 +370,6 @@ def check_modules(ws_dir: str | None, stack: str) -> dict:
     if not ws_dir or not os.path.isdir(ws_dir):
         return {"ok": False, "missing": [], "installed": [], "output": "workspace missing"}
     if stack not in ("python", "node"):
-        # go modules / nuget packages resolve through their own build tools
         return {"ok": True, "missing": [], "installed": [],
                 "output": f"no pre-flight needed for {stack}"}
     key = (ws_dir, stack)
@@ -378,12 +379,14 @@ def check_modules(ws_dir: str | None, stack: str) -> dict:
         return {"ok": True, "missing": [], "installed": [], "output": "all modules resolve"}
     missing = _probe_missing(ws_dir, stack, mods)
     if not missing:
-        cached.update(mods)
+        with _module_cache_lock:
+            cached.update(mods)
         return {"ok": True, "missing": [], "installed": [], "output": "all modules resolve"}
     names = [_PIP_NAME.get(m, m) for m in missing] if stack == "python" else missing
     res = lib_install(ws_dir, names, stack)
     if res.get("ok"):
-        cached.update(missing)
+        with _module_cache_lock:
+            cached.update(missing)
         return {"ok": True, "missing": missing, "installed": missing,
                 "output": res.get("output", "")}
     return {"ok": False, "missing": missing, "installed": [],
