@@ -234,6 +234,41 @@ CREATE TABLE IF NOT EXISTS sprints (
   end_at TEXT,
   capacity INTEGER NOT NULL DEFAULT 40,
   status TEXT NOT NULL DEFAULT 'Planned',
+  development_status TEXT NOT NULL DEFAULT 'Pending',
+  build_status TEXT NOT NULL DEFAULT 'Pending',
+  test_status TEXT NOT NULL DEFAULT 'Pending',
+  functional_status TEXT NOT NULL DEFAULT 'Pending',
+  acceptance_status TEXT NOT NULL DEFAULT 'Pending',
+  failure_reason TEXT NOT NULL DEFAULT '',
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sprint_gate_executions (
+  id TEXT PRIMARY KEY,
+  sprint_id TEXT NOT NULL REFERENCES sprints(id),
+  gate_type TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'Pending',
+  started_at TEXT,
+  completed_at TEXT,
+  duration_ms INTEGER,
+  executed_by TEXT NOT NULL DEFAULT 'sprint-engine',
+  error_message TEXT NOT NULL DEFAULT '',
+  result_summary TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sprint_acceptance_criteria (
+  id TEXT PRIMARY KEY,
+  sprint_id TEXT NOT NULL REFERENCES sprints(id),
+  code TEXT NOT NULL,
+  description TEXT NOT NULL,
+  required INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'Pending',
+  result TEXT NOT NULL DEFAULT '',
+  failure_reason TEXT NOT NULL DEFAULT '',
+  validated_at TEXT,
   created_at TEXT NOT NULL
 );
 
@@ -496,10 +531,25 @@ def init_db():
     proj_cols = {r["name"] for r in query("PRAGMA table_info(projects)")}
     if "po_enabled" not in proj_cols:
         execute("ALTER TABLE projects ADD COLUMN po_enabled INTEGER NOT NULL DEFAULT 0")
+    # Sprint gating: gate status columns on pre-existing sprints.
+    sprint_cols = {r["name"] for r in query("PRAGMA table_info(sprints)")}
+    for col, ddl in (
+        ("development_status", "TEXT NOT NULL DEFAULT 'Pending'"),
+        ("build_status", "TEXT NOT NULL DEFAULT 'Pending'"),
+        ("test_status", "TEXT NOT NULL DEFAULT 'Pending'"),
+        ("functional_status", "TEXT NOT NULL DEFAULT 'Pending'"),
+        ("acceptance_status", "TEXT NOT NULL DEFAULT 'Pending'"),
+        ("failure_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("started_at", "TEXT"),
+        ("completed_at", "TEXT"),
+    ):
+        if col not in sprint_cols:
+            execute(f"ALTER TABLE sprints ADD COLUMN {col} {ddl}")
     db.commit()
     seed_if_empty()
     seed_instruction_files()
     ensure_product_owner()
+    ensure_junior_developer()
 
 
 def _mask(key_value: str) -> str:
@@ -534,6 +584,10 @@ def seed_instruction_files():
                  "# Coding Standards for Senior Developers\n\n## General Principles\n- Write clean, maintainable, and well-documented code\n- Follow SOLID principles\n- Prefer simplicity over cleverness\n- Ensure test coverage for critical logic\n\n## Error Handling\n- Implement proper error handling\n- Use structured logging\n- Provide meaningful error messages\n\n## Performance\n- Optimize for readability first, then performance\n- Avoid premature optimization\n- Use profiling tools for bottlenecks"),
                 ("code-review.md", "Code review guidelines and checklist",
                  "# Code Review Guidelines\n\n## Checklist\n- Correctness: does the change do what it claims?\n- Tests: are new paths covered by meaningful assertions?\n- Security: no secrets, no injection risks, no unsafe deserialization\n- Readability: clear names, small functions, helpful comments\n\n## Etiquette\n- Review within one business day\n- Comment on code, never on people"),
+            ],
+            "Junior Developer": [
+                ("helpers-playbook.md", "How to grow the shared reusable helpers file",
+                 "# Junior Developer Playbook\n\n## Mission\n- One shared helpers file per project, owned by you\n- Every helper is small, typed, easy to build and easy to reuse\n\n## Rules\n- Before writing anything, check whether a helper already exists\n- Repeated boilerplate becomes a helper — the next agent calls it instead of regenerating it\n- Fewer regenerated lines means fewer tokens spent per task\n- One concern per function; no speculative features"),
             ],
             "Solution Architect": [
                 ("architecture-guidelines.md", "System design and architecture guidelines",
@@ -659,6 +713,93 @@ def ensure_product_owner():
                                       "settings_json": json.dumps({"temperature": 0.3}), "active": 1})
 
 
+def ensure_junior_developer():
+    """Idempotently guarantee the Junior Developer role and — per the team
+    charter — one Junior Developer agent on EVERY team. The Jr Dev owns the
+    shared reusable helpers file: small, easy-to-build functions that
+    teammates call instead of regenerating boilerplate, which keeps the
+    code (and therefore token usage) per task down."""
+    ts = now()
+    role = query_one("SELECT * FROM roles WHERE lower(name) = lower('Junior Developer')")
+    if not role:
+        rid = new_id()
+        insert("roles", {"id": rid, "name": "Junior Developer",
+                         "description": "Builds small reusable helper functions in the shared helpers "
+                                        "file so teammates generate less code and fewer tokens.",
+                         "active": 1, "created_at": ts, "updated_at": ts})
+        role = query_one("SELECT * FROM roles WHERE id = ?", (rid,))
+        audit("seed_jr_dev_role", "role", rid, "Seeded Junior Developer role")
+    rid = role["id"]
+
+    if not query_one("SELECT id FROM instruction_files WHERE role_id = ?", (rid,)):
+        insert("instruction_files", {
+            "id": new_id(), "role_id": rid, "filename": "helpers-playbook.md",
+            "description": "How to grow the shared reusable helpers file",
+            "content": ("# Junior Developer Playbook\n\n## Mission\n- One shared helpers file per project, "
+                        "owned by you\n- Every helper is small, typed, easy to build and easy to reuse\n\n"
+                        "## Rules\n- Before writing anything, check whether a helper already exists\n"
+                        "- Repeated boilerplate becomes a helper — the next agent calls it instead of "
+                        "regenerating it\n- Fewer regenerated lines means fewer tokens spent per task\n"
+                        "- One concern per function; no speculative features"),
+            "version": 1, "created_at": ts, "updated_at": ts,
+        })
+
+    persona = query_one("SELECT * FROM personas WHERE role_id = ? ORDER BY created_at LIMIT 1", (rid,))
+    if not persona:
+        pid = new_id()
+        instr = ("You are the Junior Developer. Your job is small, easy-to-build reusable functions: keep "
+                 "the shared helpers file growing so teammates call helpers instead of re-implementing "
+                 "them — less generated code, fewer tokens. Keep every function tiny, typed and tested.")
+        insert("personas", {"id": pid, "role_id": rid, "name": "Helper Builder",
+                            "description": "Turns repeated boilerplate into tiny reusable helpers.",
+                            "instructions": instr,
+                            "constraints_text": "Never duplicate a helper that already exists. No clever one-liners.",
+                            "version": 1, "active": 1, "created_at": ts, "updated_at": ts})
+        insert("persona_versions", {"id": new_id(), "persona_id": pid, "version": 1,
+                                    "instructions": instr,
+                                    "constraints_text": "Never duplicate a helper that already exists.",
+                                    "checksum": checksum(instr), "created_at": ts})
+        persona = query_one("SELECT * FROM personas WHERE id = ?", (pid,))
+        audit("seed_jr_dev_persona", "persona", pid, "Seeded Junior Developer persona 'Helper Builder'")
+
+    binding = query_one("SELECT id FROM model_bindings WHERE role_id = ? AND active = 1", (rid,))
+    if not binding:
+        gw = query_one("SELECT id FROM gateways WHERE status = 'Active' ORDER BY created_at LIMIT 1")
+        model = query_one(
+            "SELECT id FROM gateway_models WHERE gateway_id = ? AND active = 1 "
+            "AND provider_model_id LIKE '%mini%' LIMIT 1", (gw["id"],)) if gw else None
+        if not model and gw:
+            model = query_one("SELECT id FROM gateway_models WHERE gateway_id = ? AND active = 1 LIMIT 1",
+                              (gw["id"],))
+        if gw and model:
+            insert("model_bindings", {"id": (bid := new_id()), "role_id": rid, "gateway_id": gw["id"],
+                                      "model_id": model["id"],
+                                      "settings_json": json.dumps({"temperature": 0.2}), "active": 1})
+            binding = query_one("SELECT id FROM model_bindings WHERE id = ?", (bid,))
+
+    # One Junior Developer per team, on every team that lacks one.
+    for team in query("SELECT * FROM teams ORDER BY created_at"):
+        has_jr = query_one(
+            "SELECT ta.agent_id FROM team_agents ta JOIN agents a ON a.id = ta.agent_id "
+            "JOIN roles r ON r.id = a.role_id "
+            "WHERE ta.team_id = ? AND ta.active = 1 AND lower(r.name) = lower('Junior Developer') "
+            "LIMIT 1", (team["id"],))
+        if has_jr:
+            continue
+        n = query_one("SELECT COUNT(*) AS n FROM agents a JOIN roles r ON r.id = a.role_id "
+                      "WHERE lower(r.name) = lower('Junior Developer')")["n"]
+        name = "Pip" if n == 0 else f"Pip {n + 1}"
+        aid = new_id()
+        insert("agents", {"id": aid, "name": name, "role_id": rid, "persona_id": persona["id"],
+                          "model_binding_id": binding["id"] if binding else None,
+                          "lifecycle_state": "Idle", "current_activity": "",
+                          "created_at": ts, "updated_at": ts})
+        execute("INSERT INTO team_agents (team_id, agent_id, role_in_team, active) VALUES (?,?,?,1)",
+                (team["id"], aid, "Shared Helpers"))
+        audit("seed_jr_dev_agent", "agent", aid,
+              f"Added Junior Developer '{name}' to team '{team['name']}' (owns the shared helpers file)")
+
+
 def seed_if_empty():
     if query_one("SELECT value FROM settings WHERE key = 'seeded'"):
         return
@@ -705,6 +846,8 @@ def seed_if_empty():
         ("Business Analyst", "Elicits requirements, writes backlog items and acceptance criteria."),
         ("Solution Architect", "Designs system architecture, selects patterns and tech stack."),
         ("Senior Developer", "Implements features, writes production-quality code and tests."),
+        ("Junior Developer", "Builds small reusable helper functions in the shared helpers "
+                             "file so teammates generate less code and fewer tokens."),
         ("QA Engineer", "Designs test plans, validates acceptance criteria, reports defects."),
         ("DevOps Engineer", "Manages build, deployment pipelines and infrastructure."),
     ]
@@ -743,6 +886,11 @@ def seed_if_empty():
         ("Senior Developer", "Lead Coder", "Ships clean, tested code.",
          "You are a Senior Developer. Write small, typed, well-tested modules. Follow the project's existing conventions.",
          "No secrets in code. No untested public functions.", ["python-coding", "unit-testing"]),
+        ("Junior Developer", "Helper Builder", "Turns repeated boilerplate into tiny reusable helpers.",
+         "You are the Junior Developer. Your job is small, easy-to-build reusable functions: keep the shared "
+         "helpers file growing so teammates call helpers instead of re-implementing them — less generated "
+         "code, fewer tokens. Keep every function tiny, typed and tested.",
+         "Never duplicate a helper that already exists. No clever one-liners.", ["python-coding"]),
         ("QA Engineer", "Quality Gatekeeper", "Breaks it before users do.",
          "You are a QA Engineer. Design risk-based test plans and verify each acceptance criterion explicitly.",
          "Never mark an item done with a failing criterion.", ["unit-testing", "code-review"]),
@@ -772,6 +920,7 @@ def seed_if_empty():
         "Business Analyst": "gpt-4.1-mini",
         "Solution Architect": "gpt-4.1",
         "Senior Developer": "gpt-4.1",
+        "Junior Developer": "gpt-4.1-mini",
         "QA Engineer": "gpt-4.1-mini",
         "DevOps Engineer": "gpt-4.1-mini",
     }
@@ -788,7 +937,8 @@ def seed_if_empty():
     # --- Agents ---
     agent_defs = [
         ("Ava", "Business Analyst"), ("Rex", "Solution Architect"),
-        ("Nova", "Senior Developer"), ("Iris", "QA Engineer"), ("Bolt", "DevOps Engineer"),
+        ("Nova", "Senior Developer"), ("Pip", "Junior Developer"),
+        ("Iris", "QA Engineer"), ("Bolt", "DevOps Engineer"),
     ]
     agent_ids = {}
     for aname, role_name in agent_defs:
@@ -809,6 +959,7 @@ def seed_if_empty():
     for role_name, role_in_team in [("Business Analyst", "Requirements"),
                                     ("Solution Architect", "Design"),
                                     ("Senior Developer", "Implementation"),
+                                    ("Junior Developer", "Shared Helpers"),
                                     ("QA Engineer", "Quality"),
                                     ("DevOps Engineer", "Operations")]:
         execute("INSERT INTO team_agents (team_id, agent_id, role_in_team, active) VALUES (?,?,?,1)",

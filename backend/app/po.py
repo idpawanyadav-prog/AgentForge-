@@ -15,7 +15,7 @@ import json
 import os
 import threading
 
-from . import db, workspace, runtime, toolchains
+from . import db, workspace, runtime, toolchains, sprint_gate
 from .db import audit, emit_event, execute, insert, new_id, now, query, query_one, update
 
 PO_ROLE = "Product Owner"
@@ -61,6 +61,12 @@ Rules:
 - Task titles must match real work: development tasks go to developers, QA tasks to QA agents,
   architecture to the Solution Architect. Use "assign_task" only when the default role-based
   assignment is wrong.
+- SPRINT GATING: only one sprint runs at a time. The next sprint stays LOCKED until the current
+  one completes all gates (build, tests, functional validation, acceptance). Never plan work
+  into a future sprint to work around this — the current sprint must finish first.
+- Urgent scope MAY be added to the current active sprint at any time (even mid-validation):
+  use add_task with the current sprint — the sprint re-opens for development automatically
+  and gates re-run after the new work completes. Non-urgent scope waits for the next sprint.
 - Unblock escalated tasks when the fix is obvious (rework, small defect) — say so in the reply.
 - Missing-dependency blockers are yours to fix: install the library yourself, never mark the
   task Done or cancel it because of ModuleNotFoundError.
@@ -195,6 +201,10 @@ def set_po_enabled(project_id: str, enabled: bool) -> dict:
                         "All open tasks remain as they are."})
     audit("po_disabled", "project", project_id,
           f"Product Owner authority disabled for project '{project['name']}'")
+    po_narrate(project_id,
+               "Product Owner authority disabled — control is back with you. All existing "
+               "tasks remain open exactly as they are; say stop sprint execution if you "
+               "also want the run halted.")
     return {"ok": True, "enabled": False}
 
 
@@ -215,6 +225,13 @@ def _project_brief(project_id: str, focus_blockers: bool = False) -> str:
     sprints = query("SELECT * FROM sprints WHERE project_id = ? ORDER BY created_at", (project_id,))
     for s in sprints:
         lines.append(f"SPRINT: {s['name']} [{s['status']}] capacity {s['capacity']} — goal: {s['goal'] or 'n/a'}")
+        if s["status"] in sprint_gate.ACTIVE_OR_GATING:
+            gates = ", ".join(f"{sprint_gate.GATE_LABELS[c]}={s[c]}"
+                              for c in sprint_gate.GATE_COLUMNS)
+            lines.append(f"  GATES: {gates}"
+                         + (f" — FAILURE: {s['failure_reason'][:120]}" if s["failure_reason"] else ""))
+        elif s["status"] == sprint_gate.PLANNED and sprint_gate.active_sprint(project_id):
+            lines.append("  (LOCKED — the current sprint must complete before this one can start)")
         tasks = query(
             "SELECT t.*, a.name AS agent_name, qa.name AS qa_name FROM tasks t "
             "LEFT JOIN agents a ON a.id = t.assigned_agent_id "
@@ -410,9 +427,7 @@ def _apply_actions(project_id: str, actions) -> list[str]:
                             sprint = s
                             break
                 if not sprint:
-                    sprint = query_one(
-                        "SELECT * FROM sprints WHERE project_id = ? AND status = 'Active' ORDER BY created_at DESC",
-                        (project_id,))
+                    sprint = sprint_gate.active_sprint(project_id)
                 if not sprint:
                     log.append(f"Could not add task '{title}': no sprint to put it in.")
                     continue
@@ -424,6 +439,18 @@ def _apply_actions(project_id: str, actions) -> list[str]:
                                  "status": "Todo", "created_at": ts, "updated_at": ts})
                 log.append(f"Added task '{title}' to sprint '{sprint['name']}'.")
                 emit_event(project_id, "po.action", {"action": "add_task", "task": title})
+                # Sprint gating: adding work to the ACTIVE sprint mid-gates
+                # re-opens development (urgent scope); gates re-run after the
+                # new work drains. Future sprints stay locked.
+                if sprint["status"] in sprint_gate.GATE_PHASES + (sprint_gate.REWORK,):
+                    rok, rerr = sprint_gate.reopen_sprint_for_scope(
+                        sprint["id"], f"urgent task '{title[:60]}' added by Product Owner")
+                    if rok:
+                        log.append(f"Sprint '{sprint['name']}' re-opened for the urgent task — "
+                                   "validation gates will re-run after it completes.")
+                        emit_event(project_id, "project.updated",
+                                   {"note": f"Urgent task '{title[:60]}' re-opened sprint "
+                                            f"'{sprint['name']}' mid-validation"})
             elif act == "update_task":
                 t = _resolve_task(project_id, a.get("task"))
                 if not t:
@@ -542,6 +569,31 @@ def _apply_actions(project_id: str, actions) -> list[str]:
         except Exception as exc:  # one bad action must not kill the whole review
             log.append(f"Action '{act}' failed: {exc}")
     return log
+
+
+def _ensure_delivery_running(project_id: str, stop_requested: bool = False) -> str | None:
+    """After PO actions add or change work, make sure the delivery loop is
+    actually running. The loop may have exited earlier (the project looked
+    complete, or it gave up while idle), which would leave newly added tasks
+    sitting unexecuted until the owner toggled the PO off/on."""
+    if stop_requested or not po_enabled(project_id):
+        return None
+    if project_id in runtime._schedulers:
+        return None
+    open_work = query_one(
+        "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND sprint_id IS NOT NULL "
+        "AND status NOT IN ('Done','Cancelled')", (project_id,))["n"]
+    if not open_work:
+        return None
+    result = runtime.start_sprint_execution(project_id)
+    if "error" in result:
+        return f"Could not resume sprint execution: {result['error']}"
+    return f"Resumed sprint execution on '{result['sprint']}' — the new work will run now."
+
+
+def _stop_requested(actions) -> bool:
+    return any(isinstance(a, dict) and str(a.get("action") or "").strip() == "stop_sprint"
+               for a in (actions or []))
 
 
 # ---------------------------------------------------------------- LLM plumbing
@@ -672,6 +724,9 @@ def handle_po_message(project_id: str, text: str, attachments=None) -> dict:
     if parsed:
         reply = str(parsed.get("reply") or "").strip() or "Noted."
         actions = _apply_actions(project_id, parsed.get("actions"))
+        resumed = _ensure_delivery_running(project_id, _stop_requested(parsed.get("actions")))
+        if resumed:
+            actions.append(resumed)
     elif not reply:
         reply = ("My decision model is not configured (or returned no usable plan). Set the "
                  "project gateway key under Settings and resend — your message and any files are "
@@ -708,6 +763,9 @@ def po_autonomy_tick(project_id: str, instruction: str | None = None,
                                               "(check gateway key / usage quota under Settings)"})
         return None
     actions = _apply_actions(project_id, parsed.get("actions"))
+    resumed = _ensure_delivery_running(project_id, _stop_requested(parsed.get("actions")))
+    if resumed:
+        actions.append(resumed)
     summary = str(parsed.get("reply") or "").strip()
     emit_event(project_id, "po.review",
                {"ok": True, "summary": summary[:400],

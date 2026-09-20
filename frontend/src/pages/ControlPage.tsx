@@ -14,8 +14,15 @@ interface TaskRow {
   agent_name: string | null; dependencies: { id: string; title: string; status: string }[];
   unmet_dependencies: any[]; blocked_reason: string; evidence: string;
 }
+interface SprintGateSummary {
+  sprint_id: string; sprint: string; status: string; failure_reason: string;
+  gates: { gate: string; status: string }[];
+  acceptance_criteria: { code: string; description: string; required: number; status: string; result: string; failure_reason: string }[];
+}
 interface Summary {
   project: any; agents: AgentRow[]; sprint: any; sprint_tasks: TaskRow[];
+  sprint_gates?: SprintGateSummary | null;
+  next_locked_sprint?: { id: string; name: string; status: string } | null;
   events: EventRow[]; usage: any; active_runs: any[]; backlog_count: number; scheduler_running: boolean;
   po?: { has_po: boolean; po_enabled: boolean; agent_name: string | null };
 }
@@ -30,8 +37,12 @@ function eventColor(t: string): string {
 const TASK_ICON: Record<string, string> = {
   'Done': '✅', 'In Progress': '🔄', 'Review': '🔍', 'Testing': '🧪',
   'Ready': '🟡', 'Todo': '⏳', 'Blocked': '⛔', 'Cancelled': '✖️',
+  'Waiting QA': '🧫', 'Rework': '🔁',
 };
 const taskIcon = (s: string) => TASK_ICON[s] ?? '⏳';
+
+const TASK_STATUSES = ['Todo', 'Ready', 'In Progress', 'Testing', 'Review',
+  'Waiting QA', 'Rework', 'Blocked', 'Done', 'Cancelled'];
 
 const loadUi = (key: string, fallback: string) => {
   try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
@@ -66,8 +77,62 @@ function eventText(e: EventRow): string {
     case 'po.action': return `👑 PO: ${p.action}${p.task ? ` — ${p.task}` : ''}${p.agent ? ` → ${p.agent}` : ''}${p.count ? ` (${p.count})` : ''}`;
     case 'sprint.tasks_drafted': return `Auto-drafted ${p.tasks?.length ?? 0} task(s) for "${p.sprint}"`;
     case 'sprint.activated': return `Sprint "${p.sprint}" activated`;
+    case 'sprint.status.changed': return `Sprint "${p.sprint}" → ${p.status}${p.reason ? ` (${p.reason})` : ''}`;
+    case 'sprint.gate.changed': return `${p.sprint} — ${p.gate} gate: ${p.status}${p.summary ? ` (${String(p.summary).slice(0, 80)})` : ''}`;
+    case 'sprint.unlocked': return `🔓 Sprint "${p.sprint}" unlocked (next sprint ready)`;
+    case 'task.blocked_by_sprint_gate': return `⛔ Task "${p.task}" blocked by sprint gate: ${p.reason}`;
+    case 'agent.status.changed': return p.activity ? `${p.agent}: ${p.activity}` : `${p.agent}: ${p.state}`;
     default: return e.event_type;
   }
+}
+
+const GATE_ICON: Record<string, string> = {
+  'Passed': '✅', 'Failed': '❌', 'Running': '🔄', 'Pending': '⏳',
+};
+const SPRINT_STATUS_ICON: Record<string, string> = {
+  'Planned': '📝', 'Ready': '🔓', 'Active': '🟢',
+  'Development Complete': '🔧', 'Build Validation': '🏗️', 'Automated Testing': '🧪',
+  'Functional Validation': '🧫', 'Sprint Acceptance': '📋', 'Rework': '🔁',
+  'Completed': '✅', 'Failed': '⛔', 'Cancelled': '✖️',
+};
+
+function SprintGatePanel({ s }: { s: Summary | null }) {
+  const g = s?.sprint_gates;
+  const next = s?.next_locked_sprint;
+  if (!g) return null;
+  const acs = g.acceptance_criteria ?? [];
+  const passedAcs = acs.filter((a) => a.status === 'Passed').length;
+  return (
+    <div className="sprint-gate" style={{ marginBottom: 12 }}>
+      <div className="spread" style={{ marginBottom: 6 }}>
+        <b style={{ fontSize: 13 }}>🚧 SPRINT GATE — {g.sprint}</b>
+        <Badge kind={g.status === 'Completed' ? 'ok' : g.status === 'Failed' ? 'err' : 'info'}>
+          {SPRINT_STATUS_ICON[g.status] ?? ''} {g.status}
+        </Badge>
+      </div>
+      <div className="gate-list">
+        {g.gates.map((gate) => (
+          <div key={gate.gate} className="gate-item">
+            <span>{GATE_ICON[gate.status] ?? '⏳'} {gate.gate}</span>
+            <span className={`gate-status gate-${gate.status.toLowerCase()}`}>{gate.status}</span>
+          </div>
+        ))}
+      </div>
+      {acs.length > 0 && (
+        <div className="small muted" style={{ marginTop: 6 }}>
+          Acceptance criteria: {passedAcs}/{acs.length} passed
+        </div>
+      )}
+      {g.failure_reason && (
+        <div className="small" style={{ color: 'var(--err)', marginTop: 6 }}>⛔ {g.failure_reason}</div>
+      )}
+      {next && (
+        <div className="small muted" style={{ marginTop: 6 }}>
+          🔒 {next.name} locked — waiting for {g.sprint} to complete
+        </div>
+      )}
+    </div>
+  );
 }
 
 export default function ControlPage({ activeProject, setActiveProject }: { activeProject: string | null; setActiveProject: (id: string) => void }) {
@@ -84,6 +149,27 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
   const [sprints, setSprints] = React.useState<any[]>([]);
   const [selectedSprint, setSelectedSprint] = React.useState<string>('');
   const [sprintTasks, setSprintTasks] = React.useState<TaskRow[]>([]);
+  // Sprint task status filter (multi-select). Empty set = show all.
+  const [statusFilter, setStatusFilter] = React.useState<Set<string>>(() => {
+    try {
+      const saved = localStorage.getItem('ao.statusFilter');
+      const arr = saved ? JSON.parse(saved) : null;
+      return Array.isArray(arr) && arr.length ? new Set(arr) : new Set(TASK_STATUSES);
+    } catch { return new Set(TASK_STATUSES); }
+  });
+  React.useEffect(() => {
+    try { localStorage.setItem('ao.statusFilter', JSON.stringify([...statusFilter])); } catch { /* private mode */ }
+  }, [statusFilter]);
+  const toggleStatusFilter = (st: string) => {
+    setStatusFilter((prev) => {
+      const next = new Set(prev);
+      if (next.has(st)) next.delete(st); else next.add(st);
+      return next.size ? next : new Set(TASK_STATUSES); // never filter to nothing
+    });
+  };
+  const filteredSprintTasks = statusFilter.size === TASK_STATUSES.length
+    ? sprintTasks
+    : sprintTasks.filter((t) => statusFilter.has(t.status));
   // Chat windowing: show only the most recent messages; older ones load in
   // batches of 12 via the "Load previous chat history" button.
   const [visibleMsgs, setVisibleMsgs] = React.useState(12);
@@ -378,13 +464,14 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
           <span style={{ flex: 1 }} />
           {s?.po?.has_po && (
             <button
-              className={`btn small ${s.po.po_enabled ? 'danger' : 'primary'}`}
+              className={`btn small ${s.po.po_enabled ? 'primary po-on' : ''}`}
               onClick={togglePo}
               title={s.po.po_enabled
                 ? 'Product Owner authority is ON — click to disable and take back control'
                 : `Enable ${s.po.agent_name} (Product Owner) to run this project autonomously`}
             >
               🤖 Product Owner: {s.po.po_enabled ? 'On' : 'Off'}
+              {s.po.po_enabled && <span className="live-dot po-live-dot" style={{ marginLeft: 6 }} title="PO authority active" />}
             </button>
           )}
           {s?.po?.has_po && (
@@ -583,18 +670,33 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
 
               {tab === 'tasks' && (
                 <>
+                  <SprintGatePanel s={s} />
                   <div className="row" style={{ marginBottom: 10, gap: 8 }}>
                     <select style={{ flex: 1 }} value={selectedSprint}
                       onChange={(e) => { userPickedSprint.current = true; setSelectedSprint(e.target.value); }}>
                       <option value="">— select sprint —</option>
                       {sprints.map((sp) => (
                         <option key={sp.id} value={sp.id}>
-                          {sp.name} · {sp.status} · {sp.committed_points ?? 0}/{sp.capacity} pts
+                          {SPRINT_STATUS_ICON[sp.status] ?? '📝'} {sp.name} · {sp.status} · {sp.committed_points ?? 0}/{sp.capacity} pts
                         </option>
                       ))}
                     </select>
                   </div>
-                  {sprintTasks.map((t) => (
+                  <div className="row" style={{ marginBottom: 10, flexWrap: 'wrap', gap: 6 }}>
+                    {TASK_STATUSES.map((st) => {
+                      const n = sprintTasks.filter((t) => t.status === st).length;
+                      if (!n) return null;
+                      const on = statusFilter.has(st);
+                      return (
+                        <button key={st} title={on ? `Hide ${st} tasks` : `Show ${st} tasks`}
+                          className={`chip ${on ? 'chip-on' : ''}`}
+                          onClick={() => toggleStatusFilter(st)}>
+                          {taskIcon(st)} {st} · {n}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {filteredSprintTasks.map((t) => (
                     <div key={t.id} className="task-row">
                       <div className="spread">
                         <b style={{ fontSize: 13 }}>{taskIcon(t.status)} {t.title}</b>
@@ -629,6 +731,9 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
                     <div className="empty">
                       {selectedSprint ? 'No tasks committed to this sprint.' : 'No sprints yet. Plan one on the Projects page.'}
                     </div>
+                  )}
+                  {!!sprintTasks.length && !filteredSprintTasks.length && (
+                    <div className="empty">No tasks match the status filter — tap a status chip above to widen it.</div>
                   )}
                 </>
               )}

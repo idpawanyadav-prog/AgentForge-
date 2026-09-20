@@ -1,8 +1,9 @@
-"""Windowless AgentForge server launcher.
+"""AgentForge server launcher.
 
-Run with pythonw.exe (no console) from start.bat. Logging goes to
-server.log in the repo root; stderr/stdout are never touched, so the
-server survives console/window closing.
+start.bat runs this with python.exe in a visible console window so server
+logs are live on screen; it can also run windowless with pythonw.exe.
+Logging always goes to server.log in the repo root, and additionally to
+the console when one is attached (python.exe).
 """
 import logging
 import os
@@ -17,10 +18,13 @@ sys.path.insert(0, HERE)
 os.environ.setdefault("AGENT_OFFICE_WORKSPACES",
                       os.path.join(os.path.expanduser("~"), ".verdent", "agentforge-projects"))
 
+handlers = [logging.FileHandler(os.path.join(os.path.dirname(HERE), "server.log"))]
+if sys.stderr is not None:
+    handlers.append(logging.StreamHandler(sys.stderr))
 logging.basicConfig(
-    filename=os.path.join(os.path.dirname(HERE), "server.log"),
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=handlers,
 )
 
 import uvicorn  # noqa: E402

@@ -10,7 +10,10 @@ summary containing the exact install hint, and the chat copilot offers an
 approval-gated install (`install dotnet toolchain` -> winget).
 """
 
+import ast
+import json
 import os
+import re
 import subprocess
 import sys
 import shutil
@@ -238,6 +241,155 @@ def _lib_env(ws_dir: str | None) -> dict:
     return env
 
 
+# ------------------------------------------------------------ module pre-flight
+#
+# Before an agent uses a module (build, boot, tests), verify every import
+# in the workspace actually resolves in the project environment. Whatever
+# is missing is installed into <workspace>/lib/ (and linked back in) BEFORE
+# the run starts, so a missing dependency never surfaces as a build/test
+# failure the dev agent cannot fix.
+
+# import name -> pip package name (only where they differ)
+_PIP_NAME = {
+    "PIL": "Pillow", "cv2": "opencv-python", "yaml": "PyYAML", "sklearn": "scikit-learn",
+    "bs4": "beautifulsoup4", "dotenv": "python-dotenv", "dateutil": "python-dateutil",
+    "jwt": "PyJWT", "Crypto": "pycryptodome", "OpenSSL": "pyOpenSSL", "socks": "PySocks",
+    "docx": "python-docx", "pptx": "python-pptx", "fitz": "PyMuPDF", "magic": "python-magic",
+    "github": "PyGithub", "attr": "attrs", "matplotlib": "matplotlib",
+}
+
+_NODE_BUILTINS = {
+    "assert", "buffer", "child_process", "cluster", "console", "constants", "crypto",
+    "dgram", "dns", "domain", "events", "fs", "http", "http2", "https", "inspector",
+    "module", "net", "os", "path", "perf_hooks", "process", "punycode", "querystring",
+    "readline", "repl", "stream", "string_decoder", "timers", "tls", "tty", "url",
+    "util", "v8", "vm", "worker_threads",
+}
+
+_SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv", "lib",
+              "_quarantine"}
+
+# (ws_dir, stack) -> modules already verified to resolve (or installed)
+_MODULE_CACHE: dict[tuple, set] = {}
+
+
+def _workspace_imports(ws_dir: str, stack: str) -> list[str]:
+    """Top-level module names imported by project source files (dependency
+    folders like .venv/node_modules/lib are excluded — only the code the
+    agents wrote is scanned). Python uses ast.parse, so docstrings and
+    comments never produce false imports."""
+    names: set[str] = set()
+    for root, dirs, files in os.walk(ws_dir):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        for f in files:
+            if stack == "python" and not f.endswith(".py"):
+                continue
+            if stack == "node" and not f.endswith((".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx")):
+                continue
+            try:
+                with open(os.path.join(root, f), encoding="utf-8", errors="replace") as fh:
+                    src = fh.read()
+            except OSError:
+                continue
+            if stack == "python":
+                try:
+                    tree = ast.parse(src)
+                except SyntaxError:
+                    continue  # the build check reports syntax errors separately
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        for a in node.names:
+                            names.add(a.name.split(".")[0])
+                    elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                        names.add(node.module.split(".")[0])
+            else:
+                # strip line comments so "// require('x')" never matches
+                src = re.sub(r"^\s*//.*$", "", src, flags=re.M)
+                names.update(re.findall(r"require\(\s*['\"]([^'\"]+)['\"]\s*\)", src))
+                names.update(re.findall(
+                    r"import\s+(?:[\w*{},\s]+\s+from\s+)?['\"]([^'\"]+)['\"]", src))
+    if stack == "node":
+        # normalize: strip subpaths, drop relative/alias/builtin specifiers
+        roots = set()
+        for n in names:
+            if n.startswith(("node:", ".", "/", "@/")):
+                continue
+            if n.startswith("@"):
+                parts = n.split("/")
+                roots.add("/".join(parts[:2]))  # @scope/pkg
+            else:
+                roots.add(n.split("/")[0])
+        names = {n for n in roots if n.split("/")[0].split("@")[-1] not in _NODE_BUILTINS}
+    return sorted(names)
+
+
+def _probe_missing(ws_dir: str, stack: str, mods: list[str]) -> list[str]:
+    """Which of `mods` fail to resolve in the project environment (same
+    interpreter/env as the build check, lib/ linked in). One subprocess."""
+    if not mods:
+        return []
+    try:
+        if stack == "python":
+            py = project_python(ws_dir) or sys.executable
+            code = ("import importlib.util, json, sys\n"
+                    "missing = []\n"
+                    "for m in sys.argv[1:]:\n"
+                    "    try:\n"
+                    "        if importlib.util.find_spec(m) is None:\n"
+                    "            missing.append(m)\n"
+                    "    except Exception:\n"
+                    "        pass\n"
+                    "print(json.dumps(missing))\n")
+            proc = subprocess.run([py, "-c", code, *mods], cwd=ws_dir, capture_output=True,
+                                  text=True, timeout=120,
+                                  env={**os.environ, **_lib_env(ws_dir)},
+                                  encoding="utf-8", errors="replace")
+        else:  # node
+            node = shutil.which("node")
+            if not node:
+                return []
+            script = ("const mods = process.argv.slice(1); const missing = []; "
+                      "for (const m of mods) { try { require.resolve(m); } "
+                      "catch { missing.push(m); } } console.log(JSON.stringify(missing));")
+            proc = subprocess.run([node, "-e", script, *mods], cwd=ws_dir, capture_output=True,
+                                  text=True, timeout=120,
+                                  env={**os.environ, **_lib_env(ws_dir)},
+                                  encoding="utf-8", errors="replace")
+        return json.loads((proc.stdout or "").strip() or "[]")
+    except Exception:
+        return []  # probe failure must not break the run; the build check reports
+
+
+def check_modules(ws_dir: str | None, stack: str) -> dict:
+    """Pre-flight dependency check: verify every workspace import resolves
+    in the project environment; install missing modules into the project
+    lib/ folder (linked via PYTHONPATH/NODE_PATH) before they are used.
+    Cached per workspace, so repeat checks only probe new imports."""
+    if not ws_dir or not os.path.isdir(ws_dir):
+        return {"ok": False, "missing": [], "installed": [], "output": "workspace missing"}
+    if stack not in ("python", "node"):
+        # go modules / nuget packages resolve through their own build tools
+        return {"ok": True, "missing": [], "installed": [],
+                "output": f"no pre-flight needed for {stack}"}
+    key = (ws_dir, stack)
+    cached = _MODULE_CACHE.setdefault(key, set())
+    mods = [m for m in _workspace_imports(ws_dir, stack) if m not in cached]
+    if not mods:
+        return {"ok": True, "missing": [], "installed": [], "output": "all modules resolve"}
+    missing = _probe_missing(ws_dir, stack, mods)
+    if not missing:
+        cached.update(mods)
+        return {"ok": True, "missing": [], "installed": [], "output": "all modules resolve"}
+    names = [_PIP_NAME.get(m, m) for m in missing] if stack == "python" else missing
+    res = lib_install(ws_dir, names, stack)
+    if res.get("ok"):
+        cached.update(missing)
+        return {"ok": True, "missing": missing, "installed": missing,
+                "output": res.get("output", "")}
+    return {"ok": False, "missing": missing, "installed": [],
+            "output": (res.get("output") or "")[-400:]}
+
+
 def ensure_project_env(ws_dir: str | None, extra_packages=None, timeout: int = 600) -> dict:
     """Create and fill the project-local environment: `<workspace>/.venv`
     with everything from the workspace requirements.txt plus any explicitly
@@ -398,13 +550,17 @@ def _err_lines(out: str) -> str:
 # ---------------------------------------------------------------- python
 
 _BUILD_DRIVER = r'''
-import json, os, py_compile, sys, tempfile, traceback
+import atexit, json, os, py_compile, sys, tempfile, traceback
 
 def out(ok, msg):
     print(json.dumps({"ok": bool(ok), "msg": msg}))
     sys.exit(0)
 
-_tmp_pyc = os.path.join(tempfile.gettempdir(), "af_build_smoke.pyc")
+# unique per run: parallel build checks must not share one temp .pyc
+# (a fixed name gives WinError 5 Access denied under concurrency)
+_fd, _tmp_pyc = tempfile.mkstemp(suffix=".pyc", prefix="af_build_smoke_")
+os.close(_fd)
+atexit.register(lambda: os.path.exists(_tmp_pyc) and os.unlink(_tmp_pyc))
 errors = []
 for root, dirs, files in os.walk("."):
     dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", ".pytest_cache",
@@ -416,7 +572,9 @@ for root, dirs, files in os.walk("."):
                 py_compile.compile(p, cfile=_tmp_pyc, doraise=True)
             except py_compile.PyCompileError as e:
                 first = (e.args[0] if e.args else str(e)).splitlines()
-                errors.append(next((l for l in first if l.strip() and not l.startswith("  ")), p)[:200])
+                detail = next((l.strip() for l in first if l.strip() and not l.startswith("  ")),
+                              str(e))
+                errors.append(f"{p}: {detail}"[:200])
             except Exception as e:
                 errors.append(f"{p}: {e}"[:200])
 if errors:
@@ -492,19 +650,186 @@ def _python_build(ws_dir: str) -> tuple[bool, str]:
     return ok, msg
 
 
-def _python_tests(ws_dir: str) -> tuple[bool, str]:
+def _quarantine_broken_tests(py: str, ws_dir: str) -> list[str]:
+    """Stale test modules that fail at COLLECTION (importing names that no
+    longer exist in the app) poison every task's test run — the dev can
+    self-fix its own code but not unrelated broken tests. Move the broken
+    modules to <ws>/_quarantine/ (outside the pytest testpaths) so the real
+    suite can run. Guard: if NOTHING collects the breakage is systemic and
+    must stay visible, not be hidden."""
+    # full output (not the 12-line _run tail) — with many broken modules the
+    # ERROR summary lines would otherwise be truncated away
+    try:
+        proc = subprocess.run([py, "-m", "pytest", "-q", "--no-header", "--collect-only"],
+                              cwd=ws_dir, capture_output=True, text=True, timeout=180,
+                              env={**os.environ, **_lib_env(ws_dir)},
+                              encoding="utf-8", errors="replace")
+        out = (proc.stdout or "") + (proc.stderr or "")
+        rc = proc.returncode
+    except Exception:
+        return []
+    if rc == 0:
+        return []
+    # summary lines ("ERROR tests/test_x.py") — the detail lines are truncated
+    # by the output tail, the summary lines always survive
+    broken = sorted({m.replace("\\", "/") for m in re.findall(r"^ERROR (\S+\.py)", out, re.M)
+                     if os.path.basename(m) != "conftest.py"})
+    if not broken:
+        return []
+    m = re.search(r"(\d+) tests? collected", out)
+    collected = int(m.group(1)) if m else 0
+    if collected == 0:
+        return []  # nothing collects at all — systemic, keep errors visible
+    qdir = os.path.join(ws_dir, "_quarantine")
+    moved = []
+    for rel in broken:
+        src = os.path.join(ws_dir, rel)
+        if os.path.isfile(src):
+            dst = os.path.join(qdir, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            try:
+                shutil.move(src, dst)
+                moved.append(rel)
+            except OSError:
+                pass
+    return moved
+
+
+def _load_test_modules(ws_dir: str) -> list[str]:
+    """Test modules that import locust/gevent. Their monkey-patching
+    (monkey.patch_all / gevent ssl patch) deadlocks the FastAPI TestClient
+    for every test that runs after them in the same process. Load tests are
+    performance tooling, not part of the unit gate — they get --ignored."""
+    hits = []
+    tests_dir = os.path.join(ws_dir, "tests")
+    if not os.path.isdir(tests_dir):
+        return hits
+    for f in os.listdir(tests_dir):
+        if not (f.startswith("test_") and f.endswith(".py")):
+            continue
+        try:
+            with open(os.path.join(tests_dir, f), encoding="utf-8", errors="replace") as fh:
+                src = fh.read()
+        except OSError:
+            continue
+        if re.search(r"^\s*(?:import|from)\s+(?:locust|gevent)\b", src, re.M):
+            hits.append(f"tests/{f}")
+    return hits
+
+
+def _pytest_full(cmd: list[str], ws_dir: str, timeout: int) -> tuple[int, str]:
+    """Pytest with FULL output capture (the _run helper tails to 12 lines,
+    which truncates FAILED lists)."""
+    try:
+        proc = subprocess.run(cmd, cwd=ws_dir, capture_output=True, text=True,
+                              timeout=timeout, env={**os.environ, **_lib_env(ws_dir)},
+                              encoding="utf-8", errors="replace")
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout}s"
+    except OSError as exc:
+        return 127, str(exc)
+
+
+_HYGIENE_CACHE: dict[str, tuple[float, list[str]]] = {}
+
+
+def _test_hygiene(py: str, ws_dir: str) -> tuple[list[str], list[str]]:
+    """(quarantined, load-test-ignored) — cached briefly so the baseline
+    snapshot and the real run don't pay the collect-only cost twice."""
+    import time as _time
+    key = os.path.normcase(ws_dir)
+    hit = _HYGIENE_CACHE.get(key)
+    now = _time.time()
+    moved: list[str] = []
+    if not hit or now - hit[0] > 300:
+        moved = _quarantine_broken_tests(py, ws_dir)
+        _HYGIENE_CACHE[key] = (now, moved)
+    ignored = _load_test_modules(ws_dir)
+    return moved, ignored
+
+
+def _pytest_cmd(py: str, ignored: list[str], scope: str | None = None) -> list[str]:
+    cmd = [py, "-m", "pytest", "-q", "--no-header", "--tb=no"]
+    for rel in ignored:
+        cmd.append(f"--ignore={rel}")
+    if scope:
+        cmd.append(scope)
+    return cmd
+
+
+def failing_tests(stack: str, ws_dir: str | None, scope: str | None = None) -> set[str] | None:
+    """Snapshot of currently failing test ids (python only; None = unknown).
+    Captured before work starts, this is the baseline that separates legacy
+    failures (tolerated) from NEW failures (the task's responsibility). A
+    `scope` (e.g. 'tests/test_config.py') restricts to one module."""
+    if stack != "python" or not ws_dir or not os.path.isdir(ws_dir):
+        return None
+    py = project_python(ws_dir) or sys.executable
+    try:
+        moved, ignored = _test_hygiene(py, ws_dir)
+        rc, out = _pytest_full(_pytest_cmd(py, ignored, scope), ws_dir, 300)
+        if rc == 124 or "timed out" in out:
+            return None
+        return {m for m in re.findall(r"^FAILED (\S+)", out, re.M)}
+    except Exception:
+        return None
+
+
+def failing_test_details(stack: str, ws_dir: str | None, scope: str,
+                         max_tests: int = 8) -> str:
+    """nodeid + assertion detail per failing test in ONE module — compact
+    enough for a task description, actionable enough to actually fix."""
+    if stack != "python" or not ws_dir or not os.path.isdir(ws_dir):
+        return ""
+    py = project_python(ws_dir) or sys.executable
+    try:
+        moved, ignored = _test_hygiene(py, ws_dir)
+        rc, out = _pytest_full(_pytest_cmd(py, ignored, scope), ws_dir, 300)
+    except Exception:
+        return ""
+    details, current = [], None
+    for line in out.splitlines():
+        if line.startswith(("FAILED ", "ERROR ")):
+            nodeid = line.split(None, 1)[1].split(" - ")[0]
+            current = {"id": nodeid, "msg": line.split(" - ")[-1][:200]}
+            details.append(current)
+        elif current and (line.startswith(("E ", "assert", "AssertionError"))
+                          or "Error" in line[:60]):
+            current["msg"] = line.lstrip("E ").strip()[:200]
+        if len(details) >= max_tests:
+            break
+    return "\n".join(f"- {d['id']}: {d['msg']}" for d in details)[:1800]
+
+
+def _python_tests(ws_dir: str, baseline: set[str] | None = None,
+                  scope: str | None = None) -> tuple[bool, str]:
     if not ws_dir or not os.path.isdir(ws_dir):
         return False, "workspace missing"
     ensure_pyproject(ws_dir)
     py = project_python(ws_dir) or sys.executable
-    rc, tail = _run([py, "-m", "pytest", "-q", "--no-header", "-x", "--tb=line"],
-                    ws_dir, timeout=300)
-    lines = tail.splitlines()
+    moved, ignored = _test_hygiene(py, ws_dir)
+    rc, out = _pytest_full(_pytest_cmd(py, ignored, scope), ws_dir, 300)
+    lines = out.strip().splitlines()
     summary = lines[-1] if lines else "no output"
-    detail = next((l for l in reversed(lines) if l.startswith("E ") or l.startswith("FAILED")), "")
-    ok = rc == 0
-    out = summary + (f" | {detail}" if detail and not ok else "")
-    return ok, out[:300]
+    fails = {m for m in re.findall(r"^FAILED (\S+)", out, re.M)}
+    notes = []
+    if moved:
+        notes.append(f"quarantined {len(moved)} stale test module(s)")
+    if ignored:
+        notes.append("excluded load-test module(s): " + ", ".join(ignored)[:100])
+    prefix = (" | ".join(notes) + " | ") if notes else ""
+    if rc == 0:
+        return True, prefix + f"tests passed: {summary}"
+    if baseline is not None:
+        new = sorted(fails - baseline)
+        if not new:
+            return True, prefix + (f"tests passed: {len(fails)} pre-existing failure(s) "
+                                   f"tolerated | {summary}")
+        return False, (prefix + "tests FAILED: new failures: "
+                       + ", ".join(new[:5])[:180] + f" | {summary}")[:400]
+    detail = next((l for l in reversed(lines) if l.startswith("E ")), "")
+    return False, (prefix + "tests FAILED: " + summary + (f" | {detail[:120]}" if detail else ""))[:400]
 
 
 # ------------------------------------------------------------ dotnet / go / node
@@ -652,15 +977,18 @@ def build_check(stack: str, ws_dir: str) -> tuple[bool, str]:
     return ok, (f"build passed: {msg}" if ok else f"build FAILED: {msg}")
 
 
-def run_stack_tests(stack: str, ws_dir: str) -> tuple[bool, str]:
+def run_stack_tests(stack: str, ws_dir: str, baseline: set[str] | None = None,
+                    scope: str | None = None) -> tuple[bool, str]:
     """Real test run for the stack. Summary starts with 'tests passed'
-    or 'tests FAILED'."""
+    or 'tests FAILED'. With a baseline (set of failing test ids captured
+    before the work started), pre-existing failures are tolerated — only
+    NEW failures fail the gate. `scope` restricts to one module (python)."""
     ok, msg = toolchain_available(stack)
     if not ok:
         return False, f"tests FAILED: toolchain unavailable — {msg}"
     try:
         if stack == "python":
-            ok, msg = _python_tests(ws_dir)
+            ok, msg = _python_tests(ws_dir, baseline, scope)
         elif stack == "dotnet":
             ok, msg = _dotnet_tests(ws_dir)
         elif stack == "go":

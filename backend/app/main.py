@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import chatbot, db, po, runtime, workspace
+from . import chatbot, db, po, runtime, sprint_gate, workspace
 from .db import audit, execute, insert, new_id, now, query, query_one, update
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "static")
@@ -28,6 +28,22 @@ async def lifespan(app: FastAPI):
     workspace.relocate_workspaces()
     runtime.recover_orphans()
     runtime.set_loop(asyncio.get_running_loop())
+
+    async def _resume_po_projects():
+        # With PO authority enabled, delivery should survive server restarts:
+        # any project with open sprint work gets its execution loop back.
+        await asyncio.sleep(2.0)
+        try:
+            projects = db.query(
+                "SELECT p.id FROM projects p WHERE p.po_enabled = 1 AND EXISTS ("
+                "  SELECT 1 FROM tasks t WHERE t.project_id = p.id AND t.sprint_id IS NOT NULL "
+                "  AND t.status NOT IN ('Done','Cancelled'))")
+            for p in projects:
+                runtime.start_sprint_execution(p["id"])
+        except Exception:
+            pass
+
+    asyncio.create_task(_resume_po_projects())
     yield
 
 
@@ -845,7 +861,9 @@ def update_project(pid: str, body: dict):
 
 @app.delete("/api/v1/projects/{pid}")
 def delete_project(pid: str):
-    for tbl, col in (("task_dependencies", ""), ("tasks", "project_id"), ("sprints", "project_id"),
+    for tbl, col in (("task_dependencies", ""), ("tasks", "project_id"),
+                     ("sprint_gate_executions", "sprint"), ("sprint_acceptance_criteria", "sprint"),
+                     ("sprints", "project_id"),
                      ("backlog_items", "project_id"), ("messages", ""), ("conversations", "project_id"),
                      ("execution_events", "project_id")):
         if tbl == "task_dependencies":
@@ -853,6 +871,8 @@ def delete_project(pid: str):
                     "OR depends_on_task_id IN (SELECT id FROM tasks WHERE project_id=?)", (pid, pid))
         elif tbl == "messages":
             execute("DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE project_id=?)", (pid,))
+        elif tbl in ("sprint_gate_executions", "sprint_acceptance_criteria"):
+            execute(f"DELETE FROM {tbl} WHERE sprint_id IN (SELECT id FROM sprints WHERE project_id=?)", (pid,))
         else:
             execute(f"DELETE FROM {tbl} WHERE {col} = ?", (pid,))
     execute("DELETE FROM projects WHERE id=?", (pid,))
@@ -935,8 +955,82 @@ def update_sprint(sid: str, body: dict):
 @app.delete("/api/v1/sprints/{sid}")
 def delete_sprint(sid: str):
     execute("UPDATE tasks SET sprint_id=NULL WHERE sprint_id=?", (sid,))
+    execute("DELETE FROM sprint_gate_executions WHERE sprint_id=?", (sid,))
+    execute("DELETE FROM sprint_acceptance_criteria WHERE sprint_id=?", (sid,))
     execute("DELETE FROM sprints WHERE id=?", (sid,))
     return {"ok": True}
+
+
+# ------------------------------- sprint gating -------------------------------
+
+@app.get("/api/v1/projects/{pid}/sprints/active")
+def get_active_sprint(pid: str):
+    _or_404(query_one("SELECT id FROM projects WHERE id=?", (pid,)), "Project")
+    sprint = sprint_gate.active_sprint(pid)
+    if not sprint:
+        return {"sprint": None, "gates": None, "next_locked_sprint": sprint_gate.next_locked_sprint(pid)}
+    return {"sprint": sprint,
+            "gates": sprint_gate.sprint_gate_summary(sprint["id"]),
+            "next_locked_sprint": sprint_gate.next_locked_sprint(pid)}
+
+
+@app.post("/api/v1/projects/{pid}/sprints/{sid}/activate")
+def activate_sprint(pid: str, sid: str):
+    _or_404(query_one("SELECT id FROM projects WHERE id=?", (pid,)), "Project")
+    sprint = _or_404(query_one("SELECT * FROM sprints WHERE id=? AND project_id=?", (sid, pid)), "Sprint")
+    # RULE 1: one active sprint per project — reject, never silently demote.
+    active = sprint_gate.active_sprint(pid)
+    if active and active["id"] != sid:
+        raise HTTPException(409, f"Sprint '{active['name']}' is already active "
+                                 f"({active['status']}) — complete or cancel it first")
+    if sprint["status"] == sprint_gate.COMPLETED:
+        raise HTTPException(409, "Sprint is already completed")
+    ok, err = sprint_gate.transition_sprint(sid, sprint_gate.ACTIVE,
+                                            "Activated via API", executed_by="user")
+    if not ok:
+        raise HTTPException(409, err)
+    if not sprint.get("started_at"):
+        update("sprints", sid, {"started_at": now()})
+    audit("sprint_activated", "sprint", sid, f"Sprint '{sprint['name']}' activated via API")
+    return query_one("SELECT * FROM sprints WHERE id = ?", (sid,))
+
+
+@app.get("/api/v1/sprints/{sid}/gates")
+def sprint_gates(sid: str):
+    _or_404(query_one("SELECT id FROM sprints WHERE id=?", (sid,)), "Sprint")
+    return {"summary": sprint_gate.sprint_gate_summary(sid),
+            "history": sprint_gate.gate_history(sid)}
+
+
+@app.get("/api/v1/sprints/{sid}/history")
+def sprint_history(sid: str):
+    sprint = _or_404(query_one("SELECT id, project_id FROM sprints WHERE id=?", (sid,)), "Sprint")
+    rows = query(
+        "SELECT * FROM execution_events WHERE project_id = ? AND event_type IN "
+        "('sprint.status.changed','sprint.gate.changed','sprint.unlocked','sprint.activated') "
+        "ORDER BY seq DESC LIMIT 100", (sprint["project_id"],))
+    for r in rows:
+        r["payload"] = json.loads(r["payload"])
+    return rows
+
+
+@app.post("/api/v1/sprints/{sid}/accept")
+def accept_sprint(sid: str):
+    """Manual acceptance override (spec §38: human approval). Marks every
+    required acceptance criterion Passed, then runs the remaining gates."""
+    sprint = _or_404(query_one("SELECT * FROM sprints WHERE id=?", (sid,)), "Sprint")
+    if sprint["status"] == sprint_gate.COMPLETED:
+        return {"ok": True, "note": "already completed"}
+    if sprint["status"] not in sprint_gate.ACTIVE_OR_GATING:
+        raise HTTPException(409, f"Sprint is {sprint['status']} — cannot accept")
+    sprint_gate.seed_sprint_acs(sprint)
+    execute("UPDATE sprint_acceptance_criteria SET status='Passed', "
+            "result='manually accepted', validated_at=? WHERE sprint_id=? AND required=1",
+            (now(), sid))
+    audit("sprint_accept_override", "sprint", sid,
+          f"Sprint '{sprint['name']}' manually accepted by user", actor="user")
+    outcome = sprint_gate.run_sprint_gates(sprint["project_id"], sid, {})
+    return {"ok": outcome == "Completed", "outcome": outcome}
 
 
 TASK_TRANSITIONS = {
@@ -990,6 +1084,16 @@ def create_task(pid: str, body: TaskIn):
                      "created_at": ts, "updated_at": ts})
     for dep in body.depends_on:
         execute("INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_task_id) VALUES (?,?)", (tid, dep))
+    # Sprint gating: an urgent (priority-1) task added to the current sprint
+    # mid-validation re-opens development; gates re-run after it completes.
+    if body.sprint_id and body.priority == 1:
+        sprint = query_one("SELECT * FROM sprints WHERE id = ? AND project_id = ?", (body.sprint_id, pid))
+        if sprint and sprint["status"] in sprint_gate.GATE_PHASES + (sprint_gate.REWORK,):
+            ok, _ = sprint_gate.reopen_sprint_for_scope(
+                body.sprint_id, f"urgent task '{body.title[:60]}' added")
+            if ok:
+                audit("sprint_reopen_task", "task", tid,
+                      f"Urgent task re-opened sprint '{sprint['name']}' mid-validation")
     return query_one("SELECT * FROM tasks WHERE id = ?", (tid,))
 
 
@@ -1062,7 +1166,10 @@ def control_summary(pid: str):
         "WHERE ta.active = 1 ORDER BY a.name", (pid,))
     tasks = list_tasks(pid, sprint_id=None)
     sprint_tasks = [t for t in tasks if t["sprint_id"]]
-    active_sprint = query_one("SELECT * FROM sprints WHERE project_id=? AND status='Active'", (pid,))
+    # Active = the ONE sprint in development or moving through gates.
+    active_sprint = sprint_gate.active_sprint(pid)
+    sprint_gates = sprint_gate.sprint_gate_summary(active_sprint["id"]) if active_sprint else None
+    next_locked = sprint_gate.next_locked_sprint(pid)
     events = query("SELECT * FROM execution_events WHERE project_id=? ORDER BY seq DESC LIMIT 40", (pid,))
     for e in events:
         e["payload"] = json.loads(e["payload"])
@@ -1076,6 +1183,8 @@ def control_summary(pid: str):
         "project": project,
         "agents": agents,
         "sprint": active_sprint,
+        "sprint_gates": sprint_gates,
+        "next_locked_sprint": next_locked,
         "sprint_tasks": sprint_tasks,
         "events": list(reversed(events)),
         "usage": usage,

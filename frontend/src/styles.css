@@ -125,9 +125,38 @@ body {
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn.primary:hover { opacity: 0.9; color: #fff; }
 .btn.danger:hover { border-color: var(--err); color: var(--err); }
+/* Product Owner toggle: red blinking light while authority is ON (blue button) */
+.live-dot.po-live-dot { background: var(--err); }
+.btn.po-on { animation: po-blink 1.2s ease-in-out infinite; }
+@keyframes po-blink {
+  0%, 100% { box-shadow: 0 0 3px 0 rgba(79, 142, 247, 0.7); filter: brightness(1); }
+  50% { box-shadow: 0 0 14px 4px rgba(79, 142, 247, 0.55); filter: brightness(1.25); }
+}
 .btn.small { padding: 4px 10px; font-size: 12px; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* Status filter chips (multi-select, live auto-filter) */
+.chip {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 999px;
+  color: var(--text-dim); padding: 3px 10px; font-size: 12px; cursor: pointer;
+  transition: all 0.15s ease; font-family: inherit;
+}
+.chip:hover { border-color: var(--accent); color: var(--text); }
+.chip-on {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--accent);
+  font-weight: 600;
+}
+
+/* Sprint gate panel */
+.sprint-gate { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; background: var(--bg2); }
+.gate-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 4px 16px; margin-top: 2px; }
+.gate-item { display: flex; justify-content: space-between; align-items: center; font-size: 12.5px; padding: 2px 0; }
+.gate-status { font-size: 11.5px; font-weight: 600; }
+.gate-passed { color: var(--ok); }
+.gate-failed { color: var(--err); }
+.gate-running { color: var(--accent); }
+.gate-pending { color: var(--text-dim); }
 
 /* ---------- forms ---------- */
 input, select, textarea {

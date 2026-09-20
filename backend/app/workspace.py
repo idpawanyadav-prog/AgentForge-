@@ -13,8 +13,23 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 
 from .db import execute, now, query, query_one, update
+
+# Per-project git locks: with parallel task execution several agents can
+# finish and commit in the same workspace at the same time. Serializing
+# add+commit per workspace avoids git index.lock races.
+_commit_locks: dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+def _commit_lock(project_id: str) -> threading.Lock:
+    with _locks_guard:
+        lock = _commit_locks.get(project_id)
+        if lock is None:
+            lock = _commit_locks[project_id] = threading.Lock()
+        return lock
 
 
 def workspaces_root() -> str:
@@ -152,11 +167,13 @@ def write_deliverable(project_id: str, task, run_id: str) -> str | None:
 
 
 def commit_all(project_id: str) -> str | None:
-    """Best-effort `git add -A` + commit of the workspace. Returns short hash."""
+    """Best-effort `git add -A` + commit of the workspace. Returns short hash.
+    Serialized per workspace so concurrent agent runs can't race on git."""
     ws_dir = get_workspace(project_id)
     if not ws_dir or not os.path.isdir(os.path.join(ws_dir, ".git")):
         return None
-    _git(["add", "-A"], cwd=ws_dir)
-    _git(["-c", "user.name=AgentForge", "-c", "user.email=agents@agentforge.local",
-          "commit", "-q", "-m", "AgentForge: agent deliverable update"], cwd=ws_dir)
-    return _git(["rev-parse", "--short", "HEAD"], cwd=ws_dir)
+    with _commit_lock(project_id):
+        _git(["add", "-A"], cwd=ws_dir)
+        _git(["-c", "user.name=AgentForge", "-c", "user.email=agents@agentforge.local",
+              "commit", "-q", "-m", "AgentForge: agent deliverable update"], cwd=ws_dir)
+        return _git(["rev-parse", "--short", "HEAD"], cwd=ws_dir)

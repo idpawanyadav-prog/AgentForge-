@@ -122,12 +122,44 @@ def _pick_codegen_model(gateway_id: str, fallback_model) -> dict:
     return fallback_model or {"provider_model_id": "claude-sonnet-5"}
 
 
+def is_llm_outage(error: str) -> bool:
+    """True when a codegen error is an LLM outage/quota condition — the
+    caller must stop retrying (each retry burns quota) and block with the
+    clear reason instead of burning self-fix / health rounds."""
+    return bool(error) and _llm_outage_reason(error) != "" or \
+        (error or "").lower().startswith(("llm usage limit", "llm quota",
+                                          "llm rate limited", "llm provider overloaded"))
+
+
+def _llm_outage_reason(text: str) -> str:
+    """Detect an LLM outage / quota / rate-limit message in the response
+    text. Returns a clean reason string, or '' when this looks like a
+    normal (but unusable) reply. These must surface as outages, not
+    'no usable files' — the model literally cannot help right now."""
+    low = text.lower()
+    for pat, label in (
+        ("usage limit", "LLM usage limit reached (quota exhausted)"),
+        ("quota", "LLM quota exhausted"),
+        ("rate limit", "LLM rate limited"),
+        ("overloaded", "LLM provider overloaded"),
+        ("insufficient", "LLM insufficient credits/balance"),
+        ("temporarily unavailable", "LLM temporarily unavailable"),
+        ("service unavailable", "LLM service unavailable"),
+    ):
+        if pat in low:
+            return label
+    return ""
+
+
 # ---------------------------------------------------------------- codegen
 
 _SHARED_RULES = """- Contribute to ONE coherent application with a conventional
   layout for its stack — extend existing files rather than creating
   task-named one-offs.
 - NEVER name a file after the task title.
+- REUSE the shared helpers file (see REUSABLE HELPERS below): call its
+  functions instead of re-implementing small utilities. New tiny reusable
+  utilities go into that same file (return its FULL updated content).
 - Non-source files (launcher scripts like .bat/.sh, README.md, .env.example,
   Dockerfile, config) are expected whenever the task asks for them — create
   exactly the requested file type.
@@ -143,7 +175,8 @@ Return ONLY a JSON object (no markdown fences, no prose, no tool calls):
 Structure rules:
 - Contribute to ONE coherent application with a conventional layout:
   app/main.py (FastAPI app + include_router calls), app/routers/, app/services/,
-  app/models.py, requirements.txt, tests/test_*.py.
+  app/models.py, app/helpers.py (shared reusable helpers — owned by the
+  Junior Developer), requirements.txt, tests/test_*.py.
 - If you add an APIRouter, register it in app/main.py and return main.py's
   FULL updated content in files.
 - Use FastAPI for web/API projects; otherwise plain Python modules.
@@ -194,6 +227,34 @@ def _system_for(stack: str) -> str:
     return _CODEGEN_SYSTEMS.get(stack) or _CODEGEN_SYSTEMS["python"]
 
 
+_JR_DEV_SYSTEM = """You are the Junior Developer implementing one task of a real project.
+Return ONLY a JSON object (no markdown fences, no prose, no tool calls):
+{"summary": "<one line>", "files": [{"path": "<relative/path>", "content": "<full file content>"}]}
+Your specialty is small, easy-to-build REUSABLE functions that save the team
+tokens: every utility a teammate could re-implement belongs in the shared
+helpers file (app/helpers.py) so the next agent just calls it.
+Rules:
+- Grow app/helpers.py: append tiny, typed, single-purpose functions (one
+  concern each, ~10 lines max) and return the file's FULL updated content.
+- Never duplicate a helper that already exists — extend or fix it instead.
+- Update tests/test_helpers.py with one focused test per new helper.
+- Only touch other files when the task explicitly needs feature code; then
+  import and call the helpers rather than inlining utility logic.
+""" + _SHARED_RULES
+
+
+def _is_junior_dev(agent_ref: str) -> bool:
+    """True when the implementer (agent id or name) has the Junior
+    Developer role."""
+    ref = (agent_ref or "").strip()
+    if not ref:
+        return False
+    row = query_one(
+        "SELECT r.name AS role_name FROM agents a JOIN roles r ON r.id = a.role_id "
+        "WHERE a.id = ? OR lower(a.name) = lower(?) LIMIT 1", (ref, ref))
+    return bool(row) and "junior" in (row["role_name"] or "").lower()
+
+
 def _existing_tree(ws_dir: str, limit: int = 60) -> str:
     entries = []
     for root, dirs, files in os.walk(ws_dir):
@@ -210,6 +271,177 @@ def _safe_rel_path(p: str) -> str | None:
     if not p or ".." in p.split("/") or p.startswith((".", "~")) or ":" in p:
         return None
     return p
+
+
+# ---------------------------------------------------------------- shared helpers
+# One reusable helper function file per project workspace, owned by the
+# team's Junior Developer. Teammates CALL these helpers instead of
+# re-implementing small utilities, so every task regenerates less code —
+# fewer output tokens and smaller prompts on later passes.
+
+HELPERS_REL_PATH = "app/helpers.py"
+
+_STARTER_HELPERS = '''"""Shared reusable helpers — owned by the team's Junior Developer.
+
+Small, typed, easy-to-reuse functions. CALL these instead of
+re-implementing them: less duplicated code, fewer tokens per task.
+"""
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+
+
+def slugify(text: str) -> str:
+    """URL/file-safe slug: 'Hello World!' -> 'hello-world'."""
+    cleaned = "".join(c if c.isalnum() else " " for c in (text or "").lower())
+    return "-".join(cleaned.split()) or "item"
+
+
+def truncate(text: str, limit: int = 200) -> str:
+    """Cut text to limit, appending '...' when it was longer."""
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
+
+
+def compact_json(data) -> str:
+    """Smallest possible JSON string (no spaces, ascii kept as-is)."""
+    return json.dumps(data, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def deep_get(data: dict, path: str, default=None):
+    """Safely read nested keys: deep_get(d, "user.address.city")."""
+    for key in path.split("."):
+        if not isinstance(data, dict) or key not in data:
+            return default
+        data = data[key]
+    return data
+
+
+def parse_bool(value, default: bool = False) -> bool:
+    """Forgiving bool from strings ('true'/'1'/'yes'/'on') or None."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "y")
+
+
+def now_iso() -> str:
+    """UTC timestamp string, e.g. '2026-09-20T15:20:20+00:00'."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def paginate(items: list, page: int = 1, size: int = 20) -> dict:
+    """Standard pagination envelope: items, page, size, total."""
+    page, size = max(1, page), max(1, min(size, 200))
+    start = (page - 1) * size
+    return {"items": items[start:start + size], "page": page,
+            "size": size, "total": len(items)}
+'''
+
+_STARTER_HELPERS_TEST = '''"""Tests for the shared helpers (owned by the Junior Developer)."""
+from app.helpers import compact_json, deep_get, paginate, parse_bool, slugify, truncate
+
+
+def test_slugify():
+    assert slugify("Hello World!") == "hello-world"
+    assert slugify("  Multiple   Spaces  ") == "multiple-spaces"
+    assert slugify("!!!") == "item"
+
+
+def test_truncate():
+    assert truncate("short") == "short"
+    assert len(truncate("x" * 500, 50)) == 50
+    assert truncate("x" * 500, 50).endswith("...")
+
+
+def test_compact_json():
+    assert compact_json({"a": 1, "b": 2}) == '{"a":1,"b":2}'
+
+
+def test_deep_get():
+    assert deep_get({"a": {"b": 7}}, "a.b") == 7
+    assert deep_get({}, "a.b.c", "fallback") == "fallback"
+
+
+def test_parse_bool():
+    assert parse_bool("yes") is True
+    assert parse_bool("0") is False
+    assert parse_bool(None, default=True) is True
+
+
+def test_paginate():
+    result = paginate(list(range(50)), page=2, size=10)
+    assert result["items"][0] == 10
+    assert result["total"] == 50
+'''
+
+
+def ensure_helpers_file(ws_dir: str) -> bool:
+    """Create the shared helpers file (+ its tests) when missing. Returns
+    True when the starter file was written, False when it already existed."""
+    path = os.path.join(ws_dir, HELPERS_REL_PATH.replace("/", os.sep))
+    if os.path.exists(path):
+        return False
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(_STARTER_HELPERS)
+    test_path = os.path.join(ws_dir, "tests", "test_helpers.py")
+    if not os.path.exists(test_path):
+        os.makedirs(os.path.dirname(test_path), exist_ok=True)
+        with open(test_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_STARTER_HELPERS_TEST)
+    return True
+
+
+def _helpers_index(ws_dir: str, limit: int = 40) -> str:
+    """Compact one-line-per-function index of the helpers file (signature +
+    first docstring line) for prompts. Signatures only — never the full
+    file — so the prompt stays small and tokens stay low."""
+    path = os.path.join(ws_dir, HELPERS_REL_PATH.replace("/", os.sep))
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+    except OSError:
+        return ""
+    entries = []
+    for m in re.finditer(
+            r'^def (\w+)\(([^)]*)\)(\s*->\s*[^:\n]+)?:\s*\n\s*"""([^"\n]*)',
+            src, re.M):
+        sig = f"{m.group(1)}({m.group(2).strip()})" + (m.group(3) or "").rstrip()
+        doc = m.group(4).strip()
+        entries.append(f"- {sig} — {doc}" if doc else f"- {sig}")
+    return "\n".join(entries[:limit])
+
+
+def _feedback_file_blocks(ws_dir: str, feedback: str, limit: int = 3) -> str:
+    """Contents of workspace files the failure feedback points at, so the
+    model can actually fix the file that failed instead of guessing blind."""
+    if not feedback or not ws_dir:
+        return ""
+    seen, blocks = set(), []
+    for m in re.finditer(r"[A-Za-z0-9_./\\-]+\.(?:py|js|ts|tsx|go|cs|html|css|json|md)", feedback):
+        rel = m.group(0).replace("\\", "/").lstrip("./")
+        safe = _safe_rel_path(rel)
+        if not safe or safe in seen:
+            continue
+        path = os.path.join(ws_dir, safe.replace("/", os.sep))
+        if not os.path.isfile(path):
+            continue
+        seen.add(safe)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                src = fh.read()
+        except OSError:
+            continue
+        blocks.append(f"CURRENT {safe} (this file FAILED — fix it):\n{src[:6000]}"
+                      + ("\n... (truncated)" if len(src) > 6000 else ""))
+        if len(blocks) >= limit:
+            break
+    return ("\n\n" + "\n\n".join(blocks)) if blocks else ""
 
 
 def generate_implementation(project, task, agent_name: str, feedback: str = "") -> dict:
@@ -229,10 +461,23 @@ def generate_implementation(project, task, agent_name: str, feedback: str = "") 
         result["error"] = "workspace missing"
         return result
 
+    # The Junior Developer's shared reusable-function file: present in every
+    # python workspace so all agents reuse it instead of regenerating
+    # boilerplate (fewer output tokens, smaller later prompts).
+    helpers_block = ""
+    if stack == "python":
+        ensure_helpers_file(ws_dir)
+        index = _helpers_index(ws_dir)
+        if index:
+            helpers_block = ("\nREUSABLE HELPERS in app/helpers.py (maintained by the Junior "
+                             "Developer — CALL these instead of re-implementing, it saves tokens):\n"
+                             f"{index}\n")
+
     gw, model = resolve_llm(project)
     if gw and model:
         from .chatbot import _extract_json
-        system_prompt = _system_for(stack)
+        system_prompt = (_JR_DEV_SYSTEM if stack == "python" and _is_junior_dev(agent_name)
+                         else _system_for(stack))
         feedback_block = f"\n\nPREVIOUS ATTEMPT FEEDBACK (fix these issues):\n{feedback}\n" if feedback else ""
         main_py = os.path.join(ws_dir, "app", "main.py")
         main_block = "(app/main.py does not exist yet)"
@@ -249,8 +494,10 @@ def generate_implementation(project, task, agent_name: str, feedback: str = "") 
                        f"DESCRIPTION: {task['description'] or 'n/a'}\n"
                        f"ACCEPTANCE CRITERIA: {task['acceptance_criteria'] or 'n/a'}"
                        f"{feedback_block}\n"
-                       f"EXISTING WORKSPACE FILES:\n{_existing_tree(ws_dir)}\n\n"
-                       f"CURRENT app/main.py:\n{main_block}\n\n"
+                       f"EXISTING WORKSPACE FILES:\n{_existing_tree(ws_dir)}\n"
+                       f"{helpers_block}\n"
+                       f"CURRENT app/main.py:\n{main_block}"
+                       f"{_feedback_file_blocks(ws_dir, feedback)}\n\n"
                        "Implement this task now. Return the JSON object with complete file contents.")
 
         def _usable_files(text: str):
@@ -285,6 +532,15 @@ def generate_implementation(project, task, agent_name: str, feedback: str = "") 
                                "output_tokens": resp["output_tokens"]})
                 if stack == "python":
                     toolchains.ensure_pyproject(ws_dir)
+                return result
+            # Distinguish a genuine outage (quota / usage limit / overloaded)
+            # from a model that just didn't follow the format. An outage must
+            # surface as a clear, non-retryable error — NOT fall through to a
+            # task-named scaffold that looks like real work.
+            outage = _llm_outage_reason(resp.get("text") or "")
+            if outage:
+                result["error"] = outage
+                result["summary"] = f"failed: {outage}"
                 return result
             result["error"] = "model returned no usable files"
         except Exception as exc:
