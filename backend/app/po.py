@@ -612,10 +612,21 @@ def _po_llm(project_id: str):
     cfg_raw = query_one("SELECT value FROM settings WHERE key = 'po_bot'")
     if cfg_raw and cfg_raw["value"]:
         try:
-            cfg = _json.loads(cfg_raw["value"])
-            if cfg.get("gateway_id") and cfg.get("model_id"):
-                gw = query_one("SELECT * FROM gateways WHERE id = ?", (cfg["gateway_id"],))
-                model = query_one("SELECT * FROM gateway_models WHERE id = ?", (cfg["model_id"],))
+            cfg = json.loads(cfg_raw["value"])
+            gw_id = cfg.get("gateway_id")
+            if gw_id:
+                gw = query_one("SELECT * FROM gateways WHERE id = ?", (gw_id,))
+                model = (query_one("SELECT * FROM gateway_models WHERE id = ?", (cfg["model_id"],))
+                         if cfg.get("model_id") else None)
+                if gw and not model:
+                    # The saved model id went stale (the gateway re-synced its
+                    # catalog and minted new ids). Recover by picking a usable
+                    # chat model on the same gateway the owner chose, so the PO
+                    # keeps working instead of silently resolving to nothing.
+                    model = query_one(
+                        "SELECT * FROM gateway_models WHERE gateway_id = ? AND active = 1 "
+                        "AND lower(provider_model_id) NOT LIKE '%embed%' "
+                        "ORDER BY display_name LIMIT 1", (gw_id,))
                 if gw and model:
                     return gw, model
         except ValueError:
