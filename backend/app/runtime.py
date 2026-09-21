@@ -293,12 +293,16 @@ def start_execution(project_id: str, task_id: str, idempotency_key: str | None =
     audit("start_execution", "workflow_run", run_id,
           f"Started {'QA verification' if qa_mode else 'execution'} of task '{task['title']}'")
 
-    ctrl = {"paused": False, "cancelled": False}
+    # The live worker and pause/resume/cancel (and stop_sprint_execution) all
+    # mutate THIS dict, so it must be the same object stored in the registry —
+    # a copy would strand cancellation flags away from the running coroutine.
+    ctrl = {"paused": False, "cancelled": False,
+            "input_cost_per_m": input_cost_per_m, "output_cost_per_m": output_cost_per_m,
+            "model_used": model_name, "pinned_ref": None}
     handle = _spawn(_run_phases(run_id, ctrl, qa_mode))
+    ctrl["task"] = handle
     with _registry_lock:
-        _registry[run_id] = {**ctrl, "task": handle,
-                           "input_cost_per_m": input_cost_per_m,
-                           "output_cost_per_m": output_cost_per_m}
+        _registry[run_id] = ctrl
     return {"run": get_run(run_id)}
 
 
@@ -312,6 +316,35 @@ async def _run_phases(run_id: str, ctrl: dict, qa_mode: bool = False):
     llm_tokens = {"in": 0, "out": 0}
     test_summary = ""
     selftest_failed = False
+
+    def _record_model(gen):
+        """Persist the chain member that actually served this codegen call onto
+        the run control so later calls in the SAME task reuse it (the chosen
+        model is pinned per task). A new task run resets it, so the chain is
+        only re-checked from the top when the agent moves on or the sprint
+        restarts. Emits a fallback event whenever the agent had to switch."""
+        used_ref = gen.get("pinned_ref")
+        if used_ref and ctrl.get("pinned_ref") != used_ref:
+            ctrl["pinned_ref"] = used_ref
+            if gen.get("used_provider_model_id"):
+                ctrl["model_used"] = gen["used_provider_model_id"]
+            mid = gen.get("used_model_id")
+            if mid:
+                row = query_one("SELECT input_cost_per_m, output_cost_per_m "
+                                "FROM gateway_models WHERE id = ?", (mid,))
+                if row and row["input_cost_per_m"]:
+                    ctrl["input_cost_per_m"] = row["input_cost_per_m"]
+                    ctrl["output_cost_per_m"] = (row["output_cost_per_m"]
+                                                 or config.LLM_OUTPUT_COST_PER_M)
+        skipped = gen.get("fallbacks") or []
+        if skipped:
+            _emit(project_id, "agent.model_fallback",
+                  {"agent_id": agent_id, "task": task["title"],
+                   "skipped": skipped, "using": ctrl.get("model_used") or used_ref},
+                  workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
+            trail = "→".join((s.get("model") or "?") for s in skipped)
+            evidence.append(f"model-fallback:{trail}→"
+                            f"{ctrl.get('model_used') or gen.get('used_provider_model_id') or used_ref or 'ok'}"[:160])
     # Module-fix tasks (sprint gate rework / legacy health tasks) verify
     # only their own test module, not the whole suite (other modules'
     # pre-existing failures belong to their own tasks).
@@ -357,7 +390,9 @@ async def _run_phases(run_id: str, ctrl: dict, qa_mode: bool = False):
                     # rework_count > 0 means a previous attempt failed QA.
                     feedback = task["blocked_reason"] if task["rework_count"] else ""
                     gen = await asyncio.to_thread(
-                        codegen.generate_implementation, project, task, run["agent_id"], feedback)
+                        codegen.generate_implementation, project, task, run["agent_id"], feedback,
+                        pinned_ref=ctrl.get("pinned_ref"))
+                    _record_model(gen)
                     llm_tokens["in"] += gen["input_tokens"]
                     llm_tokens["out"] += gen["output_tokens"]
                     for rel in gen["files"]:
@@ -418,7 +453,9 @@ async def _run_phases(run_id: str, ctrl: dict, qa_mode: bool = False):
                                 codegen.generate_implementation, project, task,
                                 run["agent_id"],
                                 f"Your code FAILED the build check: {build_summary}\n"
-                                "Return the corrected complete file(s).")
+                                "Return the corrected complete file(s).",
+                                pinned_ref=ctrl.get("pinned_ref"))
+                            _record_model(gen)
                             if gen.get("error") and codegen.is_llm_outage(gen["error"]):
                                 bok = False
                                 build_summary = gen["error"]
@@ -455,7 +492,9 @@ async def _run_phases(run_id: str, ctrl: dict, qa_mode: bool = False):
                                     codegen.generate_implementation, project, task,
                                     run["agent_id"],
                                     f"Your code FAILED the test suite: {test_summary}\n"
-                                    "Return the corrected complete file(s).")
+                                    "Return the corrected complete file(s).",
+                                    pinned_ref=ctrl.get("pinned_ref"))
+                                _record_model(gen)
                                 if gen.get("error") and codegen.is_llm_outage(gen["error"]):
                                     ok = False
                                     test_summary = gen["error"]
@@ -505,7 +544,8 @@ async def _run_phases(run_id: str, ctrl: dict, qa_mode: bool = False):
         task = query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
         in_tokens = llm_tokens["in"]
         out_tokens = llm_tokens["out"]
-        model_name = run.get("model_used") or "scaffold"
+        model_name = ctrl.get("model_used") or run.get("model_used") or "scaffold"
+        cost = 0.0  # scaffold-only runs record no usage; keep cost bound for the finishers
         if not in_tokens and not out_tokens:
             insert("usage_records", {
                 "id": new_id(), "workflow_run_id": run_id, "agent_id": agent_id,
@@ -853,6 +893,7 @@ def cancel_execution(run_id):
         return {"ok": True, "note": "run was not active"}
     ctrl["cancelled"] = True
     ctrl["paused"] = False
+    _cancel_handle(ctrl.get("task"))
     return {"ok": True}
 
 
@@ -905,6 +946,16 @@ def _set_waiting_agents(project_id: str, waiting: bool):
 
 async def _run_sprint(project_id: str, ctrl: dict):
     _emit(project_id, "project.updated", {"note": "Sprint execution started"})
+    try:
+        await _sprint_loop(project_id, ctrl)
+    finally:
+        # Always release the scheduler slot, even on force-cancel or an
+        # unexpected error, so the UI's "Stop" button flips back to "Start".
+        with _schedulers_lock:
+            _schedulers.pop(project_id, None)
+
+
+async def _sprint_loop(project_id: str, ctrl: dict):
     idle_rounds = 0
     while not ctrl["cancelled"]:
         eligible = _eligible_tasks(project_id)
@@ -977,6 +1028,13 @@ async def _run_sprint(project_id: str, ctrl: dict):
             blocked = 0
             auto_assign_tasks(project_id)
             idle_rounds += 1
+            # Default the give-up threshold up front: with the PO enabled it is
+            # only recomputed inside the %10 review branch below, so without a
+            # default an idle round between reviews would reference an
+            # unassigned variable and crash the whole scheduler loop (which
+            # silently stopped assigning tasks to devs).
+            give_up_after = (IDLE_GIVE_UP_CLEAN if po.po_enabled(project_id)
+                             else IDLE_GIVE_UP_BLOCKED)
             if po.po_enabled(project_id):
                 if idle_rounds % 10 == 0:
                     try:
@@ -1043,8 +1101,6 @@ async def _run_sprint(project_id: str, ctrl: dict):
             except Exception as exc:
                 logger.debug("Event archive failed for project %s: %s",
                              project_id, exc)
-    with _schedulers_lock:
-        _schedulers.pop(project_id, None)
 
 
 def _active_project_runs(project_id) -> int:
@@ -1384,16 +1440,43 @@ def start_sprint_execution(project_id: str, sprint_ref=None):
             "auto_drafted": drafted_n}
 
 
+def _cancel_handle(handle):
+    """Best-effort force-cancel of a spawned task from another thread.
+
+    _spawn returns either a concurrent.futures.Future (threadsafe .cancel())
+    or an asyncio.Task (must be cancelled on its own loop)."""
+    if handle is None:
+        return
+    try:
+        if isinstance(handle, asyncio.Future) and _loop is not None and _loop.is_running():
+            _loop.call_soon_threadsafe(handle.cancel)
+        else:
+            handle.cancel()
+    except Exception as exc:
+        logger.debug("Force-cancel failed: %s", exc)
+
+
 def stop_sprint_execution(project_id: str):
     with _schedulers_lock:
-        ctrl = _schedulers.get(project_id)
-    if ctrl:
-        ctrl["cancelled"] = True
+        sched = _schedulers.get(project_id)
+    if sched:
+        sched["cancelled"] = True
+    # Snapshot live run ids under the lock; do DB reads outside it.
     with _registry_lock:
-        for run_id, rc in list(_registry.items()):
-            run = get_run(run_id)
-            if run and run["project_id"] == project_id:
+        run_ids = [rid for rid, rc in _registry.items() if not rc.get("cancelled")]
+    for rid in run_ids:
+        run = get_run(rid)
+        if run and run["project_id"] == project_id:
+            with _registry_lock:
+                rc = _registry.get(rid)
+            if rc:
                 rc["cancelled"] = True
+                rc["paused"] = False
+                _cancel_handle(rc.get("task"))
+    # Cancel the scheduler task too: it may be parked in a to_thread gate/PO
+    # step that doesn't observe the flag promptly, and this guarantees the
+    # coroutine unwinds so _run_sprint frees the _schedulers slot right away.
+    _cancel_handle(sched.get("task") if sched else None)
     return {"ok": True}
 
 

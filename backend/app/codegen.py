@@ -550,48 +550,120 @@ def _feedback_file_blocks(ws_dir: str, feedback: str, limit: int = 3) -> str:
     return ("\n\n" + "\n\n".join(blocks)) if blocks else ""
 
 
-def _agent_model_and_role(project, agent_ref):
-    """Resolve (gateway, model, role_name) for the agent running a task.
+def _find_agent(agent_ref: str):
+    """Resolve an agent row by id (what the runtime passes) or by name."""
+    if not agent_ref:
+        return None
+    return (query_one("SELECT * FROM agents WHERE id = ?", (agent_ref,))
+            or query_one("SELECT * FROM agents WHERE lower(name) = lower(?)", (agent_ref,)))
 
-    The agent's own binding from the Models catalog wins, so the model an
-    agent is configured with is the model it actually runs on. Falls back to
-    the project/bot default (resolve_llm) when the agent has no binding, the
-    binding is inactive, or its gateway has no stored API key. ``agent_ref``
-    is whatever the runtime passes — an agent id — but a name also resolves.
+
+def _agent_role_name(agent) -> str:
+    if not agent:
+        return ""
+    r = query_one("SELECT name FROM roles WHERE id = ?", (agent["role_id"],))
+    return r["name"] if r else ""
+
+
+def _binding_chain(binding_id: str):
+    """Ordered fallback chain carried by ONE Models-catalog entry.
+
+    A model is now an ordered set of gateway+model members (``members_json``);
+    the agent just picks this one model and inference fails over across its
+    members. Each usable member is ``{ref, gateway_id, model_id, gw, model}``.
+    Members whose gateway has no stored key or whose model row is gone are
+    skipped. Falls back to the row's own ``gateway_id``/``model_id`` when
+    ``members_json`` is empty (pre-chain data), so existing models keep working.
     """
-    agent = None
-    if agent_ref:
-        agent = (query_one("SELECT * FROM agents WHERE id = ?", (agent_ref,))
-                 or query_one("SELECT * FROM agents WHERE lower(name) = lower(?)", (agent_ref,)))
-    role_name = ""
-    if agent:
-        r = query_one("SELECT name FROM roles WHERE id = ?", (agent["role_id"],))
-        role_name = r["name"] if r else ""
-        if agent["model_binding_id"]:
-            row = query_one("SELECT gateway_id, model_id FROM model_bindings "
-                            "WHERE id = ? AND active = 1", (agent["model_binding_id"],))
-            if row:
-                gw = query_one("SELECT * FROM gateways WHERE id = ?", (row["gateway_id"],))
-                model = query_one("SELECT * FROM gateway_models WHERE id = ?", (row["model_id"],))
-                if gw and model and get_gateway_key(gw["id"]):
-                    return gw, model, role_name
-    gw, model = resolve_llm(project)
-    return gw, model, role_name
+    if not binding_id:
+        return []
+    row = query_one("SELECT gateway_id, model_id, members_json FROM model_bindings "
+                    "WHERE id = ? AND active = 1", (binding_id,))
+    if not row:
+        return []
+    try:
+        members = json.loads(row["members_json"]) if row["members_json"] else []
+    except (ValueError, TypeError):
+        members = []
+    if not (isinstance(members, list) and members):
+        members = [{"gateway_id": row["gateway_id"], "model_id": row["model_id"]}]
+    chain, seen = [], set()
+    for m in members:
+        if not isinstance(m, dict):
+            continue
+        gid = str(m.get("gateway_id") or "")
+        mid = str(m.get("model_id") or "")
+        ref = f"{gid}:{mid}"
+        if not gid or not mid or ref in seen:
+            continue
+        gw = query_one("SELECT * FROM gateways WHERE id = ?", (gid,))
+        gm = query_one("SELECT * FROM gateway_models WHERE id = ?", (mid,))
+        if gw and gm and get_gateway_key(gw["id"]):
+            chain.append({"ref": ref, "gateway_id": gid, "model_id": mid, "gw": gw, "model": gm})
+            seen.add(ref)
+    return chain
 
 
-def generate_implementation(project, task, agent_ref: str, feedback: str = "") -> dict:
+def _model_chain(project, agent_ref):
+    """Ordered fallback chain the agent runs on, as
+    ``([{'ref', 'gateway_id', 'model_id', 'gw', 'model'}, ...], role_name)``.
+
+    The agent picks a single Model from the catalog; that model's member list is
+    the chain. Falls back to the project/bot default (a one-member chain) when
+    the agent has no binding or the binding resolves to nothing usable, so
+    behaviour matches the old single-model resolution.
+    """
+    agent = _find_agent(agent_ref)
+    role_name = _agent_role_name(agent)
+    chain = []
+    if agent and agent["model_binding_id"]:
+        chain = _binding_chain(agent["model_binding_id"])
+    if not chain:
+        gw, model = resolve_llm(project)
+        if gw and model:
+            chain = [{"ref": f"{gw['id']}:{model.get('id') or ''}",
+                      "gateway_id": gw["id"], "model_id": model.get("id"),
+                      "gw": gw, "model": model}]
+    return chain, role_name
+
+
+def _ordered_for_pin(chain: list, pinned_ref):
+    """Reorder the chain so the pinned (already-working-this-task) member is
+    tried first, keeping the rest as continued fallback. An unknown/None pin
+    leaves the chain untouched (re-check from the top)."""
+    if not pinned_ref:
+        return chain
+    pinned = [e for e in chain if e.get("ref") == pinned_ref]
+    if not pinned:
+        return chain
+    rest = [e for e in chain if e.get("ref") != pinned_ref]
+    return pinned + rest
+
+
+def generate_implementation(project, task, agent_ref: str, feedback: str = "",
+                            pinned_ref: str | None = None) -> dict:
     """Generate real code files for a task into the project workspace.
 
     Returns {"files": [relative paths], "summary": str, "mode": "llm"|"scaffold",
-             "input_tokens": int, "output_tokens": int, "error": str|""}.
+             "input_tokens": int, "output_tokens": int, "error": str|""} plus
+             "pinned_ref" / "used_model_id" / "used_provider_model_id" (the
+             member that actually served the call) and "fallbacks"
+             ([{model, error}] for each earlier chain member that was skipped).
+
+    The chosen Model's ordered member chain is tried in priority order; a member
+    that errors, hits an outage, or returns no usable files falls through to the
+    next. ``pinned_ref`` (the member that already worked earlier in the SAME
+    task) is tried first so the chain isn't re-probed on every call —
+    re-checking from the top happens only when a new task run starts.
     Never raises: python LLM failures degrade to the deterministic scaffold;
     non-python stacks return an error so the rework loop reports honestly
     instead of bolting a FastAPI file onto a Go/.NET/Node project.
     """
     ws_dir = project["workspace_path"]
     stack = toolchains.detect_stack(project, ws_dir)
-    result = {"files": [], "summary": "", "mode": "scaffold",
-              "input_tokens": 0, "output_tokens": 0, "error": ""}
+    result = {"files": [], "summary": "", "mode": "scaffold", "input_tokens": 0,
+              "output_tokens": 0, "error": "", "pinned_ref": None,
+              "used_model_id": None, "used_provider_model_id": None, "fallbacks": []}
     if not ws_dir or not os.path.isdir(ws_dir):
         result["error"] = "workspace missing"
         return result
@@ -608,8 +680,8 @@ def generate_implementation(project, task, agent_ref: str, feedback: str = "") -
                              "Developer — CALL these instead of re-implementing, it saves tokens):\n"
                              f"{index}\n")
 
-    gw, model, role_name = _agent_model_and_role(project, agent_ref)
-    if gw and model:
+    chain, role_name = _model_chain(project, agent_ref)
+    if chain:
         from .chatbot import _extract_json
         system_prompt = (_JR_DEV_SYSTEM if stack == "python" and _is_junior_dev(role_name or agent_ref)
                          else _system_for(stack))
@@ -646,41 +718,55 @@ def generate_implementation(project, task, agent_ref: str, feedback: str = "") -
                         files.append((rel, content))
             return data, files
 
-        try:
-            resp = call_llm(gw, model, system_prompt, user_prompt, max_tokens=8000)
-            data, files = _usable_files(resp["text"])
-            if not files:
-                retry_prompt = (user_prompt + "\n\nIMPORTANT: your previous reply was not the "
-                                "required JSON object. Reply with ONLY the raw JSON object "
-                                '{"summary": ..., "files": [{"path": ..., "content": ...}]} '
-                                "starting with { and ending with }.")
-                resp = call_llm(gw, model, system_prompt, retry_prompt, max_tokens=8000)
+        # Try each member of the (pin-aware) chain in order. A member that
+        # errors, reports an outage, or returns no usable files is recorded and
+        # we move to the next; the first to produce files wins and is returned.
+        for entry in _ordered_for_pin(chain, pinned_ref):
+            gw, model = entry["gw"], entry["model"]
+            model_label = model.get("provider_model_id") or model.get("display_name") or "?"
+            try:
+                resp = call_llm(gw, model, system_prompt, user_prompt, max_tokens=8000)
                 data, files = _usable_files(resp["text"])
-            if files:
-                for rel, content in files:
-                    dest = os.path.join(ws_dir, rel.replace("/", os.sep))
-                    os.makedirs(os.path.dirname(dest), exist_ok=True)
-                    with open(dest, "w", encoding="utf-8", newline="\n") as fh:
-                        fh.write(content)
-                result.update({"files": [r for r, _ in files], "summary": str(data.get("summary") or "")[:200],
-                               "mode": "llm", "input_tokens": resp["input_tokens"],
-                               "output_tokens": resp["output_tokens"]})
-                if stack == "python":
-                    toolchains.ensure_pyproject(ws_dir)
-                return result
-            # Distinguish a genuine outage (quota / usage limit / overloaded)
-            # from a model that just didn't follow the format. An outage must
-            # surface as a clear, non-retryable error — NOT fall through to a
-            # task-named scaffold that looks like real work.
-            outage = _llm_outage_reason(resp.get("text") or "")
-            if outage:
-                result["error"] = outage
-                result["summary"] = f"failed: {outage}"
-                return result
-            result["error"] = "model returned no usable files"
-        except Exception as exc:
-            result["error"] = str(exc)[:200]
+                if not files:
+                    retry_prompt = (user_prompt + "\n\nIMPORTANT: your previous reply was not the "
+                                    "required JSON object. Reply with ONLY the raw JSON object "
+                                    '{"summary": ..., "files": [{"path": ..., "content": ...}]} '
+                                    "starting with { and ending with }.")
+                    resp = call_llm(gw, model, system_prompt, retry_prompt, max_tokens=8000)
+                    data, files = _usable_files(resp["text"])
+                if files:
+                    for rel, content in files:
+                        dest = os.path.join(ws_dir, rel.replace("/", os.sep))
+                        os.makedirs(os.path.dirname(dest), exist_ok=True)
+                        with open(dest, "w", encoding="utf-8", newline="\n") as fh:
+                            fh.write(content)
+                    result.update({"files": [r for r, _ in files],
+                                   "summary": str(data.get("summary") or "")[:200],
+                                   "mode": "llm", "input_tokens": resp["input_tokens"],
+                                   "output_tokens": resp["output_tokens"],
+                                   "pinned_ref": entry.get("ref"),
+                                   "used_model_id": entry.get("model_id"),
+                                   "used_provider_model_id": model.get("provider_model_id")})
+                    if stack == "python":
+                        toolchains.ensure_pyproject(ws_dir)
+                    return result
+                # Distinguish a genuine outage (quota / usage limit / overloaded)
+                # from a model that just didn't follow the format.
+                error = _llm_outage_reason(resp.get("text") or "") or "model returned no usable files"
+            except Exception as exc:
+                error = str(exc)[:200]
+            # This member failed — record it as a fallback step and try the next.
+            result["fallbacks"].append({"model": model_label, "error": error[:160]})
+            result["error"] = error[:200]
+        # Whole chain failed. A genuine outage (quota / rate limit / provider
+        # down) must surface as a clear, non-retryable error and NOT fall
+        # through to a task-named scaffold that looks like real work — the
+        # runtime keys off is_llm_outage() to stop burning quota.
+        if result["error"]:
+            result["summary"] = f"failed: {result['error']}"
 
+    if is_llm_outage(result.get("error") or ""):
+        return result
     if stack != "python":
         # No fake scaffold for other stacks — surface the failure so the
         # rework loop / human escalation sees the real error.

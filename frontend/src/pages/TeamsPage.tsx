@@ -102,13 +102,12 @@ function AgentForm({ agent, teams = [], onClose, onSaved }: {
   const { data: models } = useAsyncData<any[]>(() => get('/api/v1/models'), []);
   const [f, setF] = React.useState({
     name: agent?.name ?? '', role_id: agent?.role_id ?? '',
-    persona_id: agent?.persona_id ?? '', model_binding_id: agent?.model_binding_id ?? '',
+    persona_id: agent?.persona_id ?? '',
+    model_binding_id: agent?.model_binding_id ?? '',
     lifecycle_state: agent?.lifecycle_state ?? 'Idle',
   });
   const upd = (k: string) => (e: any) => setF({ ...f, [k]: e.target.value });
   const rolePersonas = (personas ?? []).filter((p) => p.role_id === f.role_id);
-  // Models are a global catalog; keep the agent's current selection visible
-  // even if it has since been deactivated so editing never silently drops it.
   const allModels = (models ?? []).filter((m) => m.active || m.id === f.model_binding_id);
   const memberOf = (agent ? teams.filter((t) => (t.agents ?? []).some((m: any) => m.id === agent.id)) : []);
 
@@ -146,11 +145,31 @@ function AgentForm({ agent, teams = [], onClose, onSaved }: {
           {rolePersonas.map((p) => <option key={p.id} value={p.id}>{p.name} (v{p.version})</option>)}
         </select>
       </Field>
-      <Field label="Model (from the Models tab)">
+      <Field label="Model">
         <select value={f.model_binding_id} onChange={upd('model_binding_id')}>
-          <option value="">— none —</option>
-          {allModels.map((m) => <option key={m.id} value={m.id}>{m.name} · {m.provider_model_id}</option>)}
+          <option value="">— project default model —</option>
+          {allModels.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.name}{m.members?.length > 1 ? ` (1 primary + ${m.members.length - 1} fallback${m.members.length - 1 > 1 ? 's' : ''})` : ''}
+            </option>
+          ))}
         </select>
+        {(() => {
+          const sel = allModels.find((m) => m.id === f.model_binding_id);
+          const ms: any[] = sel?.members ?? [];
+          if (ms.length <= 1) return (
+            <div className="muted small" style={{ marginTop: 4 }}>
+              This model carries a single gateway + model. Add fallback members to it
+              in the Models tab to make the agent fail over automatically.
+            </div>
+          );
+          return (
+            <div className="muted small" style={{ marginTop: 4 }}>
+              Failover order within this model:{' '}
+              {ms.map((mm, i) => `${i + 1}. ${mm.gateway_name} · ${mm.name}`).join('  →  ')}
+            </div>
+          );
+        })()}
         {allModels.length === 0 && (
           <div className="muted small" style={{ marginTop: 4 }}>
             No models yet — create one in the Models tab.
