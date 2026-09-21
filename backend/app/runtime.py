@@ -980,7 +980,11 @@ async def _run_sprint(project_id: str, ctrl: dict):
             if po.po_enabled(project_id):
                 if idle_rounds % 10 == 0:
                     try:
-                        await asyncio.to_thread(po.po_autonomy_tick, project_id)
+                        # Periodic idle pass: suppress the "nothing to do"
+                        # narration so a steady loop can't spam the main chat.
+                        # Genuine actions and stuck/error states still surface.
+                        await asyncio.to_thread(po.po_autonomy_tick, project_id,
+                                                announce_no_action=False)
                     except Exception as exc:
                         logger.warning("PO autonomy tick failed for project %s: %s",
                                        project_id, exc)
@@ -1181,6 +1185,7 @@ def auto_assign_tasks(project_id: str) -> dict:
     avail = [dict(m) for m in members]
     assigned = 0
     pending = []
+    assigned_lines = []
     for t in tasks:
         family = _family_for_task(t)
         pick, matched = _pick_member(avail, family)
@@ -1196,7 +1201,20 @@ def auto_assign_tasks(project_id: str) -> dict:
                     "role": pick["role_name"], "family": family, "role_matched": matched,
                     "note": note.strip(), "auto": True},
                    task_id=t["id"], agent_id=pick["id"])
+        assigned_lines.append(f"- '{t['title']}' → {pick['name']} ({pick['role_name']}){note}")
         assigned += 1
+    if assigned_lines:
+        # Surface scheduler auto-assignments in the main chat too — the owner
+        # should see work reaching the devs even when it wasn't the PO who
+        # handed it out. Only fires on a real assignment (state change), so it
+        # can't spam an idle loop.
+        try:
+            po.po_narrate(
+                project_id,
+                "🛠️ **Scheduler** auto-assigned work to the team:\n"
+                + "\n".join(assigned_lines))
+        except Exception as exc:  # narration must never break the loop
+            logger.debug("auto-assign narration skipped: %s", exc)
     if pending:
         logger.debug("%d task(s) pending assignment (specialist busy) for project %s",
                      len(pending), project_id)

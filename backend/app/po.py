@@ -87,11 +87,17 @@ Current project state:
 
 # ---------------------------------------------------------------- narration
 
-def po_narrate(project_id: str, text: str):
+def po_narrate(project_id: str, text: str, *, dedupe: bool = False):
     """Post a Product Owner update into the project's MAIN control chat so
     autonomous PO activity is visible where the owner chats. The dedicated
-    'Product Owner' conversation is excluded (it has its own thread)."""
-    if not str(text or "").strip():
+    'Product Owner' conversation is excluded (it has its own thread).
+
+    With ``dedupe=True``, an identical message is suppressed when it matches
+    the most recent assistant message already in that chat — this stops the
+    periodic idle tick from spamming the same 'nothing to do' line while still
+    letting genuine, distinct updates through."""
+    text = str(text or "").strip()
+    if not text:
         return None
     conv = query_one(
         "SELECT * FROM conversations WHERE project_id = ? AND title != ? "
@@ -101,6 +107,12 @@ def po_narrate(project_id: str, text: str):
         insert("conversations", {"id": (cid := new_id()), "project_id": project_id,
                                  "title": MAIN_CONV_TITLE, "created_at": ts, "updated_at": ts})
         conv = query_one("SELECT * FROM conversations WHERE id = ?", (cid,))
+    if dedupe:
+        last = query_one(
+            "SELECT content FROM messages WHERE conversation_id = ? AND role = 'assistant' "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1", (conv["id"],))
+        if last and str(last["content"]).strip() == text:
+            return conv["id"]
     insert("messages", {"id": new_id(), "conversation_id": conv["id"], "role": "assistant",
                         "content": text, "created_at": now()})
     update("conversations", conv["id"], {"updated_at": now()})
@@ -116,6 +128,17 @@ def _narrate_actions(project_id: str, agent_name: str, summary: str, actions: li
         lines.append("")
         lines.extend(f"- {a}" for a in actions)
     po_narrate(project_id, "\n".join(lines))
+
+
+def _narrate_stuck(project_id: str, agent_name: str, reason: str, *, dedupe: bool = True):
+    """Main-chat narration for an autonomous PO pass that could NOT act
+    (error, no valid plan, or nothing to do). These 'stuck' states used to be
+    silent outside the SSE feed, which is exactly what made the PO look frozen
+    to the owner. Deduped so the periodic idle tick can't spam the same line."""
+    agent_name = agent_name or "Product Owner"
+    po_narrate(project_id,
+               f"👑 **{agent_name} (Product Owner)** could not act this pass: {reason}",
+               dedupe=dedupe)
 
 
 # ---------------------------------------------------------------- status
@@ -756,12 +779,21 @@ def handle_po_message(project_id: str, text: str, attachments=None) -> dict:
 # ---------------------------------------------------------------- autonomous review tick
 
 def po_autonomy_tick(project_id: str, instruction: str | None = None,
-                     emit_no_model: bool = False) -> str | None:
+                     emit_no_model: bool = False,
+                     announce_no_action: bool = True) -> str | None:
     """One autonomous Product Owner review pass. Called from the sprint loop
     and right after enabling: the PO reviews current state and acts. Returns
-    a short summary of what changed (None when the PO could not run)."""
+    a short summary of what changed (None when the PO could not run).
+
+    Every outcome is surfaced into the project's MAIN chat so the owner can see
+    what the PO is doing — including the 'stuck' states (error, no valid plan,
+    nothing to do) that used to be silent. ``announce_no_action=False`` is used
+    by the periodic idle tick so a steady 'nothing to do' doesn't spam the chat
+    (event-driven ticks with a real instruction still announce)."""
     if not po_enabled(project_id):
         return None
+    agent = po_agent_for_project(project_id)
+    agent_name = agent["name"] if agent else None
     ask = instruction or (
         "Do a Product Owner review pass: examine requirements, sprints and tasks "
         "(especially blocked or unassigned items) and take any actions needed to "
@@ -771,12 +803,15 @@ def po_autonomy_tick(project_id: str, instruction: str | None = None,
     except Exception as exc:
         logger.warning("PO autonomy tick failed for project %s: %s", project_id, exc)
         emit_event(project_id, "po.review", {"ok": False, "error": str(exc)[:300]})
+        _narrate_stuck(project_id, agent_name,
+                       f"the review errored out ({str(exc)[:200]}). I'll retry on the next pass.")
         return None
     if not parsed:
+        reason = ("the PO model returned no valid plan (check the gateway key / usage quota "
+                  "under Settings).")
         if emit_no_model:
-            emit_event(project_id, "po.review",
-                       {"ok": False, "error": "PO model returned no valid plan "
-                                              "(check gateway key / usage quota under Settings)"})
+            emit_event(project_id, "po.review", {"ok": False, "error": reason})
+        _narrate_stuck(project_id, agent_name, reason)
         return None
     actions = _apply_actions(project_id, parsed.get("actions"))
     resumed = _ensure_delivery_running(project_id, _stop_requested(parsed.get("actions")))
@@ -788,6 +823,14 @@ def po_autonomy_tick(project_id: str, instruction: str | None = None,
                 "actions": actions[:10] if actions else [],
                 "acted": bool(actions)})
     if actions:
-        agent = po_agent_for_project(project_id)
-        _narrate_actions(project_id, agent["name"] if agent else None, summary, actions)
+        _narrate_actions(project_id, agent_name, summary, actions)
+    elif announce_no_action:
+        # Ran cleanly but changed nothing. Say so in the main chat (deduped)
+        # so a 'stuck' PO is visible rather than silent.
+        _narrate_stuck(
+            project_id, agent_name,
+            "no action was needed this pass — "
+            + (summary[:200] if summary else
+               "requirements are met / no unblocked work remains."),
+            dedupe=True)
     return summary
