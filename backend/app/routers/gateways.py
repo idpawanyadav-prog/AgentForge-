@@ -141,7 +141,7 @@ def delete_model(gid: str, mid: str):
 
 
 @router.post("/gateways/{gid}/test-chat")
-async def gateway_test_chat(gid: str, body: TestChatIn):
+def gateway_test_chat(gid: str, body: TestChatIn):
     """Live single-turn inference against a gateway model (playground)."""
     from ..codegen import GatewayClient
 
@@ -150,7 +150,7 @@ async def gateway_test_chat(gid: str, body: TestChatIn):
                       (body.model_id, gid))
     if not model:
         raise HTTPException(404, "Model not found on this gateway")
-    result = await GatewayClient.call(gw, model, body.message, max_tokens=512)
+    result = GatewayClient.call(gw, model, body.message, max_tokens=512)
     reply = result["text"]
     latency_ms = result.get("latency_ms", 0)
     in_t = result.get("input_tokens", 0)

@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import chatbot, db, po, runtime, workspace
-from .routers import agents, chat, gateways, projects, roles, settings, tasks
+from .routers import agents, chat, gateways, models, projects, roles, settings, tasks
 from .rate_limit import rate_limit_middleware
 
 logger = logging.getLogger(__name__)
@@ -81,6 +81,7 @@ app.middleware("http")(rate_limit_middleware)
 # Mount routers
 app.include_router(gateways.router)
 app.include_router(roles.router)
+app.include_router(models.router)
 app.include_router(agents.router)
 app.include_router(projects.router)
 app.include_router(tasks.router)

@@ -58,7 +58,7 @@ Available actions:
     "note"?: str} — clears the blocker and makes the task Ready again (also resets its rework counter)
 - {"action": "cancel_task", "task": "<title or partial>", "reason"?: str}
 - {"action": "start_sprint", "sprint"?: "<sprint number/name; default: active or first planned>"}
-- {"action": "stop_sprint": {}}
+- {"action": "stop_sprint"}
 
 Rules:
 - Task titles must match real work: development tasks go to developers, QA tasks to QA agents,

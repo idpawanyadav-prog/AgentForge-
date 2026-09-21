@@ -248,7 +248,9 @@ Todo → Ready → In Progress → Review → Testing → Done
 
 ### 5.3  Agent Lifecycle States
 
-`Idle → Working → Waiting → Blocked → Paused → Completed / Failed`
+Valid states (`AGENT_STATES` in `runtime.py`), in declared order:
+
+`Idle → Working → Waiting → Blocked → Failed → Paused → Completed`
 
 ### 5.4  Sprint Execution Scheduler (`runtime.py`)
 
@@ -372,13 +374,13 @@ Sensitive commands (gateways, agents, teams) require user confirmation.
 
 ### Database Layer (`db.py`)
 All queries use raw SQL via helper functions:
-- `query(sql, params)` → list of dicts
-- `query_one(sql, params)` → single dict or None
-- `execute(sql, params)` → rowcount (with retry on SQLite lock)
-- `insert(table, dict)` → inserts, returns new ID
-- `update(table, id, dict)` → updates by primary key
-- `emit_event(project_id, event_type, payload)` → appends to `events` table
-- `audit(action, resource_type, resource_id, summary)` → appends to `audit`
+- `query(sql, params=())` → list of dicts
+- `query_one(sql, params=())` → single dict or None
+- `execute(sql, params=())` → rowcount; commits, retries twice on transient `OperationalError`
+- `insert(table, values: dict)` → inserts, returns the new ID (str)
+- `update(table, entity_id, values: dict)` → updates by primary key
+- `emit_event(project_id, event_type, payload, *, workflow_run_id=None, agent_run_id=None, task_id=None, agent_id=None)` → appends to the `execution_events` table, returns event ID (str)
+- `audit(action, resource_type, resource_id=None, summary="", actor="user")` → appends to `audit_events`
 
 ### Event System
 - Events are stored in the `events` table with per-project `seq` numbers

@@ -3,10 +3,11 @@ import { get, put } from './api';
 import ControlPage from './pages/ControlPage';
 import ProjectsPage from './pages/ProjectsPage';
 import TeamsPage from './pages/TeamsPage';
+import ModelsPage from './pages/ModelsPage';
 import MemoryPage from './pages/MemoryPage';
 import SettingsPage from './pages/SettingsPage';
 
-type Page = 'control' | 'projects' | 'teams' | 'memory' | 'settings';
+type Page = 'control' | 'projects' | 'teams' | 'models' | 'memory' | 'settings';
 
 const loadUi = (key: string, fallback: string) => {
   try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
@@ -19,6 +20,7 @@ const NAV: { id: Page; icon: string; label: string }[] = [
   { id: 'control', icon: '◉', label: 'Project Control' },
   { id: 'projects', icon: '▤', label: 'Projects' },
   { id: 'teams', icon: '⧉', label: 'Teams' },
+  { id: 'models', icon: '◈', label: 'Models' },
   { id: 'memory', icon: '✦', label: 'Agent Memory' },
   { id: 'settings', icon: '⚙', label: 'Settings' },
 ];
@@ -126,6 +128,7 @@ export default function App() {
           <ProjectsPage activeProject={activeProject} setActiveProject={setActiveProject} onOpenControl={() => setPage('control')} />
         )}
         {page === 'teams' && <TeamsPage />}
+        {page === 'models' && <ModelsPage />}
         {page === 'memory' && <MemoryPage />}
         {page === 'settings' && <SettingsPage />}
       </main>

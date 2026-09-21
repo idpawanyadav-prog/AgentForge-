@@ -35,7 +35,7 @@ export default function TeamsPage() {
             <div className="kv" style={{ marginTop: 6 }}>
               Role: {a.role_name ?? '—'}<br />
               Persona: {a.persona_name ?? '—'} (v{a.persona_version ?? '?'})<br />
-              Model: {a.provider_model_id ?? 'not bound'}
+              Model: {a.model_name ?? a.provider_model_id ?? 'not bound'}
             </div>
             {a.current_activity && <div className="agent-activity">{a.current_activity}</div>}
             <div className="btn-row" style={{ marginTop: 10 }}>
@@ -99,43 +99,26 @@ function AgentForm({ agent, teams = [], onClose, onSaved }: {
 }) {
   const { data: roles } = useAsyncData<any[]>(() => get('/api/v1/roles'), []);
   const { data: personas } = useAsyncData<any[]>(() => get('/api/v1/personas'), []);
-  const { data: bindings } = useAsyncData<any[]>(() => get('/api/v1/model-bindings'), []);
-  const { data: gateways } = useAsyncData<any[]>(() => get('/api/v1/gateways'), []);
-  const [gwModels, setGwModels] = React.useState<any[]>([]);
+  const { data: models } = useAsyncData<any[]>(() => get('/api/v1/models'), []);
   const [f, setF] = React.useState({
     name: agent?.name ?? '', role_id: agent?.role_id ?? '',
-    persona_id: agent?.persona_id ?? '', gateway_id: '', model_id: '',
+    persona_id: agent?.persona_id ?? '', model_binding_id: agent?.model_binding_id ?? '',
     lifecycle_state: agent?.lifecycle_state ?? 'Idle',
   });
   const upd = (k: string) => (e: any) => setF({ ...f, [k]: e.target.value });
   const rolePersonas = (personas ?? []).filter((p) => p.role_id === f.role_id);
-  const roleBindings = (bindings ?? []).filter((b) => b.role_id === f.role_id);
+  // Models are a global catalog; keep the agent's current selection visible
+  // even if it has since been deactivated so editing never silently drops it.
+  const allModels = (models ?? []).filter((m) => m.active || m.id === f.model_binding_id);
   const memberOf = (agent ? teams.filter((t) => (t.agents ?? []).some((m: any) => m.id === agent.id)) : []);
-
-  React.useEffect(() => {
-    if (agent && bindings) {
-      const b = bindings.find((x) => x.id === agent.model_binding_id);
-      if (b) setF((p) => ({ ...p, gateway_id: b.gateway_id, model_id: b.model_id }));
-    }
-  }, [agent, bindings]);
-  React.useEffect(() => {
-    if (!f.gateway_id) { setGwModels([]); return; }
-    get(`/api/v1/gateways/${f.gateway_id}/models`).then(setGwModels).catch(() => setGwModels([]));
-  }, [f.gateway_id]);
 
   const save = async () => {
     const personaId = f.persona_id || rolePersonas[0]?.id || '';
-    let bindingId = roleBindings[0]?.id || null;
-    if (f.gateway_id && f.model_id) {
-      const existing = (bindings ?? []).find((b) =>
-        b.role_id === f.role_id && b.gateway_id === f.gateway_id && b.model_id === f.model_id);
-      try {
-        bindingId = existing ? existing.id
-          : (await post('/api/v1/model-bindings', { role_id: f.role_id, gateway_id: f.gateway_id, model_id: f.model_id })).id;
-      } catch (e: any) { alert(e.message); return; }
-    }
     try {
-      const payload = { name: f.name, role_id: f.role_id, persona_id: personaId, model_binding_id: bindingId };
+      const payload = {
+        name: f.name, role_id: f.role_id, persona_id: personaId,
+        model_binding_id: f.model_binding_id || null,
+      };
       // Only send lifecycle_state when the operator actually changed it in the
       // form — otherwise a stale snapshot would overwrite runtime state.
       if (agent && f.lifecycle_state !== agent.lifecycle_state) {
@@ -152,7 +135,7 @@ function AgentForm({ agent, teams = [], onClose, onSaved }: {
     <Modal title={agent ? `Edit Agent: ${agent.name}` : 'Create Agent'} onClose={onClose}>
       <Field label="Agent name"><input value={f.name} onChange={upd('name')} /></Field>
       <Field label="Role">
-        <select value={f.role_id} onChange={(e) => setF({ ...f, role_id: e.target.value, persona_id: '', gateway_id: '', model_id: '' })}>
+        <select value={f.role_id} onChange={(e) => setF({ ...f, role_id: e.target.value, persona_id: '' })}>
           <option value="">— select role —</option>
           {(roles ?? []).map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
         </select>
@@ -163,17 +146,16 @@ function AgentForm({ agent, teams = [], onClose, onSaved }: {
           {rolePersonas.map((p) => <option key={p.id} value={p.id}>{p.name} (v{p.version})</option>)}
         </select>
       </Field>
-      <Field label="Gateway (inherits role default)">
-        <select value={f.gateway_id} onChange={(e) => setF({ ...f, gateway_id: e.target.value, model_id: '' })} disabled={!f.role_id}>
-          <option value="">— role default —</option>
-          {(gateways ?? []).map((g) => <option key={g.id} value={g.id}>{g.name} ({g.provider})</option>)}
+      <Field label="Model (from the Models tab)">
+        <select value={f.model_binding_id} onChange={upd('model_binding_id')}>
+          <option value="">— none —</option>
+          {allModels.map((m) => <option key={m.id} value={m.id}>{m.name} · {m.provider_model_id}</option>)}
         </select>
-      </Field>
-      <Field label="Model">
-        <select value={f.model_id} onChange={upd('model_id')} disabled={!f.gateway_id}>
-          <option value="">{f.gateway_id ? '— select model —' : '— role default —'}</option>
-          {gwModels.map((m) => <option key={m.id} value={m.id}>{m.provider_model_id}</option>)}
-        </select>
+        {allModels.length === 0 && (
+          <div className="muted small" style={{ marginTop: 4 }}>
+            No models yet — create one in the Models tab.
+          </div>
+        )}
       </Field>
       {agent && (
         <Field label="Lifecycle state (set to Idle to unstick a busy agent)">

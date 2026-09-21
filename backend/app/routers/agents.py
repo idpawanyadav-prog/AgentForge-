@@ -34,7 +34,7 @@ def list_agents(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=
     total = query_one("SELECT COUNT(*) AS n FROM agents")["n"]
     items = query(
         "SELECT a.*, r.name AS role_name, p.name AS persona_name, p.version AS persona_version, "
-        "gm.provider_model_id FROM agents a "
+        "mb.name AS model_name, gm.provider_model_id FROM agents a "
         "LEFT JOIN roles r ON r.id = a.role_id "
         "LEFT JOIN personas p ON p.id = a.persona_id "
         "LEFT JOIN model_bindings mb ON mb.id = a.model_binding_id "
