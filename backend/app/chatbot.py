@@ -381,9 +381,7 @@ def _generate_role_kit(role) -> str:
         binding_note = "no model binding (configure a gateway in Settings)"
         gw, model = _default_gateway_and_model()
         if gw and model:
-            insert("model_bindings", {"id": new_id(), "role_id": role["id"], "gateway_id": gw["id"],
-                                      "model_id": model["id"], "settings_json": '{"temperature": 0.3}',
-                                      "active": 1})
+            db.ensure_model_binding(gw["id"], model["id"], settings_json='{"temperature": 0.3}')
             binding_note = f"model binding to {model['provider_model_id']} @ {gw['name']}"
         return (f"persona 'Default {role['name']}', charter instruction file, "
                 f"{n_skills} skill(s), {binding_note}")
@@ -455,7 +453,7 @@ def _hire_agent_for_role(role, name=None):
     """Create a fully functional agent for a role (persona + role model binding)."""
     persona = _ensure_role_persona(role)
     name = name or _next_agent_name(role)
-    binding = query_one("SELECT * FROM model_bindings WHERE role_id = ? AND active = 1", (role["id"],))
+    binding = query_one("SELECT * FROM model_bindings WHERE active = 1 ORDER BY rowid LIMIT 1")
     aid = new_id()
     ts = now()
     insert("agents", {"id": aid, "name": name, "role_id": role["id"],
@@ -594,7 +592,7 @@ def _execute_command(project_id, command, args) -> str:
             return f"Role **{args.get('role')}** not found."
         if not persona:
             persona = _ensure_role_persona(role)
-        binding = query_one("SELECT * FROM model_bindings WHERE role_id = ? AND active = 1", (role["id"],))
+        binding = query_one("SELECT * FROM model_bindings WHERE active = 1 ORDER BY rowid LIMIT 1")
         aid = new_id()
         insert("agents", {"id": aid, "name": args["name"], "role_id": role["id"],
                           "persona_id": persona["id"],
@@ -606,7 +604,7 @@ def _execute_command(project_id, command, args) -> str:
         if binding:
             m = query_one("SELECT provider_model_id FROM gateway_models WHERE id = ?", (binding["model_id"],))
             if m:
-                model_note = f" Model: **{m['provider_model_id']}** (inherited from role binding)."
+                model_note = f" Model: **{m['provider_model_id']}** (default from the Models catalog)."
         return f"Agent **{args['name']}** created from role **{role['name']}** + persona **{persona['name']}**.{model_note}"
 
     if command == "create_team":

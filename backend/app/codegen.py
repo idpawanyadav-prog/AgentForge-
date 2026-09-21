@@ -11,25 +11,23 @@ deterministic, runnable FastAPI + pytest scaffold so the workspace always
 contains working code.
 """
 import json
-import logging
 import os
 import re
 import shutil
 import time
 import urllib.error as uerr
-import urllib.request as ureq
-from typing import Any
 
 from .db import get_gateway_key, query, query_one
 from . import toolchains
-
-logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------- LLM access
 
 def call_llm(gw, model, system_prompt: str, user_text: str, max_tokens: int = 8000) -> dict:
     """Live inference call. Returns {"text", "input_tokens", "output_tokens"}."""
+    import urllib.error as uerr
+    import urllib.request as ureq
+
     api_key = get_gateway_key(gw["id"])
     if not api_key:
         raise RuntimeError("No API key stored for the configured gateway")
@@ -69,8 +67,6 @@ def call_llm(gw, model, system_prompt: str, user_text: str, max_tokens: int = 80
         in_toks = usage.get("input_tokens") or 0
         out_toks = usage.get("output_tokens") or 0
     else:
-        if not data.get("choices"):
-            raise RuntimeError("Gateway returned an empty response with no choices")
         text = data["choices"][0]["message"]["content"] or ""
         in_toks = usage.get("prompt_tokens") or 0
         out_toks = usage.get("completion_tokens") or 0
@@ -181,10 +177,12 @@ class GatewayClient:
         )
 
 
-# ---------------------------------------------------------------- model selection
-
 def resolve_llm(project):
-    """Pick (gateway, model) for code generation."""
+    """Pick (gateway, model) for code generation: the project's default
+    gateway when it has a key, else the control-bot gateway. (None, None)
+    when nothing usable is configured. The model is chosen from the
+    gateway's catalog — plain chat/coding models only; the control bot's
+    tool-calling routing model is never used for code generation."""
     candidates = []
     if project and project["default_gateway_id"]:
         candidates.append(project["default_gateway_id"])
@@ -199,188 +197,609 @@ def resolve_llm(project):
     return None, None
 
 
-_BAD_MODEL_TOKENS = ("embed", "image", "audio", "whisper", "tts", "dall", "fable-")
+# Preferred code-generation models, in order. Anything whose id contains a
+# _BAD_MODEL_TOKENS entry is never selected (embedders, image/audio models,
+# and the control bot's tool-call-tuned "fable" routing models).
+_CODEGEN_MODEL_PREF = (
+    "claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5",
+    "claude-sonnet-4", "claude-opus-5", "claude-opus-4", "gpt-4.1", "gpt-4o",
+)
+_BAD_MODEL_TOKENS = ("embedding", "whisper", "dall-e", "tts", "image",
+                     "fable", "default")
 
-def _pick_codegen_model(gateway_id: str, preferred_id: str | None) -> dict | None:
-    """Pick the best chat/coding model from a gateway's catalog."""
-    models = query(
-        "SELECT * FROM gateway_models WHERE gateway_id=? AND active=1 ORDER BY display_name",
+
+def _pick_codegen_model(gateway_id: str, fallback_model) -> dict:
+    rows = query(
+        "SELECT provider_model_id FROM gateway_models WHERE gateway_id = ? AND active = 1",
         (gateway_id,))
-    if not models:
-        return None
-    if preferred_id:
-        for m in models:
-            if m["id"] == preferred_id:
-                return m
-    for m in models:
-        low = m["provider_model_id"].lower()
-        if not any(t in low for t in _BAD_MODEL_TOKENS):
-            return m
-    return models[0]
+    text_models = [r["provider_model_id"] for r in rows
+                   if not any(b in (r["provider_model_id"] or "").lower()
+                              for b in _BAD_MODEL_TOKENS)]
+    for pref in _CODEGEN_MODEL_PREF:
+        for m in text_models:
+            if m == pref:
+                return {"provider_model_id": m}
+    for pref in _CODEGEN_MODEL_PREF:
+        for m in text_models:
+            if m.startswith(pref):
+                return {"provider_model_id": m}
+    if text_models:
+        return {"provider_model_id": text_models[0]}
+    return fallback_model or {"provider_model_id": "claude-sonnet-5"}
 
 
-# ---------------------------------------------------------------- codegen helpers
-
-def is_llm_outage(gw, exc: Exception) -> bool:
-    return isinstance(exc, RuntimeError) and "Could not reach gateway" in str(exc)
-
-
-def _llm_outage_reason(exc: Exception) -> str:
-    s = str(exc)
-    if "HTTP" in s:
-        return f"Provider returned an error: {s[:120]}"
-    return f"Provider unreachable: {s[:120]}"
+def is_llm_outage(error: str) -> bool:
+    """True when a codegen error is an LLM outage/quota condition — the
+    caller must stop retrying (each retry burns quota) and block with the
+    clear reason instead of burning self-fix / health rounds."""
+    return bool(error) and _llm_outage_reason(error) != "" or \
+        (error or "").lower().startswith(("llm usage limit", "llm quota",
+                                          "llm rate limited", "llm provider overloaded"))
 
 
-def _system_for(role: str) -> str:
-    family = {
-        "backend": "You are a backend engineer.",
-        "frontend": "You are a frontend engineer.",
-        "qa": "You are a QA engineer.",
-        "devops": "You are a DevOps engineer.",
-        "architect": "You are a software architect.",
-    }.get(role, "You are a software engineer.")
-    return f"{family} Write production-ready, well-documented code."
+def _llm_outage_reason(text: str) -> str:
+    """Detect an LLM outage / quota / rate-limit message in the response
+    text. Returns a clean reason string, or '' when this looks like a
+    normal (but unusable) reply. These must surface as outages, not
+    'no usable files' — the model literally cannot help right now."""
+    low = text.lower()
+    for pat, label in (
+        ("usage limit", "LLM usage limit reached (quota exhausted)"),
+        ("quota", "LLM quota exhausted"),
+        ("rate limit", "LLM rate limited"),
+        ("overloaded", "LLM provider overloaded"),
+        ("insufficient", "LLM insufficient credits/balance"),
+        ("temporarily unavailable", "LLM temporarily unavailable"),
+        ("service unavailable", "LLM service unavailable"),
+    ):
+        if pat in low:
+            return label
+    return ""
 
 
-def _is_junior_dev(role_name: str) -> bool:
-    return "junior" in role_name.lower() or "intern" in role_name.lower()
+# ---------------------------------------------------------------- codegen
+
+_SHARED_RULES = """- Contribute to ONE coherent application with a conventional
+  layout for its stack — extend existing files rather than creating
+  task-named one-offs.
+- NEVER name a file after the task title.
+- REUSE the shared helpers file (see REUSABLE HELPERS below): call its
+  functions instead of re-implementing small utilities. New tiny reusable
+  utilities go into that same file (return its FULL updated content).
+- Non-source files (launcher scripts like .bat/.sh, README.md, .env.example,
+  Dockerfile, config) are expected whenever the task asks for them — create
+  exactly the requested file type.
+- Every change MUST come with or update tests that pass with the stack's
+  standard test runner.
+- Keep the full content of every file you touch (no diffs, no placeholders
+  like "...", no TODO-only stubs). 6 files maximum."""
+
+_CODEGEN_SYSTEMS = {
+    "python": """You are a senior software engineer implementing one task of a real project.
+Return ONLY a JSON object (no markdown fences, no prose, no tool calls):
+{"summary": "<one line>", "files": [{"path": "<relative/path>", "content": "<full file content>"}]}
+Structure rules:
+- Contribute to ONE coherent application with a conventional layout:
+  app/main.py (FastAPI app + include_router calls), app/routers/, app/services/,
+  app/models.py, app/helpers.py (shared reusable helpers — owned by the
+  Junior Developer), requirements.txt, tests/test_*.py.
+- If you add an APIRouter, register it in app/main.py and return main.py's
+  FULL updated content in files.
+- Use FastAPI for web/API projects; otherwise plain Python modules.
+""" + _SHARED_RULES,
+
+    "dotnet": """You are a senior .NET engineer implementing one task of a real project (WPF,
+WinForms, ASP.NET or a class library).
+Return ONLY a JSON object (no markdown fences, no prose, no tool calls):
+{"summary": "<one line>", "files": [{"path": "<relative/path>", "content": "<full file content>"}]}
+Structure rules:
+- Provide/maintain the .sln (or single .csproj), one project per concern:
+  src/<App>/ for the application (WPF XAML + code-behind/MVVM, or ASP.NET
+  controllers/services) and tests/<App>.Tests/ for xUnit tests
+  ([Fact]/[Theory] in *.Tests.csproj with Microsoft.NET.Test.Sdk + xunit).
+- Include <TargetFramework> that matches the installed SDK (net8.0 unless the
+  project already declares another), and <Nullable>enable</Nullable>.
+- For WPF include App.xaml/App.xaml.cs and MainWindow when relevant; use
+  MVVM (ViewModels + INotifyPropertyChanged) for new UI logic.
+- Tests must pass with `dotnet test`.
+""" + _SHARED_RULES,
+
+    "go": """You are a senior Go engineer implementing one task of a real project.
+Return ONLY a JSON object (no markdown fences, no prose, no tool calls):
+{"summary": "<one line>", "files": [{"path": "<relative/path>", "content": "<full file content>"}]}
+Structure rules:
+- Provide/maintain go.mod (module name from the project), cmd/<app>/main.go
+  for entrypoints, internal/ packages for logic.
+- Idiomatic Go: exported symbols documented, errors wrapped with %w, no panics
+  for expected failures.
+- Table-driven tests in *_test.go (testing package) next to the code they
+  cover; they must pass with `go test ./...`.
+""" + _SHARED_RULES,
+
+    "node": """You are a senior Node.js/TypeScript engineer implementing one task of a real project.
+Return ONLY a JSON object (no markdown fences, no prose, no tool calls):
+{"summary": "<one line>", "files": [{"path": "<relative/path>", "content": "<full file content>"}]}
+Structure rules:
+- Provide/maintain package.json (name, scripts: build/test/start, typed
+  dependencies with pinned versions), src/ for code, tests/ for suites.
+- Use vitest or jest (declare as devDependency) with tests in
+  tests/*.test.ts or *.test.js; they must pass with `npm test`.
+- If TypeScript, include tsconfig.json and keep `tsc --noEmit` clean.
+""" + _SHARED_RULES,
+}
 
 
-def _existing_tree(workspace: str) -> dict:
-    tree = {}
-    if not os.path.isdir(workspace):
-        return tree
-    for root, dirs, files in os.walk(workspace):
-        dirs[:] = [d for d in dirs if d != "__pycache__" and d != ".git"]
-        rel = os.path.relpath(root, workspace)
-        if rel == ".":
-            rel = ""
+def _system_for(stack: str) -> str:
+    return _CODEGEN_SYSTEMS.get(stack) or _CODEGEN_SYSTEMS["python"]
+
+
+_JR_DEV_SYSTEM = """You are the Junior Developer implementing one task of a real project.
+Return ONLY a JSON object (no markdown fences, no prose, no tool calls):
+{"summary": "<one line>", "files": [{"path": "<relative/path>", "content": "<full file content>"}]}
+Your specialty is small, easy-to-build REUSABLE functions that save the team
+tokens: every utility a teammate could re-implement belongs in the shared
+helpers file (app/helpers.py) so the next agent just calls it.
+Rules:
+- Grow app/helpers.py: append tiny, typed, single-purpose functions (one
+  concern each, ~10 lines max) and return the file's FULL updated content.
+- Never duplicate a helper that already exists — extend or fix it instead.
+- Update tests/test_helpers.py with one focused test per new helper.
+- Only touch other files when the task explicitly needs feature code; then
+  import and call the helpers rather than inlining utility logic.
+""" + _SHARED_RULES
+
+
+def _is_junior_dev(agent_ref: str) -> bool:
+    """True when the implementer (agent id or name) has the Junior
+    Developer role."""
+    ref = (agent_ref or "").strip()
+    if not ref:
+        return False
+    row = query_one(
+        "SELECT r.name AS role_name FROM agents a JOIN roles r ON r.id = a.role_id "
+        "WHERE a.id = ? OR lower(a.name) = lower(?) LIMIT 1", (ref, ref))
+    return bool(row) and "junior" in (row["role_name"] or "").lower()
+
+
+def _existing_tree(ws_dir: str, limit: int = 60) -> str:
+    entries = []
+    for root, dirs, files in os.walk(ws_dir):
+        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", ".pytest_cache", "node_modules")]
+        rel = os.path.relpath(root, ws_dir)
         for f in files:
-            if f.endswith((".py", ".ts", ".tsx", ".js", ".json", ".md", ".yaml", ".yml", ".toml")):
-                path = os.path.join(rel, f) if rel else f
-                try:
-                    tree[path] = open(os.path.join(root, f), encoding="utf-8").read()
-                except OSError:
-                    pass
-    return tree
+            entries.append(os.path.normpath(os.path.join(rel, f)).replace("\\", "/"))
+    entries = sorted(entries)[:limit]
+    return "\n".join(entries) or "(empty workspace)"
 
 
-def _safe_rel_path(base: str, candidate: str) -> str | None:
-    safe = os.path.normpath(os.path.join(base, candidate))
-    if not safe.startswith(os.path.normpath(base)):
+def _safe_rel_path(p: str) -> str | None:
+    p = (p or "").replace("\\", "/").strip().lstrip("/")
+    if not p or ".." in p.split("/") or p.startswith((".", "~")) or ":" in p:
         return None
-    return safe
+    return p
 
 
-def ensure_helpers_file(workspace: str, project_name: str) -> str:
-    pkg = os.path.join(workspace, project_name.replace(" ", "_").replace("-", "_").lower())
-    os.makedirs(pkg, exist_ok=True)
-    path = os.path.join(pkg, "helpers.py")
-    if not os.path.exists(path):
-        open(path, "w").write('"""Shared helpers."""\n\n__all__: list[str] = []\n')
-    return path
+# ---------------------------------------------------------------- shared helpers
+# One reusable helper function file per project workspace, owned by the
+# team's Junior Developer. Teammates CALL these helpers instead of
+# re-implementing small utilities, so every task regenerates less code —
+# fewer output tokens and smaller prompts on later passes.
+
+HELPERS_REL_PATH = "app/helpers.py"
+
+_STARTER_HELPERS = '''"""Shared reusable helpers — owned by the team's Junior Developer.
+
+Small, typed, easy-to-reuse functions. CALL these instead of
+re-implementing them: less duplicated code, fewer tokens per task.
+"""
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
 
 
-def _helpers_index(tree: dict, pkg: str) -> list[dict]:
-    helpers = []
-    for path in tree:
-        if path.startswith(pkg + "/helpers") or path == pkg + "/helpers.py":
-            helpers.append({"path": path, "size": len(tree.get(path, ""))})
-    return helpers
+def slugify(text: str) -> str:
+    """URL/file-safe slug: 'Hello World!' -> 'hello-world'."""
+    cleaned = "".join(c if c.isalnum() else " " for c in (text or "").lower())
+    return "-".join(cleaned.split()) or "item"
 
 
-def _feedback_file_blocks(tree: dict, pkg: str) -> str:
-    blocks = []
-    for path, content in tree.items():
-        if path.startswith(pkg + "/") and path.endswith(".py"):
-            blocks.append(f"### {path}\n```python\n{content[:400]}\n```")
-    return "\n\n".join(blocks) if blocks else "(no existing files)"
+def truncate(text: str, limit: int = 200) -> str:
+    """Cut text to limit, appending '...' when it was longer."""
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
 
 
-def generate_implementation(workspace: str, task: dict, project_name: str,
-                            role: str = "backend") -> dict:
-    """Generate implementation files for a task using the LLM."""
-    gw, model = (None, None)
+def compact_json(data) -> str:
+    """Smallest possible JSON string (no spaces, ascii kept as-is)."""
+    return json.dumps(data, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def deep_get(data: dict, path: str, default=None):
+    """Safely read nested keys: deep_get(d, "user.address.city")."""
+    for key in path.split("."):
+        if not isinstance(data, dict) or key not in data:
+            return default
+        data = data[key]
+    return data
+
+
+def parse_bool(value, default: bool = False) -> bool:
+    """Forgiving bool from strings ('true'/'1'/'yes'/'on') or None."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "y")
+
+
+def now_iso() -> str:
+    """UTC timestamp string, e.g. '2026-09-20T15:20:20+00:00'."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def paginate(items: list, page: int = 1, size: int = 20) -> dict:
+    """Standard pagination envelope: items, page, size, total."""
+    page, size = max(1, page), max(1, min(size, 200))
+    start = (page - 1) * size
+    return {"items": items[start:start + size], "page": page,
+            "size": size, "total": len(items)}
+'''
+
+_STARTER_HELPERS_TEST = '''"""Tests for the shared helpers (owned by the Junior Developer)."""
+from app.helpers import compact_json, deep_get, paginate, parse_bool, slugify, truncate
+
+
+def test_slugify():
+    assert slugify("Hello World!") == "hello-world"
+    assert slugify("  Multiple   Spaces  ") == "multiple-spaces"
+    assert slugify("!!!") == "item"
+
+
+def test_truncate():
+    assert truncate("short") == "short"
+    assert len(truncate("x" * 500, 50)) == 50
+    assert truncate("x" * 500, 50).endswith("...")
+
+
+def test_compact_json():
+    assert compact_json({"a": 1, "b": 2}) == '{"a":1,"b":2}'
+
+
+def test_deep_get():
+    assert deep_get({"a": {"b": 7}}, "a.b") == 7
+    assert deep_get({}, "a.b.c", "fallback") == "fallback"
+
+
+def test_parse_bool():
+    assert parse_bool("yes") is True
+    assert parse_bool("0") is False
+    assert parse_bool(None, default=True) is True
+
+
+def test_paginate():
+    result = paginate(list(range(50)), page=2, size=10)
+    assert result["items"][0] == 10
+    assert result["total"] == 50
+'''
+
+
+def ensure_helpers_file(ws_dir: str) -> bool:
+    """Create the shared helpers file (+ its tests) when missing. Returns
+    True when the starter file was written, False when it already existed."""
+    path = os.path.join(ws_dir, HELPERS_REL_PATH.replace("/", os.sep))
+    if os.path.exists(path):
+        return False
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(_STARTER_HELPERS)
+    test_path = os.path.join(ws_dir, "tests", "test_helpers.py")
+    if not os.path.exists(test_path):
+        os.makedirs(os.path.dirname(test_path), exist_ok=True)
+        with open(test_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_STARTER_HELPERS_TEST)
+    return True
+
+
+def _helpers_index(ws_dir: str, limit: int = 40) -> str:
+    """Compact one-line-per-function index of the helpers file (signature +
+    first docstring line) for prompts. Signatures only — never the full
+    file — so the prompt stays small and tokens stay low."""
+    path = os.path.join(ws_dir, HELPERS_REL_PATH.replace("/", os.sep))
+    if not os.path.isfile(path):
+        return ""
     try:
-        from .chatbot import _bot_config as _bc
-        gw, model = _bc()
-        if gw and model:
-            gw, model = gw, _pick_codegen_model(gw["id"], model["id"])
-    except Exception as exc:
-        logger.debug("Bot config resolution failed; falling back to scaffold: %s", exc)
-
-    if not gw or not model:
-        return _scaffold_files(workspace, task, project_name)
-
-    tree = _existing_tree(workspace)
-    ensure_helpers_file(workspace, project_name)
-    sys = _system_for(role)
-    _helpers_path = os.path.join(workspace, project_name.replace(' ', '_').replace('-', '_').lower(), 'helpers.py')
-    helpers_content = tree.get(_helpers_path, '(empty)')
-    user = ("""Implement this task: """ + task['title'] + "\n\n"
-            "Acceptance criteria: " + (task.get('acceptance_criteria') or 'None') + "\n\n"
-            "Existing package tree:\n" + json.dumps({k: v[:200] for k, v in tree.items() if k.endswith('.py')}, indent=2) + "\n\n"
-            "Existing helpers.py:\n" + helpers_content)
-    try:
-        result = call_llm(gw, model, sys, user, max_tokens=4000)
-        raw = result["text"]
-    except RuntimeError as exc:
-        if is_llm_outage(gw, exc):
-            return {"status": "outage", "reason": _llm_outage_reason(exc)}
-        raise
-    files = _scaffold_from_llm(raw, workspace, project_name)
-    return {"status": "ok", "files": files, "model": model["provider_model_id"],
-            "usage": {k: result.get(k) for k in ("input_tokens", "output_tokens") if k in result}}
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+    except OSError:
+        return ""
+    entries = []
+    for m in re.finditer(
+            r'^def (\w+)\(([^)]*)\)(\s*->\s*[^:\n]+)?:\s*\n\s*"""([^"\n]*)',
+            src, re.M):
+        sig = f"{m.group(1)}({m.group(2).strip()})" + (m.group(3) or "").rstrip()
+        doc = m.group(4).strip()
+        entries.append(f"- {sig} — {doc}" if doc else f"- {sig}")
+    return "\n".join(entries[:limit])
 
 
-def _scaffold_files(workspace: str, task: dict, project_name: str) -> dict:
-    pkg = project_name.replace(" ", "_").replace("-", "_").lower()
-    pkg_dir = os.path.join(workspace, pkg)
-    os.makedirs(pkg_dir, exist_ok=True)
-    ensure_helpers_file(workspace, project_name)
-    task_mod = re.sub(r"[^a-z0-9_]", "_", task["title"].lower())[:40]
-    path = os.path.join(pkg_dir, f"{task_mod}.py")
-    if not os.path.exists(path):
-        content = f'"""Implementation: {task["title"]}."""\n\n\ndef run():\n    raise NotImplementedError("TODO")\n'
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-    return {"status": "ok", "files": [path], "mode": "deterministic_scaffold"}
+def _feedback_file_blocks(ws_dir: str, feedback: str, limit: int = 3) -> str:
+    """Contents of workspace files the failure feedback points at, so the
+    model can actually fix the file that failed instead of guessing blind."""
+    if not feedback or not ws_dir:
+        return ""
+    seen, blocks = set(), []
+    for m in re.finditer(r"[A-Za-z0-9_./\\-]+\.(?:py|js|ts|tsx|go|cs|html|css|json|md)", feedback):
+        rel = m.group(0).replace("\\", "/").lstrip("./")
+        safe = _safe_rel_path(rel)
+        if not safe or safe in seen:
+            continue
+        path = os.path.join(ws_dir, safe.replace("/", os.sep))
+        if not os.path.isfile(path):
+            continue
+        seen.add(safe)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                src = fh.read()
+        except OSError:
+            continue
+        blocks.append(f"CURRENT {safe} (this file FAILED — fix it):\n{src[:6000]}"
+                      + ("\n... (truncated)" if len(src) > 6000 else ""))
+        if len(blocks) >= limit:
+            break
+    return ("\n\n" + "\n\n".join(blocks)) if blocks else ""
 
 
-def _scaffold_from_llm(raw: str, workspace: str, project_name: str) -> list[str]:
-    written = []
-    fence_re = re.compile(r"```(?:python)?\n(.*?)```", re.DOTALL)
-    for i, block in enumerate(fence_re.findall(raw)):
-        path = os.path.join(workspace, project_name.replace(" ", "_").lower(), f"impl_{i}.py")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(block.strip())
-        written.append(path)
-    return written
+def _agent_model_and_role(project, agent_ref):
+    """Resolve (gateway, model, role_name) for the agent running a task.
+
+    The agent's own binding from the Models catalog wins, so the model an
+    agent is configured with is the model it actually runs on. Falls back to
+    the project/bot default (resolve_llm) when the agent has no binding, the
+    binding is inactive, or its gateway has no stored API key. ``agent_ref``
+    is whatever the runtime passes — an agent id — but a name also resolves.
+    """
+    agent = None
+    if agent_ref:
+        agent = (query_one("SELECT * FROM agents WHERE id = ?", (agent_ref,))
+                 or query_one("SELECT * FROM agents WHERE lower(name) = lower(?)", (agent_ref,)))
+    role_name = ""
+    if agent:
+        r = query_one("SELECT name FROM roles WHERE id = ?", (agent["role_id"],))
+        role_name = r["name"] if r else ""
+        if agent["model_binding_id"]:
+            row = query_one("SELECT gateway_id, model_id FROM model_bindings "
+                            "WHERE id = ? AND active = 1", (agent["model_binding_id"],))
+            if row:
+                gw = query_one("SELECT * FROM gateways WHERE id = ?", (row["gateway_id"],))
+                model = query_one("SELECT * FROM gateway_models WHERE id = ?", (row["model_id"],))
+                if gw and model and get_gateway_key(gw["id"]):
+                    return gw, model, role_name
+    gw, model = resolve_llm(project)
+    return gw, model, role_name
 
 
-def _ensure_pyproject(workspace: str) -> str:
-    path = os.path.join(workspace, "pyproject.toml")
-    if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            f.write('[project]\nname = "project"\nversion = "0.1.0"\n')
-    return path
+def generate_implementation(project, task, agent_ref: str, feedback: str = "") -> dict:
+    """Generate real code files for a task into the project workspace.
+
+    Returns {"files": [relative paths], "summary": str, "mode": "llm"|"scaffold",
+             "input_tokens": int, "output_tokens": int, "error": str|""}.
+    Never raises: python LLM failures degrade to the deterministic scaffold;
+    non-python stacks return an error so the rework loop reports honestly
+    instead of bolting a FastAPI file onto a Go/.NET/Node project.
+    """
+    ws_dir = project["workspace_path"]
+    stack = toolchains.detect_stack(project, ws_dir)
+    result = {"files": [], "summary": "", "mode": "scaffold",
+              "input_tokens": 0, "output_tokens": 0, "error": ""}
+    if not ws_dir or not os.path.isdir(ws_dir):
+        result["error"] = "workspace missing"
+        return result
+
+    # The Junior Developer's shared reusable-function file: present in every
+    # python workspace so all agents reuse it instead of regenerating
+    # boilerplate (fewer output tokens, smaller later prompts).
+    helpers_block = ""
+    if stack == "python":
+        ensure_helpers_file(ws_dir)
+        index = _helpers_index(ws_dir)
+        if index:
+            helpers_block = ("\nREUSABLE HELPERS in app/helpers.py (maintained by the Junior "
+                             "Developer — CALL these instead of re-implementing, it saves tokens):\n"
+                             f"{index}\n")
+
+    gw, model, role_name = _agent_model_and_role(project, agent_ref)
+    if gw and model:
+        from .chatbot import _extract_json
+        system_prompt = (_JR_DEV_SYSTEM if stack == "python" and _is_junior_dev(role_name or agent_ref)
+                         else _system_for(stack))
+        feedback_block = f"\n\nPREVIOUS ATTEMPT FEEDBACK (fix these issues):\n{feedback}\n" if feedback else ""
+        main_py = os.path.join(ws_dir, "app", "main.py")
+        main_block = "(app/main.py does not exist yet)"
+        if os.path.isfile(main_py):
+            try:
+                with open(main_py, encoding="utf-8", errors="replace") as fh:
+                    src = fh.read()
+                main_block = src[:4000] + ("\n... (truncated)" if len(src) > 4000 else "")
+            except OSError:
+                pass
+        user_prompt = (f"PROJECT: {project['name']}\nGOAL: {project['goal'] or 'n/a'}\n"
+                       f"TECH STACK: {project['technology_stack'] or 'Python (FastAPI where appropriate)'}\n\n"
+                       f"TASK TO IMPLEMENT: {task['title']}\n"
+                       f"DESCRIPTION: {task['description'] or 'n/a'}\n"
+                       f"ACCEPTANCE CRITERIA: {task['acceptance_criteria'] or 'n/a'}"
+                       f"{feedback_block}\n"
+                       f"EXISTING WORKSPACE FILES:\n{_existing_tree(ws_dir)}\n"
+                       f"{helpers_block}\n"
+                       f"CURRENT app/main.py:\n{main_block}"
+                       f"{_feedback_file_blocks(ws_dir, feedback)}\n\n"
+                       "Implement this task now. Return the JSON object with complete file contents.")
+
+        def _usable_files(text: str):
+            data = _extract_json(text)
+            files = []
+            if data and isinstance(data.get("files"), list):
+                for f in data["files"]:
+                    rel = _safe_rel_path(str(f.get("path") or ""))
+                    content = f.get("content")
+                    if rel and isinstance(content, str) and content.strip():
+                        files.append((rel, content))
+            return data, files
+
+        try:
+            resp = call_llm(gw, model, system_prompt, user_prompt, max_tokens=8000)
+            data, files = _usable_files(resp["text"])
+            if not files:
+                retry_prompt = (user_prompt + "\n\nIMPORTANT: your previous reply was not the "
+                                "required JSON object. Reply with ONLY the raw JSON object "
+                                '{"summary": ..., "files": [{"path": ..., "content": ...}]} '
+                                "starting with { and ending with }.")
+                resp = call_llm(gw, model, system_prompt, retry_prompt, max_tokens=8000)
+                data, files = _usable_files(resp["text"])
+            if files:
+                for rel, content in files:
+                    dest = os.path.join(ws_dir, rel.replace("/", os.sep))
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    with open(dest, "w", encoding="utf-8", newline="\n") as fh:
+                        fh.write(content)
+                result.update({"files": [r for r, _ in files], "summary": str(data.get("summary") or "")[:200],
+                               "mode": "llm", "input_tokens": resp["input_tokens"],
+                               "output_tokens": resp["output_tokens"]})
+                if stack == "python":
+                    toolchains.ensure_pyproject(ws_dir)
+                return result
+            # Distinguish a genuine outage (quota / usage limit / overloaded)
+            # from a model that just didn't follow the format. An outage must
+            # surface as a clear, non-retryable error — NOT fall through to a
+            # task-named scaffold that looks like real work.
+            outage = _llm_outage_reason(resp.get("text") or "")
+            if outage:
+                result["error"] = outage
+                result["summary"] = f"failed: {outage}"
+                return result
+            result["error"] = "model returned no usable files"
+        except Exception as exc:
+            result["error"] = str(exc)[:200]
+
+    if stack != "python":
+        # No fake scaffold for other stacks — surface the failure so the
+        # rework loop / human escalation sees the real error.
+        result["error"] = result["error"] or f"LLM produced no files for {stack} workspace"
+        result["summary"] = f"failed: {result['error']}"
+        return result
+
+    # Deterministic runnable scaffold fallback (python only).
+    files = _scaffold_files(project, task, feedback)
+    for rel, content in files:
+        dest = os.path.join(ws_dir, rel.replace("/", os.sep))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+    result.update({"files": [r for r, _ in files],
+                   "summary": "deterministic scaffold (no LLM configured)" if not result["error"]
+                   else f"LLM failed ({result['error'][:80]}); scaffold written",
+                   "mode": "scaffold"})
+    return result
 
 
-def _slug(text: str) -> str:
-    return re.sub(r"[^a-z0-9_]+", "_", text.lower())[:40].strip("_") or "task"
+def _ensure_pyproject(ws_dir: str):
+    """Make sure `python -m pytest` can import the app package."""
+    ini = os.path.join(ws_dir, "pytest.ini")
+    if not os.path.exists(ini):
+        with open(ini, "w", encoding="utf-8") as fh:
+            fh.write("[pytest]\npythonpath = .\ntestpaths = tests\n")
+    pkg = os.path.join(ws_dir, "app", "__init__.py")
+    if not os.path.exists(pkg):
+        os.makedirs(os.path.dirname(pkg), exist_ok=True)
+        with open(pkg, "w", encoding="utf-8") as fh:
+            fh.write("")
 
 
-def _scaffold_files(workspace: str, task: dict, project_name: str) -> dict:
-    pkg = project_name.replace(" ", "_").replace("-", "_").lower()
-    pkg_dir = os.path.join(workspace, pkg)
-    os.makedirs(pkg_dir, exist_ok=True)
-    ensure_helpers_file(workspace, project_name)
-    _ensure_pyproject(workspace)
-    task_mod = _slug(task["title"])
-    path = os.path.join(pkg_dir, f"{task_mod}.py")
-    if not os.path.exists(path):
-        content = f'"""Implementation: {task["title"]}."""\n\n\ndef run():\n    raise NotImplementedError("TODO")\n'
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-    return {"status": "ok", "files": [path], "mode": "deterministic_scaffold"}
+def _slug(name: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "_", (name or "task").lower()).strip("_")
+    return s or "task"
+
+
+def _scaffold_files(project, task, feedback: str) -> list[tuple[str, str]]:
+    """A real, runnable FastAPI feature module + passing pytest tests,
+    derived from the task title. Lives under app/features/ so the fallback
+    never clutters the main application package."""
+    slug = _slug(task["title"])
+    feat = "".join(w.capitalize() for w in slug.split("_")[:4]) or "Feature"
+    mod = f"""
+\"\"\"{task['title']}
+
+Auto-generated feature module for project '{project['name']}'.
+\"\"\"
+from fastapi import APIRouter, HTTPException
+
+router = APIRouter(prefix=\"/{slug}\")
+
+_ITEMS: dict[int, dict] = {{}}
+_NEXT = [1]
+
+
+@router.get(\"/health\")
+def health():
+    return {{\"feature\": \"{slug}\", \"status\": \"ok\"}}
+
+
+@router.post(\"/items\", status_code=201)
+def create_item(payload: dict):
+    if not isinstance(payload, dict) or not payload:
+        raise HTTPException(status_code=422, detail=\"payload required\")
+    item_id = _NEXT[0]
+    _NEXT[0] += 1
+    _ITEMS[item_id] = {{\"id\": item_id, **payload}}
+    return _ITEMS[item_id]
+
+
+@router.get(\"/items/{{item_id}}\")
+def get_item(item_id: int):
+    item = _ITEMS.get(item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail=\"item not found\")
+    return item
+
+
+@router.get(\"/items\")
+def list_items():
+    return list(_ITEMS.values())
+"""
+    test = f"""
+\"\"\"Tests for {task['title']} (auto-generated).\"\"\"
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.features.{slug} import router
+
+
+def _client():
+    application = FastAPI()
+    application.include_router(router)
+    return TestClient(application)
+
+
+def test_health():
+    resp = _client().get(\"/{slug}/health\")
+    assert resp.status_code == 200
+    assert resp.json()[\"status\"] == \"ok\"
+
+
+def test_create_and_get_item():
+    client = _client()
+    created = client.post(\"/{slug}/items\", json={{\"name\": \"demo\"}})
+    assert created.status_code == 201
+    item_id = created.json()[\"id\"]
+    fetched = client.get(f\"/{slug}/items/{{item_id}}\")
+    assert fetched.status_code == 200
+    assert fetched.json()[\"name\"] == \"demo\"
+
+
+def test_get_missing_item_returns_404():
+    resp = _client().get(\"/{slug}/items/99999\")
+    assert resp.status_code == 404
+"""
+    return [(f"app/features/{slug}.py", mod),
+            ("app/features/__init__.py", ""),
+            (f"tests/test_{slug}.py", test)]

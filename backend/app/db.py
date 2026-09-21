@@ -762,6 +762,30 @@ PO_CHARTER = """# Product Owner Charter
 """
 
 
+def ensure_model_binding(gateway_id, model_id, *, name=None, settings_json=None):
+    """Return the id of the global model for (gateway, model), creating it if absent.
+
+    Models are a single global catalog (role_id is NULL): one binding per
+    gateway+model pair, shared by every agent that uses it. This keeps the
+    idempotent seeders from re-creating per-role duplicates on each startup.
+    """
+    if not gateway_id or not model_id:
+        return None
+    row = query_one("SELECT id FROM model_bindings WHERE gateway_id = ? AND model_id = ? "
+                    "AND active = 1 ORDER BY rowid LIMIT 1", (gateway_id, model_id))
+    if row:
+        return row["id"]
+    if not name:
+        g = query_one("SELECT name FROM gateways WHERE id = ?", (gateway_id,))
+        m = query_one("SELECT provider_model_id FROM gateway_models WHERE id = ?", (model_id,))
+        name = f"{g['name'] if g else 'Gateway'} \u00b7 {m['provider_model_id'] if m else 'model'}"
+    bid = new_id()
+    insert("model_bindings", {"id": bid, "role_id": None, "gateway_id": gateway_id,
+                              "model_id": model_id, "name": name,
+                              "settings_json": settings_json or "{}", "active": 1})
+    return bid
+
+
 def ensure_product_owner():
     """Idempotently seed the Product Owner role (persona, skill, instruction
     file, model binding) so it exists on fresh and existing databases alike."""
@@ -816,18 +840,17 @@ def ensure_product_owner():
         execute("INSERT OR IGNORE INTO role_skills (role_id, skill_id) VALUES (?,?)", (rid, skill["id"]))
         audit("seed_po_persona", "persona", pid, "Seeded Product Owner persona 'Vision Keeper'")
 
-    if not query_one("SELECT id FROM model_bindings WHERE role_id = ? AND active = 1", (rid,)):
-        gw = query_one("SELECT id FROM gateways WHERE status = 'Active' ORDER BY created_at LIMIT 1")
+    gw = query_one("SELECT id FROM gateways WHERE status = 'Active' ORDER BY created_at LIMIT 1")
+    if gw:
         model = query_one(
             "SELECT id FROM gateway_models WHERE gateway_id = ? AND active = 1 "
-            "AND provider_model_id LIKE '%mini%' LIMIT 1", (gw["id"],)) if gw else None
-        if not model and gw:
+            "AND provider_model_id LIKE '%mini%' LIMIT 1", (gw["id"],))
+        if not model:
             model = query_one("SELECT id FROM gateway_models WHERE gateway_id = ? AND active = 1 LIMIT 1",
                               (gw["id"],))
-        if gw and model:
-            insert("model_bindings", {"id": new_id(), "role_id": rid, "gateway_id": gw["id"],
-                                      "model_id": model["id"],
-                                      "settings_json": json.dumps({"temperature": 0.3}), "active": 1})
+        if model:
+            ensure_model_binding(gw["id"], model["id"],
+                                 settings_json=json.dumps({"temperature": 0.3}))
 
 
 def ensure_junior_developer():
@@ -879,20 +902,18 @@ def ensure_junior_developer():
         persona = query_one("SELECT * FROM personas WHERE id = ?", (pid,))
         audit("seed_jr_dev_persona", "persona", pid, "Seeded Junior Developer persona 'Helper Builder'")
 
-    binding = query_one("SELECT id FROM model_bindings WHERE role_id = ? AND active = 1", (rid,))
-    if not binding:
-        gw = query_one("SELECT id FROM gateways WHERE status = 'Active' ORDER BY created_at LIMIT 1")
+    binding_id = None
+    gw = query_one("SELECT id FROM gateways WHERE status = 'Active' ORDER BY created_at LIMIT 1")
+    if gw:
         model = query_one(
             "SELECT id FROM gateway_models WHERE gateway_id = ? AND active = 1 "
-            "AND provider_model_id LIKE '%mini%' LIMIT 1", (gw["id"],)) if gw else None
-        if not model and gw:
+            "AND provider_model_id LIKE '%mini%' LIMIT 1", (gw["id"],))
+        if not model:
             model = query_one("SELECT id FROM gateway_models WHERE gateway_id = ? AND active = 1 LIMIT 1",
                               (gw["id"],))
-        if gw and model:
-            insert("model_bindings", {"id": (bid := new_id()), "role_id": rid, "gateway_id": gw["id"],
-                                      "model_id": model["id"],
-                                      "settings_json": json.dumps({"temperature": 0.2}), "active": 1})
-            binding = query_one("SELECT id FROM model_bindings WHERE id = ?", (bid,))
+        if model:
+            binding_id = ensure_model_binding(gw["id"], model["id"],
+                                              settings_json=json.dumps({"temperature": 0.2}))
 
     # One Junior Developer per team, on every team that lacks one.
     for team in query("SELECT * FROM teams ORDER BY created_at"):
@@ -908,7 +929,7 @@ def ensure_junior_developer():
         name = "Pip" if n == 0 else f"Pip {n + 1}"
         aid = new_id()
         insert("agents", {"id": aid, "name": name, "role_id": rid, "persona_id": persona["id"],
-                          "model_binding_id": binding["id"] if binding else None,
+                          "model_binding_id": binding_id,
                           "lifecycle_state": "Idle", "current_activity": "",
                           "created_at": ts, "updated_at": ts})
         execute("INSERT INTO team_agents (team_id, agent_id, role_in_team, active) VALUES (?,?,?,1)",
@@ -1032,7 +1053,7 @@ def seed_if_empty():
         for s in skills:
             execute("INSERT INTO persona_skills (persona_id, skill_id) VALUES (?, ?)", (pid, skill_ids[s]))
 
-    # --- Model bindings per role ---
+    # --- Model catalog: one global binding per distinct model ---
     binding_map = {
         "Business Analyst": "gpt-4.1-mini",
         "Solution Architect": "gpt-4.1",
@@ -1041,15 +1062,11 @@ def seed_if_empty():
         "QA Engineer": "gpt-4.1-mini",
         "DevOps Engineer": "gpt-4.1-mini",
     }
-    binding_ids = {}
-    for role_name, model_key in binding_map.items():
-        bid = new_id()
-        binding_ids[role_name] = bid
-        insert("model_bindings", {
-            "id": bid, "role_id": role_ids[role_name], "gateway_id": gw,
-            "model_id": model_ids[model_key], "settings_json": json.dumps({"temperature": 0.3}),
-            "active": 1,
-        })
+    binding_by_model = {
+        mk: ensure_model_binding(gw, model_ids[mk], settings_json=json.dumps({"temperature": 0.3}))
+        for mk in set(binding_map.values())
+    }
+    binding_ids = {role_name: binding_by_model[mk] for role_name, mk in binding_map.items()}
 
     # --- Agents ---
     agent_defs = [
