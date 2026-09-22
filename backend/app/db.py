@@ -220,6 +220,7 @@ CREATE TABLE IF NOT EXISTS projects (
   repository_url TEXT NOT NULL DEFAULT '',
   workspace_path TEXT NOT NULL DEFAULT '',
   default_gateway_id TEXT REFERENCES gateways(id),
+  default_model_id TEXT REFERENCES gateway_models(id),
   team_id TEXT REFERENCES teams(id),
   memory_policy TEXT NOT NULL DEFAULT 'project-scoped',
   created_at TEXT NOT NULL,
@@ -554,6 +555,8 @@ def _legacy_column_migrations():
     proj_cols = {r["name"] for r in query("PRAGMA table_info(projects)")}
     if "po_enabled" not in proj_cols:
         execute("ALTER TABLE projects ADD COLUMN po_enabled INTEGER NOT NULL DEFAULT 0")
+    if "default_model_id" not in proj_cols:
+        execute("ALTER TABLE projects ADD COLUMN default_model_id TEXT REFERENCES gateway_models(id)")
     # Sprint-gate columns: older databases created the sprints table before
     # the gating system added the five gate status columns plus failure
     # reason and start/complete timestamps. Without them, sprint_gate_summary

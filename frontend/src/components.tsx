@@ -48,6 +48,25 @@ export function ErrorNote({ error }: { error: string | null }) {
   return <div className="badge err" style={{ marginBottom: 10 }}>{error}</div>;
 }
 
+export function Pagination({ total, limit, offset, onChange }: {
+  total: number; limit: number; offset: number; onChange: (offset: number) => void;
+}) {
+  if (total <= limit) return null;
+  const page = Math.floor(offset / limit) + 1;
+  const pages = Math.max(1, Math.ceil(total / limit));
+  return (
+    <div className="row" style={{ justifyContent: 'space-between', marginTop: 10 }}>
+      <span className="kv">Page {page} of {pages} · {total} total</span>
+      <div className="btn-row">
+        <button className="btn small" disabled={offset <= 0}
+          onClick={() => onChange(Math.max(0, offset - limit))}>Previous</button>
+        <button className="btn small" disabled={offset + limit >= total}
+          onClick={() => onChange(offset + limit)}>Next</button>
+      </div>
+    </div>
+  );
+}
+
 /**
  * Modern collapsible card: clickable header row (title/status/actions on the
  * left, animated chevron on the right) with a smooth height transition on the

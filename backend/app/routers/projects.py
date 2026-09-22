@@ -28,6 +28,7 @@ class ProjectIn(BaseModel):
     repository_url: str = ""
     workspace_path: str = ""
     default_gateway_id: str | None = None
+    default_model_id: str | None = None
     team_id: str | None = None
 
 
@@ -64,6 +65,13 @@ def create_project(body: ProjectIn, idempotency_key: Optional[str] = Header(None
     err = workspace.validate_workspace_path(body.workspace_path)
     if err:
         raise HTTPException(400, err)
+    if body.default_model_id:
+        if not body.default_gateway_id:
+            raise HTTPException(400, "default_model_id requires default_gateway_id")
+        _or_404(query_one(
+            "SELECT id FROM gateway_models WHERE id=? AND gateway_id=?",
+            (body.default_model_id, body.default_gateway_id),
+        ), "Model")
 
     def _create():
         pid = new_id()
@@ -71,7 +79,9 @@ def create_project(body: ProjectIn, idempotency_key: Optional[str] = Header(None
         insert("projects", {"id": pid, "name": body.name, "goal": body.goal,
                             "description": body.description, "technology_stack": body.technology_stack,
                             "repository_url": body.repository_url, "workspace_path": body.workspace_path,
-                            "default_gateway_id": body.default_gateway_id, "team_id": body.team_id,
+                            "default_gateway_id": body.default_gateway_id,
+                            "default_model_id": body.default_model_id,
+                            "team_id": body.team_id,
                             "status": "Active", "created_at": ts, "updated_at": ts})
         project = query_one("SELECT * FROM projects WHERE id = ?", (pid,))
         ws = workspace.prepare_workspace(project)
@@ -99,8 +109,22 @@ def update_project(pid: str, body: ProjectUpdate):
     data = body.model_dump(exclude_unset=True)
     allowed = {k: v for k, v in data.items() if k in ("name", "goal", "description", "technology_stack",
                                                       "repository_url", "workspace_path",
-                                                      "default_gateway_id", "team_id", "status",
+                                                      "default_gateway_id", "default_model_id",
+                                                      "team_id", "status",
                                                       "po_enabled")}
+    gateway_id = allowed.get("default_gateway_id")
+    if gateway_id is None and "default_model_id" in allowed:
+        current = query_one("SELECT default_gateway_id FROM projects WHERE id=?", (pid,))
+        gateway_id = current["default_gateway_id"] if current else None
+    if allowed.get("default_model_id"):
+        if not gateway_id:
+            raise HTTPException(400, "default_model_id requires default_gateway_id")
+        _or_404(query_one(
+            "SELECT id FROM gateway_models WHERE id=? AND gateway_id=?",
+            (allowed["default_model_id"], gateway_id),
+        ), "Model")
+    elif "default_gateway_id" in allowed:
+        allowed["default_model_id"] = None
     if "workspace_path" in allowed:
         err = workspace.validate_workspace_path(allowed["workspace_path"])
         if err:

@@ -36,7 +36,26 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
   return unwrapEnvelope(await res.json()) as T;
 }
 
+export interface Page<T> {
+  total: number;
+  items: T[];
+  limit: number;
+  offset: number;
+}
+
 export const get = <T = any>(path: string) => api<T>(path);
+export const getPage = <T = any>(path: string) =>
+  fetch(path, { headers: { 'Content-Type': 'application/json' } }).then(async (res) => {
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        const body = await res.json();
+        detail = body.detail ?? JSON.stringify(body);
+      } catch { /* ignore */ }
+      throw new Error(String(detail));
+    }
+    return await res.json() as Page<T>;
+  });
 export const post = <T = any>(path: string, body?: any, headers?: Record<string, string>) =>
   api<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body), headers });
 export const patch = <T = any>(path: string, body: any) =>

@@ -1,11 +1,14 @@
 import React from 'react';
-import { get, post, patch, del } from '../api';
-import { Badge, Field, Modal, useAsyncData, ErrorNote } from '../components';
+import { get, getPage, post, patch, del, Page } from '../api';
+import { Badge, Field, Modal, useAsyncData, ErrorNote, Pagination } from '../components';
 import { TASK_STATE_CLASS } from '../api';
 
 export default function ProjectsPage({ activeProject, setActiveProject, onOpenControl }:
   { activeProject: string | null; setActiveProject: (id: string) => void; onOpenControl: () => void }) {
-  const { data: projects, reload, loading } = useAsyncData<any[]>(() => get('/api/v1/projects'), []);
+  const [projectOffset, setProjectOffset] = React.useState(0);
+  const projectLimit = 50;
+  const { data: projectPage, reload, loading } = useAsyncData<Page<any>>(
+    () => getPage(`/api/v1/projects?limit=${projectLimit}&offset=${projectOffset}`), [projectOffset]);
   const { data: teams } = useAsyncData<any[]>(() => get('/api/v1/teams'), []);
   const { data: gateways } = useAsyncData<any[]>(() => get('/api/v1/gateways'), []);
   const [selected, setSelected] = React.useState<string | null>(activeProject);
@@ -14,6 +17,7 @@ export default function ProjectsPage({ activeProject, setActiveProject, onOpenCo
   const [error, setError] = React.useState<string | null>(null);
 
   React.useEffect(() => { setSelected(activeProject); }, [activeProject]);
+  const projects = projectPage?.items ?? [];
   React.useEffect(() => { if (!selected && projects?.length) setSelected(projects[0].id); }, [projects, selected]);
 
   const project = projects?.find((p) => p.id === selected);
@@ -44,6 +48,10 @@ export default function ProjectsPage({ activeProject, setActiveProject, onOpenCo
             </div>
           ))}
           {!projects?.length && !loading && <div className="empty">No projects yet.</div>}
+          {projectPage && (
+            <Pagination total={projectPage.total} limit={projectPage.limit}
+              offset={projectPage.offset} onChange={setProjectOffset} />
+          )}
         </div>
 
         {project ? (
@@ -88,7 +96,10 @@ export default function ProjectsPage({ activeProject, setActiveProject, onOpenCo
 
 function ProjectForm({ onClose, onSaved, teams, gateways }:
   { onClose: () => void; onSaved: (id: string) => void; teams: any[]; gateways: any[] }) {
-  const [f, setF] = React.useState({ name: '', goal: '', description: '', technology_stack: '', repository_url: '', workspace_path: '', team_id: '', default_gateway_id: '' });
+  const [f, setF] = React.useState({ name: '', goal: '', description: '', technology_stack: '', repository_url: '', workspace_path: '', team_id: '', default_gateway_id: '', default_model_id: '' });
+  const { data: models } = useAsyncData<any[]>(
+    () => (f.default_gateway_id ? get(`/api/v1/gateways/${f.default_gateway_id}/models`) : Promise.resolve([])),
+    [f.default_gateway_id]);
   const upd = (k: string) => (e: any) => setF({ ...f, [k]: e.target.value });
   return (
     <Modal title="New Project" onClose={onClose}>
@@ -108,14 +119,20 @@ function ProjectForm({ onClose, onSaved, teams, gateways }:
           </select>
         </Field>
         <Field label="Default gateway">
-          <select value={f.default_gateway_id} onChange={upd('default_gateway_id')}>
+          <select value={f.default_gateway_id} onChange={(e) => setF({ ...f, default_gateway_id: e.target.value, default_model_id: '' })}>
             <option value="">— none —</option>
             {gateways.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
           </select>
         </Field>
+        <Field label="Default model">
+          <select value={f.default_model_id} disabled={!f.default_gateway_id} onChange={upd('default_model_id')}>
+            <option value="">— preferred code model —</option>
+            {(models ?? []).map((m) => <option key={m.id} value={m.id}>{m.provider_model_id}</option>)}
+          </select>
+        </Field>
       </div>
       <button className="btn primary" disabled={!f.name} onClick={async () => {
-        try { const p = await post('/api/v1/projects', { ...f, team_id: f.team_id || null, default_gateway_id: f.default_gateway_id || null }); onSaved(p.id); }
+        try { const p = await post('/api/v1/projects', { ...f, team_id: f.team_id || null, default_gateway_id: f.default_gateway_id || null, default_model_id: f.default_model_id || null }); onSaved(p.id); }
         catch (e: any) { alert(e.message); }
       }}>Create Project</button>
     </Modal>
@@ -220,8 +237,14 @@ function TaskForm({ projectId, sprints, tasks, agents, onClose, onSaved }: any) 
 
 function BacklogTab({ projectId, onError, onChanged }: { projectId: string; onError: (e: any) => void; onChanged: () => void }) {
   const [items, setItems] = React.useState<any[]>([]);
+  const [page, setPage] = React.useState<Page<any> | null>(null);
+  const [offset, setOffset] = React.useState(0);
+  const limit = 50;
   const [modal, setModal] = React.useState(false);
-  const load = React.useCallback(() => { get(`/api/v1/projects/${projectId}/backlog`).then(setItems).catch(onError); }, [projectId]);
+  const load = React.useCallback(() => {
+    getPage(`/api/v1/projects/${projectId}/backlog?limit=${limit}&offset=${offset}`)
+      .then((p) => { setPage(p); setItems(p.items); }).catch(onError);
+  }, [projectId, offset]);
   React.useEffect(load, [load]);
   return (
     <>
@@ -240,6 +263,7 @@ function BacklogTab({ projectId, onError, onChanged }: { projectId: string; onEr
         </div>
       ))}
       {!items.length && <div className="empty">Backlog is empty.</div>}
+      {page && <Pagination total={page.total} limit={page.limit} offset={page.offset} onChange={setOffset} />}
       {modal && (
         <BacklogForm onClose={() => setModal(false)} onSaved={async (body: any) => {
           try { await post(`/api/v1/projects/${projectId}/backlog`, body); setModal(false); load(); onChanged(); }
@@ -269,8 +293,14 @@ function BacklogForm({ onClose, onSaved }: any) {
 
 function SprintsTab({ projectId, onError, onChanged }: { projectId: string; onError: (e: any) => void; onChanged: () => void }) {
   const [sprints, setSprints] = React.useState<any[]>([]);
+  const [page, setPage] = React.useState<Page<any> | null>(null);
+  const [offset, setOffset] = React.useState(0);
+  const limit = 50;
   const [modal, setModal] = React.useState(false);
-  const load = React.useCallback(() => { get(`/api/v1/projects/${projectId}/sprints`).then(setSprints).catch(onError); }, [projectId]);
+  const load = React.useCallback(() => {
+    getPage(`/api/v1/projects/${projectId}/sprints?limit=${limit}&offset=${offset}`)
+      .then((p) => { setPage(p); setSprints(p.items); }).catch(onError);
+  }, [projectId, offset]);
   React.useEffect(load, [load]);
   const setStatus = async (sid: string, status: string) => {
     try { await patch(`/api/v1/sprints/${sid}`, { status }); load(); onChanged(); }
@@ -297,6 +327,7 @@ function SprintsTab({ projectId, onError, onChanged }: { projectId: string; onEr
         </div>
       ))}
       {!sprints.length && <div className="empty">No sprints yet.</div>}
+      {page && <Pagination total={page.total} limit={page.limit} offset={page.offset} onChange={setOffset} />}
       {modal && (
         <Modal title="Create Sprint" onClose={() => setModal(false)}>
           <SprintFields onSaved={async (body: any) => {
@@ -325,6 +356,9 @@ function SprintFields({ onSaved }: { onSaved: (body: any) => void }) {
 function SettingsTab({ project, teams, gateways, onError, onChanged }: any) {
   const [f, setF] = React.useState({ ...project });
   React.useEffect(() => setF({ ...project }), [project]);
+  const { data: models } = useAsyncData<any[]>(
+    () => (f.default_gateway_id ? get(`/api/v1/gateways/${f.default_gateway_id}/models`) : Promise.resolve([])),
+    [f.default_gateway_id]);
   const upd = (k: string) => (e: any) => setF({ ...f, [k]: e.target.value });
   return (
     <>
@@ -343,15 +377,21 @@ function SettingsTab({ project, teams, gateways, onError, onChanged }: any) {
           </select>
         </Field>
         <Field label="Default gateway">
-          <select value={f.default_gateway_id ?? ''} onChange={upd('default_gateway_id')}>
+          <select value={f.default_gateway_id ?? ''} onChange={(e) => setF({ ...f, default_gateway_id: e.target.value, default_model_id: '' })}>
             <option value="">— none —</option>
             {gateways.map((g: any) => <option key={g.id} value={g.id}>{g.name}</option>)}
+          </select>
+        </Field>
+        <Field label="Default model">
+          <select value={f.default_model_id ?? ''} disabled={!f.default_gateway_id} onChange={upd('default_model_id')}>
+            <option value="">— preferred code model —</option>
+            {(models ?? []).map((m: any) => <option key={m.id} value={m.id}>{m.provider_model_id}</option>)}
           </select>
         </Field>
       </div>
       <div className="btn-row">
         <button className="btn primary" onClick={async () => {
-          try { await patch(`/api/v1/projects/${project.id}`, { ...f, team_id: f.team_id || null, default_gateway_id: f.default_gateway_id || null }); onChanged(); }
+          try { await patch(`/api/v1/projects/${project.id}`, { ...f, team_id: f.team_id || null, default_gateway_id: f.default_gateway_id || null, default_model_id: f.default_model_id || null }); onChanged(); }
           catch (e: any) { onError(e); }
         }}>Save Changes</button>
         <button className="btn danger" onClick={async () => {

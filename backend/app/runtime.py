@@ -17,6 +17,7 @@ import time
 from . import db, workspace, codegen, toolchains, po, sprint_gate
 from . import config
 from .db import emit_event, execute, insert, now, new_id, query_one, query, update, audit
+from .task_registry import background_tasks
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +29,9 @@ _registry_lock = threading.Lock()
 _schedulers: dict = {}
 _schedulers_lock = threading.Lock()
 
-# Background task tracking for fire-and-forget coroutines.
-_background_tasks: set = set()
+# Background fire-and-forget coroutines are tracked centrally by
+# app.task_registry (see _spawn below); _loop is kept for the stop path's
+# call_soon_threadsafe cancellation.
 
 TASK_STATUSES = ["Todo", "Ready", "In Progress", "Blocked", "Review", "Testing", "Done", "Cancelled"]
 AGENT_STATES = ["Idle", "Working", "Waiting", "Blocked", "Failed", "Paused", "Completed"]
@@ -69,30 +71,17 @@ def _sanitize_exception(exc: Exception) -> str:
 
 
 def set_loop(loop: asyncio.AbstractEventLoop):
-    """Capture the main event loop so worker threads can spawn coroutines on it."""
+    """Capture the main event loop so worker threads can spawn coroutines on
+    it (and so the shared background-task registry can do the same)."""
     global _loop
     _loop = loop
+    background_tasks.set_loop(loop)
 
 
 def _spawn(coro):
-    if _loop is not None and _loop.is_running():
-        fut = asyncio.run_coroutine_threadsafe(coro, _loop)
-    else:
-        try:
-            fut = asyncio.get_running_loop().create_task(coro)
-        except RuntimeError:
-            fut = asyncio.get_event_loop().create_task(coro)
-    # Track background tasks so failures are not silently swallowed.
-    _background_tasks.add(fut)
-
-    def _on_done(f):
-        _background_tasks.discard(f)
-        exc = f.exception()
-        if exc is not None:
-            logger.error("Background task failed", exc_info=exc)
-
-    fut.add_done_callback(_on_done)
-    return fut
+    """Schedule a coroutine on the main loop (thread-safe) and track it in the
+    shared registry so background failures are logged and shutdown cancels it."""
+    return background_tasks.create(coro)
 
 # (step, activity, tools, next_task_status, progress)
 PHASES = [

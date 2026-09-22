@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from .. import db
 from ..db import audit, execute, insert, new_id, now, query, query_one, update
+from ..llm.health import test_gateway_models
 from ..schemas import GatewayUpdate
 
 logger = logging.getLogger(__name__)
@@ -101,19 +102,35 @@ def delete_gateway(gid: str):
 def test_gateway(gid: str):
     gw = _or_404(gid)
     ts = now()
-    ok = gw["base_url"].startswith("http://") or gw["base_url"].startswith("https://")
-    result = "Success" if ok else "Failed"
-    diag = ("Connection OK (simulated probe): TLS handshake and auth schema accepted"
-            if ok else "Invalid Base URL scheme; expected http(s)")
-    update("gateways", gid, {"last_tested_at": ts, "test_status": result, "test_diagnostic": diag})
+    health = test_gateway_models(gw)
+    update("gateways", gid, {
+        "last_tested_at": ts,
+        "test_status": health.status,
+        "test_diagnostic": health.diagnostic,
+    })
     models_fetched, models_removed = 0, 0
-    if ok:
-        sync = db.sync_gateway_models(gid)
-        models_fetched, models_removed = sync["added"], sync["removed"]
+    if health.ok:
+        for provider_model_id in health.models:
+            exists = query_one(
+                "SELECT id FROM gateway_models WHERE gateway_id=? AND provider_model_id=?",
+                (gid, provider_model_id),
+            )
+            if not exists:
+                insert("gateway_models", {
+                    "id": new_id(), "gateway_id": gid,
+                    "provider_model_id": provider_model_id,
+                    "display_name": provider_model_id,
+                    "capabilities": "", "active": 1,
+                })
+                models_fetched += 1
     audit("test_gateway", "gateway", gid,
-          f"Gateway test: {result}; catalog +{models_fetched}/-{models_removed}")
-    return {"status": result, "diagnostic": diag, "tested_at": ts,
-            "models_fetched": models_fetched, "models_removed": models_removed}
+          f"Gateway test: {health.status}; catalog +{models_fetched}/-{models_removed}")
+    return {
+        **health.as_dict(),
+        "tested_at": ts,
+        "models_fetched": models_fetched,
+        "models_removed": models_removed,
+    }
 
 
 @router.get("/gateways/{gid}/models")

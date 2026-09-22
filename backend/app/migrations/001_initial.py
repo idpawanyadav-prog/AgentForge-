@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS projects (
   repository_url TEXT NOT NULL DEFAULT '',
   workspace_path TEXT NOT NULL DEFAULT '',
   default_gateway_id TEXT REFERENCES gateways(id),
+  default_model_id TEXT REFERENCES gateway_models(id),
   team_id TEXT REFERENCES teams(id),
   memory_policy TEXT NOT NULL DEFAULT 'project-scoped',
   created_at TEXT NOT NULL,

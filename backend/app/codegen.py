@@ -18,6 +18,7 @@ import time
 import urllib.error as uerr
 
 from .db import get_gateway_key, query, query_one
+from .llm.resolver import resolve_project_model
 from . import toolchains
 
 
@@ -54,6 +55,7 @@ def call_llm(gw, model, system_prompt: str, user_text: str, max_tokens: int = 80
                                 {"role": "user", "content": user_text}]}
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     req = ureq.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+    started = time.perf_counter()
     try:
         with ureq.urlopen(req, timeout=300) as resp:
             data = json.loads(resp.read())
@@ -70,7 +72,12 @@ def call_llm(gw, model, system_prompt: str, user_text: str, max_tokens: int = 80
         text = data["choices"][0]["message"]["content"] or ""
         in_toks = usage.get("prompt_tokens") or 0
         out_toks = usage.get("completion_tokens") or 0
-    return {"text": text, "input_tokens": in_toks, "output_tokens": out_toks}
+    return {
+        "text": text,
+        "input_tokens": in_toks,
+        "output_tokens": out_toks,
+        "latency_ms": int((time.perf_counter() - started) * 1000),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -178,54 +185,11 @@ class GatewayClient:
 
 
 def resolve_llm(project):
-    """Pick (gateway, model) for code generation: the project's default
-    gateway when it has a key, else the control-bot gateway. (None, None)
-    when nothing usable is configured. The model is chosen from the
-    gateway's catalog — plain chat/coding models only; the control bot's
-    tool-calling routing model is never used for code generation."""
-    candidates = []
-    if project and project["default_gateway_id"]:
-        candidates.append(project["default_gateway_id"])
-    from .chatbot import _bot_config
-    bot_gw, bot_model = _bot_config()
-    if bot_gw and get_gateway_key(bot_gw["id"]):
-        return bot_gw, _pick_codegen_model(bot_gw["id"], bot_model)
-    for gid in candidates:
-        gw = query_one("SELECT * FROM gateways WHERE id = ?", (gid,))
-        if gw and get_gateway_key(gw["id"]):
-            return gw, _pick_codegen_model(gw["id"], None)
-    return None, None
-
-
-# Preferred code-generation models, in order. Anything whose id contains a
-# _BAD_MODEL_TOKENS entry is never selected (embedders, image/audio models,
-# and the control bot's tool-call-tuned "fable" routing models).
-_CODEGEN_MODEL_PREF = (
-    "claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5",
-    "claude-sonnet-4", "claude-opus-5", "claude-opus-4", "gpt-4.1", "gpt-4o",
-)
-_BAD_MODEL_TOKENS = ("embedding", "whisper", "dall-e", "tts", "image",
-                     "fable", "default")
-
-
-def _pick_codegen_model(gateway_id: str, fallback_model) -> dict:
-    rows = query(
-        "SELECT provider_model_id FROM gateway_models WHERE gateway_id = ? AND active = 1",
-        (gateway_id,))
-    text_models = [r["provider_model_id"] for r in rows
-                   if not any(b in (r["provider_model_id"] or "").lower()
-                              for b in _BAD_MODEL_TOKENS)]
-    for pref in _CODEGEN_MODEL_PREF:
-        for m in text_models:
-            if m == pref:
-                return {"provider_model_id": m}
-    for pref in _CODEGEN_MODEL_PREF:
-        for m in text_models:
-            if m.startswith(pref):
-                return {"provider_model_id": m}
-    if text_models:
-        return {"provider_model_id": text_models[0]}
-    return fallback_model or {"provider_model_id": "claude-sonnet-5"}
+    """Pick (gateway, model) for code generation via the central resolver."""
+    resolved = resolve_project_model(project)
+    if not resolved:
+        return None, None
+    return resolved.gateway, resolved.model
 
 
 def is_llm_outage(error: str) -> bool:

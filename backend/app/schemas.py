@@ -54,6 +54,7 @@ class ProjectUpdate(BaseModel):
     repository_url: Optional[str] = None
     workspace_path: Optional[str] = None
     default_gateway_id: Optional[str] = None
+    default_model_id: Optional[str] = None
     team_id: Optional[str] = None
     status: Optional[str] = None
     po_enabled: Optional[bool] = None

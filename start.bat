@@ -1,5 +1,5 @@
 @echo off
-rem Agent Office - start backend + frontend (served by FastAPI on port 8000)
+rem Agent Office - start backend + current frontend build (served by FastAPI on port 8000)
 rem Safe to run twice (won't start a second copy). The server runs in its
 rem own VISIBLE console window with live logs - closing that window stops
 rem the server (or use stop.bat).
@@ -26,10 +26,38 @@ if not errorlevel 1 (
     exit /b 0
 )
 
-if not exist "static\index.html" (
-    echo [!] static\ not built yet. Building frontend...
-    pushd frontend && call npm run build && popd
-    xcopy /e /i /y frontend\dist static >nul || (echo [!] frontend build failed & pause & exit /b 1)
+rem Fast frontend prep: install deps only when node_modules is missing (never
+rem the slow, destructive `npm ci`), and rebuild only when a source file is
+rem newer than the built bundle. Set AF_FORCE_BUILD=1 to force a rebuild.
+echo [*] Preparing frontend...
+if not exist "frontend\node_modules\" (
+    echo     installing frontend dependencies (first run only)...
+    pushd frontend
+    call npm install
+    if errorlevel 1 (popd & echo [!] frontend dependencies failed & pause & exit /b 1)
+    popd
+)
+
+set "NEEDS_BUILD=1"
+if not "%AF_FORCE_BUILD%"=="1" (
+    set "NEEDS_BUILD=0"
+    if not exist "backend\static\index.html" set "NEEDS_BUILD=1"
+)
+if "%NEEDS_BUILD%"=="0" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\frontend_stale.ps1"
+    if errorlevel 1 set "NEEDS_BUILD=1"
+)
+
+if "%NEEDS_BUILD%"=="0" (
+    echo     build is up to date - skipping
+) else (
+    echo     building frontend into backend\static...
+    pushd frontend
+    call npm run build
+    if errorlevel 1 (popd & echo [!] frontend build failed & pause & exit /b 1)
+    popd
+    if exist backend\static rmdir /s /q backend\static
+    xcopy /e /i /y frontend\dist backend\static >nul || (echo [!] copying frontend build failed & pause & exit /b 1)
 )
 
 echo Starting Agent Office on http://127.0.0.1:8000 ...

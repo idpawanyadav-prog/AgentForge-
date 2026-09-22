@@ -1,5 +1,6 @@
 import React from 'react';
 import { get, put } from './api';
+import { isApiReachable, DisconnectedBanner } from './offline';
 import ControlPage from './pages/ControlPage';
 import ProjectsPage from './pages/ProjectsPage';
 import TeamsPage from './pages/TeamsPage';
@@ -36,6 +37,17 @@ export default function App() {
   });
   const [activeProject, setActiveProject] = React.useState<string | null>(() => loadUi('ao.project', '') || null);
   const [collapsed, setCollapsed] = React.useState<boolean>(() => loadUi('ao.sidebar', '') === 'collapsed');
+  const [online, setOnline] = React.useState(true);
+
+  const probeApi = React.useCallback(() => {
+    isApiReachable().then(setOnline);
+  }, []);
+
+  React.useEffect(() => {
+    probeApi();
+    const id = setInterval(probeApi, 8000);
+    return () => clearInterval(id);
+  }, [probeApi]);
 
   React.useEffect(() => {
     get('/api/v1/settings')
@@ -121,6 +133,7 @@ export default function App() {
         </div>
       </aside>
       <main className="main">
+        {!online && <DisconnectedBanner onRetry={probeApi} />}
         {page === 'control' && (
           <ControlPage activeProject={activeProject} setActiveProject={setActiveProject} />
         )}
