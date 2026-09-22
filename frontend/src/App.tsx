@@ -3,12 +3,13 @@ import { get, put } from './api';
 import { isApiReachable, DisconnectedBanner } from './offline';
 import ControlPage from './pages/ControlPage';
 import ProjectsPage from './pages/ProjectsPage';
+import ProjectFlowPage from './pages/ProjectFlowPage';
 import TeamsPage from './pages/TeamsPage';
 import ModelsPage from './pages/ModelsPage';
 import MemoryPage from './pages/MemoryPage';
 import SettingsPage from './pages/SettingsPage';
 
-type Page = 'control' | 'projects' | 'teams' | 'models' | 'memory' | 'settings';
+type Page = 'control' | 'flow' | 'projects' | 'teams' | 'models' | 'memory' | 'settings';
 
 const loadUi = (key: string, fallback: string) => {
   try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
@@ -19,6 +20,7 @@ const saveUi = (key: string, value: string) => {
 
 const NAV: { id: Page; icon: string; label: string }[] = [
   { id: 'control', icon: '◉', label: 'Project Control' },
+  { id: 'flow', icon: '⇄', label: 'Project Flow' },
   { id: 'projects', icon: '▤', label: 'Projects' },
   { id: 'teams', icon: '⧉', label: 'Teams' },
   { id: 'models', icon: '◈', label: 'Models' },
@@ -136,6 +138,9 @@ export default function App() {
         {!online && <DisconnectedBanner onRetry={probeApi} />}
         {page === 'control' && (
           <ControlPage activeProject={activeProject} setActiveProject={setActiveProject} />
+        )}
+        {page === 'flow' && (
+          <ProjectFlowPage activeProject={activeProject} setActiveProject={setActiveProject} />
         )}
         {page === 'projects' && (
           <ProjectsPage activeProject={activeProject} setActiveProject={setActiveProject} onOpenControl={() => setPage('control')} />
