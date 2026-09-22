@@ -110,8 +110,8 @@ def update_project(pid: str, body: ProjectUpdate):
     allowed = {k: v for k, v in data.items() if k in ("name", "goal", "description", "technology_stack",
                                                       "repository_url", "workspace_path",
                                                       "default_gateway_id", "default_model_id",
-                                                      "team_id", "status",
-                                                      "po_enabled")}
+                                                      "team_id", "status", "po_enabled",
+                                                      "sa_review_enabled", "ba_review_enabled")}
     gateway_id = allowed.get("default_gateway_id")
     if gateway_id is None and "default_model_id" in allowed:
         current = query_one("SELECT default_gateway_id FROM projects WHERE id=?", (pid,))
@@ -129,8 +129,9 @@ def update_project(pid: str, body: ProjectUpdate):
         err = workspace.validate_workspace_path(allowed["workspace_path"])
         if err:
             raise HTTPException(400, err)
-    if "po_enabled" in allowed:
-        allowed["po_enabled"] = 1 if allowed["po_enabled"] else 0
+    for flag in ("po_enabled", "sa_review_enabled", "ba_review_enabled"):
+        if flag in allowed:
+            allowed[flag] = 1 if allowed[flag] else 0
     allowed["updated_at"] = now()
     update("projects", pid, allowed)
     _db = __import__("app.db", fromlist=["emit_event"])

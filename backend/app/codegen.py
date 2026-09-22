@@ -221,6 +221,75 @@ def _llm_outage_reason(text: str) -> str:
     return ""
 
 
+# ---------------------------------------------------------------- review gates
+
+_REVIEW_SYSTEM = {
+    "sa": (
+        "You are a Solution Architect reviewing one completed development task "
+        "in an autonomous software project. Judge ONLY architecture alignment: "
+        "module placement, dependency direction, interface/file-contract "
+        "compliance, duplicate helper implementations, and whether the change "
+        "respects the project's stated stack and conventions. Do not re-run "
+        "the build — automated gates already did that. Return ONLY a JSON "
+        'object: {"decision": "approved"|"rework", "rework_class": '
+        '"ARCHITECTURE_VIOLATION"|"CONTRACT_MISMATCH"|"HELPER_DUPLICATION"|"", '
+        '"findings": "one or two concrete sentences, empty when approved"}'),
+    "ba": (
+        "You are a Business Analyst reviewing one completed development task "
+        "in an autonomous software project. Judge ONLY functional alignment: "
+        "does the implemented behavior serve the task description, the "
+        "acceptance criteria and the project's business rules, including "
+        "obvious edge cases? Do not review code style or architecture. "
+        'Return ONLY a JSON object: {"decision": "approved"|"rework", '
+        '"rework_class": "FUNCTIONAL_MISMATCH"|"REQUIREMENT_GAP"|"", '
+        '"findings": "one or two concrete sentences, empty when approved"}'),
+}
+
+
+def review_verdict(project, task, mode: str) -> dict:
+    """One LLM call for an SA or BA review gate. Returns
+    {"decision": "approved"|"rework"|"unavailable", "rework_class",
+     "findings", "input_tokens", "output_tokens"}. 'unavailable' means the
+    gate could not run (no gateway, outage, unusable reply) — the pipeline
+    skips the gate instead of punishing the developer."""
+    empty = {"decision": "unavailable", "rework_class": "", "findings": "",
+             "input_tokens": 0, "output_tokens": 0}
+    gw, model = resolve_llm(project)
+    if not (gw and model):
+        return {**empty, "findings": "No LLM gateway configured — review gate skipped"}
+    tree = _existing_tree(project["workspace_path"])[:2500]
+    ac = task["acceptance_criteria"] or ""
+    if task["functional_ac"]:
+        ac = (ac + "\n" if ac else "") + "FUNCTIONAL AC: " + task["functional_ac"]
+    if task["technical_ac"]:
+        ac = (ac + "\n" if ac else "") + "TECHNICAL AC: " + task["technical_ac"]
+    user = (
+        f"PROJECT: {project['name']}\nGOAL: {project['goal'] or 'n/a'}\n"
+        f"STACK: {project['technology_stack'] or 'n/a'}\n"
+        f"WORKSPACE FILES:\n{tree}\n\n"
+        f"TASK: {task['title']}\n{task['description']}\n"
+        f"ACCEPTANCE CRITERIA:\n{ac or 'n/a'}\n\n"
+        f"CHANGE EVIDENCE: {(task['evidence'] or '')[:600]}\n\n"
+        "Is this implementation acceptable from your reviewing role?")
+    try:
+        raw = call_llm(gw, model, _REVIEW_SYSTEM[mode], user, max_tokens=500)
+    except Exception as exc:
+        return {**empty, "findings": f"review call failed: {str(exc)[:160]}"}
+    text = raw.get("text") or ""
+    from .chatbot import _extract_json  # lazy: chatbot imports runtime, runtime imports codegen
+    data = _extract_json(text) or {}
+    decision = str(data.get("decision") or "").lower()
+    tokens = {"input_tokens": raw.get("input_tokens", 0),
+              "output_tokens": raw.get("output_tokens", 0)}
+    if decision not in ("approved", "rework"):
+        outage = _llm_outage_reason(text)
+        reason = outage or "reviewer returned unusable output — gate skipped"
+        return {**empty, **tokens, "findings": reason}
+    return {"decision": decision,
+            "rework_class": str(data.get("rework_class") or "")[:60],
+            "findings": str(data.get("findings") or "")[:600], **tokens}
+
+
 # ---------------------------------------------------------------- codegen
 
 _SHARED_RULES = """- Contribute to ONE coherent application with a conventional

@@ -100,6 +100,27 @@ QA_PHASES = [
     ("qa-report", "QA: writing verdict and defect summary", ["code-review"], "Testing", 95),
 ]
 
+# Deterministic review gates (V3): a single verdict phase each, run by the
+# Solution Architect / Business Analyst before the task may reach QA.
+SA_REVIEW_PHASES = [
+    ("sa-review", "Solution Architect: reviewing architecture alignment", ["code-review"], "SA Review", 92),
+]
+BA_REVIEW_PHASES = [
+    ("ba-review", "Business Analyst: reviewing functional alignment", ["code-review"], "BA Review", 92),
+]
+
+_PHASES_BY_MODE = {
+    "dev": PHASES, "qa": QA_PHASES, "sa": SA_REVIEW_PHASES, "ba": BA_REVIEW_PHASES,
+}
+
+# Review-stage status -> (task_reviews.reviewer_type, team role family)
+_REVIEW_STAGES = {
+    "SA Review": ("solution_architect", "architecture"),
+    "BA Review": ("business_analyst", "requirements"),
+}
+
+_RUN_MODE_LABEL = {"dev": "", "qa": "QA: ", "sa": "SA review: ", "ba": "BA review: "}
+
 # Defect summaries QA may find (simulated verdicts).
 _QA_ISSUES = [
     "API returns 500 when city lookup has no results",
@@ -208,8 +229,13 @@ def validate_task_ready(task) -> tuple[bool, str]:
 
 
 
-def _is_qa_run(task) -> bool:
-    return task["status"] == "Waiting QA"
+def _run_mode(task) -> str:
+    """Which pipeline a start_execution claim runs: the waiting status of the
+    task selects dev / QA / SA-review / BA-review."""
+    return _MODE_BY_STATUS.get(task["status"], "dev")
+
+
+_MODE_BY_STATUS = {"Waiting QA": "qa", "SA Review": "sa", "BA Review": "ba"}
 
 
 def start_execution(project_id: str, task_id: str, idempotency_key: str | None = None):
@@ -257,30 +283,37 @@ def start_execution(project_id: str, task_id: str, idempotency_key: str | None =
                 input_cost_per_m = binding["input_cost_per_m"]
                 output_cost_per_m = binding["output_cost_per_m"]
 
-    qa_mode = _is_qa_run(task)
+    mode = _run_mode(task)
+    review_mode = mode in ("sa", "ba")
     run_id = new_id()
     insert("workflow_runs", {
         "id": run_id, "project_id": project_id, "task_id": task_id,
-        "agent_id": agent["id"], "status": "Running",
-        "current_step": (QA_PHASES if qa_mode else PHASES)[0][0], "started_at": now(),
+        "agent_id": agent["id"], "status": "Running", "mode": mode,
+        "current_step": _PHASES_BY_MODE[mode][0][0], "started_at": now(),
         "idempotency_key": idempotency_key,
     })
-    update("tasks", task_id, {"status": "In Progress" if not qa_mode else "Testing", "progress": 5,
-                              "blocked_reason": "", "updated_at": now()})
+    if review_mode:
+        # Waiting-review statuses stand on their own; only refresh progress.
+        update("tasks", task_id, {"progress": 88, "updated_at": now()})
+    else:
+        update("tasks", task_id, {"status": "In Progress" if mode == "dev" else "Testing",
+                                  "progress": 5,
+                                  "blocked_reason": "", "updated_at": now()})
     _emit(project_id, "workflow.started",
           {"run_id": run_id, "task": task["title"], "agent": agent["name"],
            "model": model_name, "persona_version": persona["version"],
-           "mode": "qa" if qa_mode else "dev"},
+           "mode": mode},
           workflow_run_id=run_id, task_id=task_id, agent_id=agent["id"])
     _set_agent(agent["id"], "Working",
-               ("QA: " if qa_mode else "") + f"Starting: {task['title']}",
+               _RUN_MODE_LABEL[mode] + f"Starting: {task['title']}",
                task_id=task_id, project_id=project_id)
-    _emit(project_id, "task.status_changed",
-          {"task_id": task_id, "task": task["title"],
-           "status": "Testing" if qa_mode else "In Progress", "progress": 5},
-          workflow_run_id=run_id, task_id=task_id)
+    if not review_mode:
+        _emit(project_id, "task.status_changed",
+              {"task_id": task_id, "task": task["title"],
+               "status": "Testing" if mode == "qa" else "In Progress", "progress": 5},
+              workflow_run_id=run_id, task_id=task_id)
     audit("start_execution", "workflow_run", run_id,
-          f"Started {'QA verification' if qa_mode else 'execution'} of task '{task['title']}'")
+          f"Started {mode} run of task '{task['title']}'")
 
     # The live worker and pause/resume/cancel (and stop_sprint_execution) all
     # mutate THIS dict, so it must be the same object stored in the registry —
@@ -288,19 +321,20 @@ def start_execution(project_id: str, task_id: str, idempotency_key: str | None =
     ctrl = {"paused": False, "cancelled": False,
             "input_cost_per_m": input_cost_per_m, "output_cost_per_m": output_cost_per_m,
             "model_used": model_name, "pinned_ref": None}
-    handle = _spawn(_run_phases(run_id, ctrl, qa_mode))
+    handle = _spawn(_run_phases(run_id, ctrl, mode))
     ctrl["task"] = handle
     with _registry_lock:
         _registry[run_id] = ctrl
     return {"run": get_run(run_id)}
 
 
-async def _run_phases(run_id: str, ctrl: dict, qa_mode: bool = False):
+async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
     run = get_run(run_id)
     project_id, task_id, agent_id = run["project_id"], run["task_id"], run["agent_id"]
     task = query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
     project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
-    phases = QA_PHASES if qa_mode else PHASES
+    phases = _PHASES_BY_MODE[mode]
+    review_mode = mode in ("sa", "ba")
     evidence = []
     llm_tokens = {"in": 0, "out": 0}
     test_summary = ""
@@ -373,7 +407,7 @@ async def _run_phases(run_id: str, ctrl: dict, qa_mode: bool = False):
                       {"agent_id": agent_id, "tool": tool, "step": step},
                       workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
 
-                if not qa_mode and step == "implement" and tool == "file.write":
+                if mode == "dev" and step == "implement" and tool == "file.write":
                     # REAL code generation (LLM when configured, runnable
                     # scaffold otherwise) written into the project workspace.
                     # rework_count > 0 means a previous attempt failed QA.
@@ -429,7 +463,7 @@ async def _run_phases(run_id: str, ctrl: dict, qa_mode: bool = False):
                     await _deps()
                     bok, build_summary = await asyncio.to_thread(
                         toolchains.build_check, stack, project["workspace_path"])
-                    if not bok and not qa_mode:
+                    if not bok and mode == "dev":
                         # Dev self-test: the dev knows the code is broken —
                         # fix it now instead of shipping it to QA.
                         for attempt in range(1, SELF_FIX_ATTEMPTS + 1):
@@ -468,7 +502,7 @@ async def _run_phases(run_id: str, ctrl: dict, qa_mode: bool = False):
                         ok, test_summary = await asyncio.to_thread(
                             toolchains.run_stack_tests, stack, project["workspace_path"],
                             baseline_failures, health_scope)
-                        if not ok and not qa_mode:
+                        if not ok and mode == "dev":
                             # Self-test on unit-test failures too, with the
                             # failing test output as feedback.
                             for attempt in range(1, SELF_FIX_ATTEMPTS + 1):
@@ -511,8 +545,26 @@ async def _run_phases(run_id: str, ctrl: dict, qa_mode: bool = False):
                           {"agent_id": agent_id, "tool": f"{tool}[{stack}]", "step": step,
                            "result": "ok" if ok else "failed", "summary": test_summary[:200]},
                           workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
-                    if not qa_mode:
+                    if mode == "dev":
                         selftest_failed = not (bok and ok)
+                    continue
+
+                if review_mode and tool == "code-review":
+                    # The gate's LLM verdict, computed once per review run;
+                    # _finish_review_run routes the task from ctrl["review"].
+                    verdict = await asyncio.to_thread(
+                        codegen.review_verdict, project, task, mode)
+                    ctrl["review"] = verdict
+                    llm_tokens["in"] += verdict["input_tokens"]
+                    llm_tokens["out"] += verdict["output_tokens"]
+                    evidence.append(
+                        f"review-{mode}-{verdict['decision']}:"
+                        + (verdict["findings"] or "")[:140])
+                    _emit(project_id, "tool.completed",
+                          {"agent_id": agent_id, "tool": "review.verdict", "step": step,
+                           "result": verdict["decision"],
+                           "summary": (verdict["findings"] or "")[:200]},
+                          workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
                     continue
 
                 _emit(project_id, "tool.completed",
@@ -563,9 +615,12 @@ async def _run_phases(run_id: str, ctrl: dict, qa_mode: bool = False):
                    "output_tokens": out_tokens, "cost_usd": cost},
                   workflow_run_id=run_id, agent_id=agent_id)
 
-        if qa_mode:
+        if mode == "qa":
             await _finish_qa_run(run_id, ctrl, project_id, task_id, agent_id, task,
                                  in_tokens, out_tokens, cost, test_summary)
+        elif review_mode:
+            await _finish_review_run(run_id, ctrl, project_id, task_id, agent_id, task,
+                                     mode, in_tokens, out_tokens, cost)
         elif selftest_failed:
             # Dev self-test failed even after fix attempts — block for
             # review instead of handing known-broken code to QA.
@@ -668,28 +723,80 @@ def _create_module_health_tasks(project_id: str, sprint_id: str, failing: set) -
     return created
 
 
+def _request_review(project_id, task, stage, dev_agent_id, evidence_str):
+    """Open a review gate for a task: assign a reviewer from the stage's
+    role family and create a pending task_reviews record. Returns the
+    reviewer, or None when no suitable agent is available (the gate is
+    then skipped rather than blocking the pipeline)."""
+    reviewer_type, family = _REVIEW_STAGES[stage]
+    members = _team_members(project_id) or []
+    reviewer, _ = _pick_member(members, family)
+    if reviewer and reviewer["id"] in (dev_agent_id, task["assigned_agent_id"]):
+        alt = [m for m in members if m["id"] not in (dev_agent_id, task["assigned_agent_id"])
+               and _family_of_role(m["role_name"]) == family]
+        reviewer = alt[0] if alt else None
+    if not reviewer:
+        return None
+    insert("task_reviews", {
+        "id": new_id(), "task_id": task["id"], "project_id": project_id,
+        "reviewer_type": reviewer_type, "reviewer_agent_id": reviewer["id"],
+        "status": "pending", "created_at": now(),
+    })
+    update("tasks", task["id"], {"status": stage, "progress": 85,
+                                 "assigned_agent_id": reviewer["id"],
+                                 "qa_agent_id": dev_agent_id,
+                                 "evidence": evidence_str, "updated_at": now()})
+    _emit(project_id, "task.status_changed",
+          {"task_id": task["id"], "task": task["title"], "status": stage, "progress": 85},
+          task_id=task["id"])
+    _emit(project_id, "task.review_requested",
+          {"task_id": task["id"], "task": task["title"], "stage": stage,
+           "reviewer": reviewer["name"]}, task_id=task["id"], agent_id=reviewer["id"])
+    return reviewer
+
+
+def _qa_handoff(project_id, task, dev_agent_id, evidence_str):
+    """Hand an approved task to QA. Returns False when no QA member is
+    available (the caller then marks the task Done directly)."""
+    qa = _pick_qa_member(project_id)
+    if not qa or qa["id"] == dev_agent_id:
+        return False
+    update("tasks", task["id"], {"status": "Waiting QA", "progress": 95,
+                                 "assigned_agent_id": qa["id"],
+                                 "qa_agent_id": dev_agent_id,
+                                 "evidence": evidence_str, "updated_at": now()})
+    _emit(project_id, "task.status_changed",
+          {"task_id": task["id"], "task": task["title"], "status": "Waiting QA", "progress": 95},
+          task_id=task["id"])
+    _emit(project_id, "task.qa_handoff",
+          {"task_id": task["id"], "task": task["title"], "dev": dev_agent_id,
+           "qa": qa["id"], "qa_name": qa["name"]}, task_id=task["id"], agent_id=dev_agent_id)
+    return True
+
+
 async def _finish_dev_run(run_id, ctrl, project_id, task_id, agent_id, task,
                           evidence, in_tokens, out_tokens, cost, test_summary=""):
-    """Dev run finished building: hand off to QA (status 'Waiting QA') or,
-    when no QA specialist exists on the team, mark the task Done directly."""
-    qa = _pick_qa_member(project_id)
-    if qa and qa["id"] != agent_id:
-        update("tasks", task_id, {"status": "Waiting QA", "progress": 95,
-                                  "assigned_agent_id": qa["id"], "qa_agent_id": agent_id,
-                                  "evidence": "; ".join(evidence) if evidence else "dev complete",
-                                  "updated_at": now()})
-        update("workflow_runs", run_id, {"status": "Completed", "current_step": "qa-handoff",
+    """Dev run finished building: route through the enabled SA/BA review
+    gates, then hand off to QA ('Waiting QA'); when nothing downstream
+    exists (no reviewers, no QA), mark the task Done directly."""
+    evidence_str = "; ".join(evidence) if evidence else "dev complete"
+    project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    outcome = "dev-done"
+    handed_off = False
+    if project["sa_review_enabled"]:
+        handed_off = bool(_request_review(project_id, task, "SA Review", agent_id, evidence_str))
+        outcome = "sa-review-handoff"
+    if not handed_off and project["ba_review_enabled"]:
+        handed_off = bool(_request_review(project_id, task, "BA Review", agent_id, evidence_str))
+        outcome = "ba-review-handoff"
+    if not handed_off:
+        handed_off = _qa_handoff(project_id, task, agent_id, evidence_str)
+    if handed_off:
+        update("workflow_runs", run_id, {"status": "Completed", "current_step": outcome,
                                          "completed_at": now()})
-        _emit(project_id, "task.status_changed",
-              {"task_id": task_id, "task": task["title"], "status": "Waiting QA", "progress": 95},
-              workflow_run_id=run_id, task_id=task_id)
-        _emit(project_id, "task.qa_handoff",
-              {"task_id": task_id, "task": task["title"], "dev": task["assigned_agent_id"],
-               "qa": qa["id"], "qa_name": qa["name"]},
-              workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
         _emit(project_id, "workflow.completed",
               {"run_id": run_id, "task": task["title"], "evidence": evidence,
-               "outcome": "dev-done", "qa_handoff": qa["name"],
+               "outcome": outcome,
                "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens,
                          "cost_usd": cost}},
               workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
@@ -698,12 +805,12 @@ async def _finish_dev_run(run_id, ctrl, project_id, task_id, agent_id, task,
         await asyncio.sleep(1.2)
         _set_agent(agent_id, "Idle", "", task_id=None, project_id=project_id)
         audit("dev_completed", "workflow_run", run_id,
-              f"Task '{task['title']}' handed off to QA ({qa['name']})")
+              f"Task '{task['title']}' completed dev phase -> {outcome}")
         return
 
     update("tasks", task_id, {
         "status": "Done", "progress": 100,
-        "evidence": "; ".join(evidence) if evidence else "review approved",
+        "evidence": evidence_str,
         "updated_at": now(),
     })
     update("workflow_runs", run_id, {"status": "Completed", "current_step": "done",
@@ -720,6 +827,119 @@ async def _finish_dev_run(run_id, ctrl, project_id, task_id, agent_id, task,
     await asyncio.sleep(1.2)
     _set_agent(agent_id, "Idle", "", task_id=None, project_id=project_id)
     audit("execution_completed", "workflow_run", run_id, f"Task '{task['title']}' completed")
+
+
+async def _finish_review_run(run_id, ctrl, project_id, task_id, agent_id, task, mode,
+                             in_tokens, out_tokens, cost):
+    """SA/BA review gate finished: record the verdict, then advance the task
+    (next gate -> QA -> Done) or bounce it to the developer as Rework.
+    After MAX_REWORK_CYCLES the task is blocked for human/PO review, and an
+    'unavailable' verdict (no gateway / LLM outage) never punishes the dev —
+    the gate is skipped and the chain advances."""
+    stage = "SA Review" if mode == "sa" else "BA Review"
+    reviewer_type, _ = _REVIEW_STAGES[stage]
+    verdict = ctrl.get("review") or {
+        "decision": "unavailable", "findings": "review verdict missing", "rework_class": ""}
+    decision = verdict["decision"]
+    findings = (verdict["findings"] or "")[:600]
+    rework_class = verdict.get("rework_class") or ""
+    task = query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    dev_agent_id = task["qa_agent_id"] or agent_id
+    reviewer = query_one("SELECT name FROM agents WHERE id = ?", (agent_id,))
+    reviewer_name = reviewer["name"] if reviewer else stage
+    row = query_one("SELECT * FROM task_reviews WHERE task_id = ? AND reviewer_type = ? "
+                    "AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+                    (task_id, reviewer_type))
+    review_status = "skipped" if decision == "unavailable" else decision
+    if row:
+        update("task_reviews", row["id"], {
+            "status": review_status, "findings": findings,
+            "rework_class": rework_class, "completed_at": now()})
+    else:
+        # Gate entered without _request_review (manual status change) —
+        # record the verdict as a completed review so evidence is never lost.
+        insert("task_reviews", {
+            "id": new_id(), "task_id": task_id, "project_id": project_id,
+            "reviewer_type": reviewer_type, "reviewer_agent_id": agent_id,
+            "status": review_status, "findings": findings,
+            "rework_class": rework_class, "created_at": now(),
+            "completed_at": now()})
+    evidence_str = ((task["evidence"] + "; ") if task["evidence"] else "") + \
+        f"review:{reviewer_type}={decision}"
+
+    if decision == "rework":
+        rework = (task["rework_count"] or 0) + 1
+        reason = f"{reviewer_name} rework: {findings}"[:400]
+        if rework >= MAX_REWORK_CYCLES:
+            blocked = f"{reason}. Failed {stage} {rework} times — needs human review."
+            update("tasks", task_id, {"status": "Blocked", "progress": 85,
+                                      "blocked_reason": blocked, "rework_count": rework,
+                                      "rework_class": rework_class,
+                                      "evidence": evidence_str, "updated_at": now()})
+            _emit(project_id, "task.status_changed",
+                  {"task_id": task_id, "task": task["title"], "status": "Blocked",
+                   "blocked_reason": blocked},
+                  workflow_run_id=run_id, task_id=task_id)
+            _emit(project_id, "review.escalated",
+                  {"task_id": task_id, "task": task["title"], "stage": stage,
+                   "cycles": rework, "needs_human": True},
+                  workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
+            audit("review_escalated", "task", task_id,
+                  f"Task '{task['title']}' escalated after {rework} {stage} rejections")
+            if po.po_enabled(project_id):
+                async def _po_review():
+                    try:
+                        await asyncio.to_thread(po.po_autonomy_tick, project_id)
+                    except Exception as exc:
+                        logger.warning("PO review failed for project %s: %s", project_id, exc)
+                _spawn(_po_review())
+        else:
+            update("tasks", task_id, {"status": "Rework",
+                                      "assigned_agent_id": dev_agent_id,
+                                      "blocked_reason": f"Rework cycle {rework}: {reason}",
+                                      "rework_count": rework, "rework_class": rework_class,
+                                      "evidence": evidence_str, "updated_at": now()})
+            _emit(project_id, "task.status_changed",
+                  {"task_id": task_id, "task": task["title"], "status": "Rework",
+                   "blocked_reason": f"Rework cycle {rework}: {reason}"},
+                  workflow_run_id=run_id, task_id=task_id)
+            _emit(project_id, "task.review_rejected",
+                  {"task_id": task_id, "task": task["title"], "stage": stage,
+                   "reviewer": reviewer_name, "findings": findings,
+                   "rework_class": rework_class, "cycle": rework},
+                  workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
+            audit("review_rejected", "workflow_run", run_id,
+                  f"{stage} rejected task '{task['title']}' (cycle {rework}): {findings[:150]}")
+    else:
+        project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+        advanced = False
+        if mode == "sa" and project["ba_review_enabled"]:
+            advanced = bool(_request_review(project_id, task, "BA Review",
+                                            dev_agent_id, evidence_str))
+        if not advanced:
+            advanced = _qa_handoff(project_id, task, dev_agent_id, evidence_str)
+        if not advanced:
+            update("tasks", task_id, {"status": "Done", "progress": 100,
+                                      "evidence": evidence_str,
+                                      "blocked_reason": "", "updated_at": now()})
+            _emit(project_id, "task.status_changed",
+                  {"task_id": task_id, "task": task["title"], "status": "Done", "progress": 100},
+                  workflow_run_id=run_id, task_id=task_id)
+            audit("review_completed", "workflow_run", run_id,
+                  f"{stage} cleared task '{task['title']}' (no QA agent — Done)")
+
+    update("workflow_runs", run_id, {"status": "Completed",
+                                     "current_step": f"{mode}-reviewed",
+                                     "completed_at": now()})
+    _emit(project_id, "workflow.completed",
+          {"run_id": run_id, "task": task["title"], "outcome": f"{mode}-review-{decision}",
+           "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens,
+                     "cost_usd": cost}},
+          workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
+    _set_agent(agent_id, "Completed", f"{stage}: {task['title']}",
+               task_id=task_id, project_id=project_id)
+    await asyncio.sleep(1.2)
+    _set_agent(agent_id, "Idle", "", task_id=None, project_id=project_id)
 
 
 async def _finish_qa_run(run_id, ctrl, project_id, task_id, agent_id, task,
@@ -904,7 +1124,7 @@ def _eligible_tasks(project_id):
         return []
     tasks = query(
         "SELECT * FROM tasks WHERE project_id = ? AND sprint_id = ? "
-        "AND status IN ('Todo','Ready','Rework','Waiting QA') AND assigned_agent_id IS NOT NULL "
+        "AND status IN ('Todo','Ready','Rework','Waiting QA','SA Review','BA Review') AND assigned_agent_id IS NOT NULL "
         "ORDER BY priority, created_at", (project_id, sprint["id"]))
     eligible = []
     for t in tasks:
@@ -1203,7 +1423,7 @@ def _team_members(project_id):
 def _agent_load(agent_id):
     return query_one(
         "SELECT COUNT(*) AS n FROM tasks WHERE assigned_agent_id = ? "
-        "AND status IN ('Ready','In Progress','Review','Testing','Waiting QA','Rework')", (agent_id,))["n"]
+        "AND status IN ('Ready','In Progress','Review','Testing','Waiting QA','SA Review','BA Review','Rework')", (agent_id,))["n"]
 
 
 def auto_assign_tasks(project_id: str) -> dict:

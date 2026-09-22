@@ -1081,7 +1081,7 @@ def _execute_command(project_id, command, args) -> str:
             "SELECT r.name AS role_name FROM agents a JOIN roles r ON r.id = a.role_id WHERE a.id = ?",
             (agent["id"],))
         mismatch = ""
-        if agent_role and task["status"] not in ("Waiting QA",):
+        if agent_role and task["status"] not in ("Waiting QA", "SA Review", "BA Review"):
             family = runtime._family_for_task(task)
             agent_family = runtime._family_of_role(agent_role["role_name"] or "")
             if family and agent_family and family != agent_family:
@@ -1488,7 +1488,7 @@ Rules:
 - If the user asks about status or progress, set command to null and summarize from the context.
 - Your reply is sent BEFORE the command runs; the real execution result is appended after it. Never claim an action already succeeded and never pre-announce outcomes (e.g. don't say "is now running" or "has been created") — describe what you are going to do.
 - start_sprint is fully autonomous: it auto-activates a planned sprint and auto-assigns tasks to team members by role. Never offer to assign tasks manually after starting; the run only surfaces for real blockers.
-- Workflow: tasks are matched to the agent's role family (dev/architecture/QA/BA/DevOps/design) — a development task never auto-assigns to QA or BA when a developer exists. After a developer finishes, the task moves to "Waiting QA" and a QA-role agent verifies it; QA pass -> Done, QA rejection -> "Rework" back to the developer with a defect summary; two rejections escalate to the user.
+- Workflow: tasks are matched to the agent's role family (dev/architecture/QA/BA/DevOps/design) — a development task never auto-assigns to QA or BA when a developer exists. After a developer finishes, the task may pass through review gates when enabled for the project ("SA Review" -> Solution Architect, "BA Review" -> Business Analyst; a rejection returns it to the developer as "Rework"); it then moves to "Waiting QA" and a QA-role agent verifies it; QA pass -> Done, QA rejection -> "Rework" back to the developer with a defect summary; two rejections escalate to the user.
 - reply: short, friendly, concrete. suggestions: exactly 3 short follow-up messages the user might send next.
 
 Respond with ONLY a JSON object, no markdown fences:

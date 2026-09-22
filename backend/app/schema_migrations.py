@@ -47,8 +47,10 @@ def _discover_migrations() -> list[tuple[int, object]]:
     found: list[tuple[int, object]] = []
     if not _MIGRATIONS_DIR.is_dir():
         return found
-    # Ensure the package is importable
-    pkg_dir = str(_MIGRATIONS_DIR.parent)
+    # Ensure the package is importable: migrations are imported as
+    # "app.migrations.X", so the *backend* dir (parent of app/) must be on
+    # sys.path — inserting app/ itself would shadow stdlib names (secrets…).
+    pkg_dir = str(_MIGRATIONS_DIR.parent.parent)
     if pkg_dir not in __import__("sys").path:
         __import__("sys").path.insert(0, pkg_dir)
     for fname in sorted(_MIGRATIONS_DIR.iterdir()):

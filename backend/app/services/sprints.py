@@ -6,8 +6,8 @@ sprint state rules.
 """
 from __future__ import annotations
 
-from . import db
-from .db import audit, execute, query_one
+from .. import db
+from ..db import audit, execute, query_one
 
 # Sprint status constants (mirrors sprint_gate.py — import from there
 # at call sites to avoid circular imports).

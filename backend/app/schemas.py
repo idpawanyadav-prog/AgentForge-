@@ -58,6 +58,8 @@ class ProjectUpdate(BaseModel):
     team_id: Optional[str] = None
     status: Optional[str] = None
     po_enabled: Optional[bool] = None
+    sa_review_enabled: Optional[bool] = None
+    ba_review_enabled: Optional[bool] = None
 
 
 class SprintUpdate(BaseModel):

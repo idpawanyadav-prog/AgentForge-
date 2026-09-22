@@ -108,4 +108,5 @@ export const TASK_STATE_CLASS: Record<string, string> = {
   Todo: 'dim', Ready: 'info', 'In Progress': 'info', Blocked: 'err',
   Review: 'warn', Testing: 'warn', Done: 'ok', Cancelled: 'dim',
   'Waiting QA': 'warn', Rework: 'err',
+  'SA Review': 'warn', 'BA Review': 'warn',
 };
