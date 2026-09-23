@@ -3,6 +3,7 @@
 > Excludes security findings (see separate security review).
 > Issues are organized by severity and categorized by type.
 > **FIXED** items are noted — they have been resolved in the current codebase.
+> Items marked **Not Pursuing** are intentional design decisions, not gaps.
 
 ---
 
@@ -58,19 +59,15 @@
 
 ## HIGH Severity Issues (Remaining)
 
-### H1. No authentication/authorization
+### H1. No authentication/authorization — **NOT PURSUING**
 
 **Files**: `backend/app/main.py`, all routers
-**Category**: Security
-**Impact**: Any client has full access to all APIs — create/delete projects, modify gateways, execute tasks
+**Category**: Design Decision (not an issue)
+**Impact**: Any client has full access to all APIs
 
-The backend has zero authentication. All 90+ endpoints are fully open. In a multi-tenant or production deployment, this allows:
-- Unauthorized project access
-- LLM key theft via gateway API
-- Arbitrary code execution via workspace manipulation
-- Data exfiltration via conversation/message APIs
+The backend has zero authentication. All 90+ endpoints are fully open. This is **intentional for now** — AgentForge is a single-user, local/internal deployment tool. Multi-tenant or production use would require auth, but that is deferred.
 
-**Recommendation**: Add API key or JWT authentication middleware. Implement project-level ACL. Add rate limiting per authenticated user.
+**Status**: Design decision. Not a bug, not a gap for current deployment model.
 
 ---
 
@@ -262,9 +259,9 @@ Markdown is rendered via `dangerouslySetInnerHTML`. The `md()` function does bas
 **Category**: Security (defense-in-depth — see security review)
 **Impact**: Keys vulnerable to memory dumps
 
-Decrypted keys live in Python strings for the process lifetime.
+Decrypted keys live in Python strings for the process lifetime. Acceptable for single-user/local deployment.
 
-**Recommendation**: Cache with TTL, zeroize after use (where possible).
+**Recommendation**: Cache with TTL, zeroize after use (where possible) when multi-user deployment is needed.
 
 ---
 
@@ -465,16 +462,17 @@ No vitest, jest, or testing-library configured.
 | Severity | Count | Key Areas |
 |----------|-------|-----------|
 | FIXED | 6 | Correctness, concurrency, reliability, maintainability |
-| HIGH | 5 | Security, maintainability, performance, reliability |
+| NOT PURSUING | 1 | Auth — intentional for single-user deployment |
+| HIGH | 4 | Maintainability, performance, reliability |
 | MEDIUM | 10 | Concurrency, reliability, architecture |
 | LOW | 8 | Style, operations, testing, UX |
 
-**Total Issues**: 29 remaining (6 fixed)
+**Total Issues**: 22 remaining (6 fixed, 1 intentional)
 
 **Priority Recommendations**:
-1. **HIGH**: Add authentication/authorization (H1) — critical for any production use
-2. **HIGH**: Refactor chatbot (H2) + fix thread blocking (H3)
-3. **MEDIUM**: Atomic workspace merge (H4), SSE backpressure (8), idempotency (9)
+1. **HIGH**: Refactor chatbot (H1 renamed) + fix thread blocking (H2)
+2. **HIGH**: Atomic workspace merge (H3), SSE backpressure (8), idempotency (9)
+3. **MEDIUM**: Address remaining concurrency and reliability items
 4. **LOW**: Schedule cleanup items for ongoing improvement
 
 ---

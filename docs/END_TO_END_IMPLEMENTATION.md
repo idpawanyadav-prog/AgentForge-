@@ -573,7 +573,7 @@ RATE_LIMIT_REDIS_URL=  # optional Redis for distributed limiting
 
 1. **SQLite concurrency**: Write contention under high parallelism (mitigated by locks)
 2. **No distributed deployment**: Single-process, single-machine only
-3. **No authentication/authorization**: All clients have full access
+3. **No authentication/authorization**: All clients have full access — **intentional for now, single-user/internal deployments**
 4. **Frontend state management**: No global store, manual polling
 5. **No frontend routing**: Manual page switching
 6. **Simulated LLM for some paths**: PO/chatbot can use deterministic parsing
@@ -582,8 +582,8 @@ RATE_LIMIT_REDIS_URL=  # optional Redis for distributed limiting
 
 ### Planned Enhancements
 
+- **Authentication/authorization**: Deferred — not needed for single-user/internal deployments
 - PostgreSQL migration path (data-access layer already swapable)
-- Authentication + role-based access control
 - WebSocket/SSE for real-time updates (replace polling)
 - Frontend router + global state (Zustand/Redux)
 - Frontend test suite (Vitest + Testing Library)
@@ -641,7 +641,7 @@ powershell scripts/setup_playwright.ps1
 
 ---
 
-## 12. Security Considerations
+### 12. Security Considerations
 
 ### Current Measures
 
@@ -654,15 +654,20 @@ powershell scripts/setup_playwright.ps1
 7. **No Stack Traces in Errors**: `_sanitize_exception()` strips internal paths
 8. **HTML Escaping**: Frontend markdown renderer escapes HTML before `dangerouslySetInnerHTML`
 
-### Areas for Improvement
+### Design Decision: No Authentication (Intentional)
 
-- No authentication/authorization (any client has full access)
-- No HTTPS enforcement (Vite proxy in dev only)
+AgentForge is designed as a **single-user, local/internal deployment** tool. All 90+ endpoints are intentionally open. This is documented as a known limitation, not a gap.
+
+### Areas for Improvement (When Multi-User Deployment is Needed)
+
+- Authentication/authorization (API key or JWT)
+- Project-level ACL
+- HTTPS enforcement (Vite proxy in dev only)
 - Decrypted keys in memory (vulnerable to dumps)
-- No audit of sensitive operations beyond basic logging
-- No secrets rotation mechanism
-- No input sanitization beyond basic escaping
-- No CSRF protection
+- Audit of sensitive operations beyond basic logging
+- Secrets rotation mechanism
+- Input sanitization beyond basic escaping
+- CSRF protection
 
 ---
 
