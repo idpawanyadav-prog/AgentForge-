@@ -304,6 +304,10 @@ _SHARED_RULES = """- Contribute to ONE coherent application with a conventional
   exactly the requested file type.
 - Every change MUST come with or update tests that pass with the stack's
   standard test runner.
+- The app is verified in a REAL headless browser (Playwright smoke): it
+  must boot, every page must render content without uncaught JS errors,
+  internal links must resolve, and form submits must not return server
+  errors. Write browser-testable acceptance criteria and UI accordingly.
 - Keep the full content of every file you touch (no diffs, no placeholders
   like "...", no TODO-only stubs). 6 files maximum."""
 

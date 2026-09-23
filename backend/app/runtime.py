@@ -14,7 +14,7 @@ import re
 import threading
 import time
 
-from . import db, workspace, codegen, toolchains, po, sprint_gate
+from . import db, workspace, codegen, toolchains, po, sprint_gate, browser_test
 from . import config
 from .db import emit_event, execute, insert, now, new_id, query_one, query, update, audit
 from .task_registry import background_tasks
@@ -88,7 +88,7 @@ PHASES = [
     ("analyze", "Analyzing task requirements and acceptance criteria", [], "In Progress", 15),
     ("plan", "Drafting implementation plan from persona instructions", ["memory.read"], "In Progress", 25),
     ("implement", "Writing code in project workspace", ["file.write", "file.read"], "In Progress", 55),
-    ("build-test", "Building and running unit tests", ["shell.run", "test.run"], "Testing", 75),
+    ("build-test", "Building and running unit tests", ["shell.run", "test.run", "browser.test"], "Testing", 75),
     ("review", "Self-review against definition of done", ["code-review"], "Review", 90),
     ("finalize", "Recording evidence and completing task", [], "Done", 100),
 ]
@@ -96,7 +96,7 @@ PHASES = [
 # QA verification phases, run by a QA-role agent after dev completion.
 QA_PHASES = [
     ("verify", "QA: reviewing implementation against acceptance criteria", ["memory.read", "file.read"], "Testing", 30),
-    ("qa-test", "QA: running test suite and exploratory checks", ["shell.run", "test.run"], "Testing", 70),
+    ("qa-test", "QA: running test suite and browser checks", ["shell.run", "test.run", "browser.test"], "Testing", 70),
     ("qa-report", "QA: writing verdict and defect summary", ["code-review"], "Testing", 95),
 ]
 
@@ -339,6 +339,20 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
     llm_tokens = {"in": 0, "out": 0}
     test_summary = ""
     selftest_failed = False
+    selftest_reason = ""
+    # Isolation: dev/QA runs work on a TEMP copy of the workspace, so no two
+    # agents ever edit the same file live and QA testing cannot disturb
+    # on-going work. Changed files merge back (per-file leases) when the run
+    # finishes; cancelled/failed runs discard their copy.
+    run_ws, ws_manifest = "", {}
+    if mode in ("dev", "qa"):
+        run_ws, ws_manifest = await asyncio.to_thread(
+            workspace.begin_run_workspace, project_id, run_id)
+        if run_ws:
+            project = dict(project, workspace_path=run_ws)
+            _emit(project_id, "workspace.run_isolated",
+                  {"agent_id": agent_id, "task": task["title"], "run_id": run_id},
+                  workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
 
     def _record_model(gen):
         """Persist the chain member that actually served this codegen call onto
@@ -428,13 +442,14 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
                         evidence.append("summary:" + gen["summary"][:120])
                     if gen["error"]:
                         evidence.append("codegen-error:" + gen["error"][:120])
-                    commit = workspace.commit_all(project_id)
-                    if commit:
-                        evidence.append("commit:" + commit)
-                        _emit(project_id, "workspace.committed",
-                              {"agent_id": agent_id, "commit": commit,
-                               "files": gen["files"], "mode": gen["mode"]},
-                              workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
+                    if not run_ws:  # not isolated: commit live directly
+                        commit = workspace.commit_all(project_id)
+                        if commit:
+                            evidence.append("commit:" + commit)
+                            _emit(project_id, "workspace.committed",
+                                  {"agent_id": agent_id, "commit": commit,
+                                   "files": gen["files"], "mode": gen["mode"]},
+                                  workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
                 elif tool == "test.run":
                     # REAL build check for the detected stack: python
                     # (compile + FastAPI boot), dotnet build, go build+vet
@@ -483,7 +498,7 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
                                 bok = False
                                 build_summary = gen["error"]
                                 break  # LLM down — retrying just burns quota
-                            commit = workspace.commit_all(project_id)
+                            commit = None if run_ws else workspace.commit_all(project_id)
                             if commit:
                                 evidence.append("commit:" + commit)
                             await _deps()  # new imports from the fix round
@@ -522,7 +537,7 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
                                     ok = False
                                     test_summary = gen["error"]
                                     break  # LLM down — retrying just burns quota
-                                commit = workspace.commit_all(project_id)
+                                commit = None if run_ws else workspace.commit_all(project_id)
                                 if commit:
                                     evidence.append("commit:" + commit)
                                 await _deps()  # new imports from the fix round
@@ -547,6 +562,55 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
                           workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
                     if mode == "dev":
                         selftest_failed = not (bok and ok)
+                    continue
+
+                elif tool == "browser.test":
+                    # Playwright smoke: boot the generated app on a private
+                    # port and drive it in a real headless browser. Missing
+                    # Playwright SKIPS (never a fake pass/fail); a real
+                    # failure triggers the dev self-fix loop like build and
+                    # unit-test failures do.
+                    res = await asyncio.to_thread(browser_test.run_smoke, project)
+                    if res["status"] == "failed" and mode == "dev":
+                        for attempt in range(1, SELF_FIX_ATTEMPTS + 1):
+                            _emit(project_id, "agent.activity",
+                                  {"agent_id": agent_id, "step": step,
+                                   "activity": f"Self-fix {attempt}/{SELF_FIX_ATTEMPTS} (browser): "
+                                               f"{res['summary'][:110]}"},
+                                  workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
+                            gen = await asyncio.to_thread(
+                                codegen.generate_implementation, project, task,
+                                run["agent_id"],
+                                f"Your app FAILED the browser smoke test: {res['summary']}\n"
+                                "The app was launched and visited with a real headless "
+                                "browser: pages must render content without uncaught JS "
+                                "errors, internal links must resolve, form submits must "
+                                "not return server errors.\n"
+                                "Return the corrected complete file(s).",
+                                pinned_ref=ctrl.get("pinned_ref"))
+                            _record_model(gen)
+                            if gen.get("error") and codegen.is_llm_outage(gen["error"]):
+                                break  # LLM down — retrying just burns quota
+                            commit = None if run_ws else workspace.commit_all(project_id)
+                            if commit:
+                                evidence.append("commit:" + commit)
+                            res = await asyncio.to_thread(browser_test.run_smoke, project)
+                            if res["status"] != "failed" or ctrl["cancelled"]:
+                                break
+                    ctrl["browser"] = res
+                    tag = {"passed": "browser-pass",
+                           "failed": "browser-fail"}.get(res["status"], "browser-skip")
+                    evidence.append(f"{tag}:" + res["summary"][:160])
+                    _emit(project_id, "tool.completed",
+                          {"agent_id": agent_id, "tool": "browser.smoke", "step": step,
+                           "result": "ok" if res["status"] != "failed" else "failed",
+                           "summary": res["summary"][:200],
+                           "pages": res.get("pages", 0),
+                           "screenshots": res.get("screenshots", [])[:6]},
+                          workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
+                    if mode == "dev" and res["status"] == "failed":
+                        selftest_failed = True
+                        selftest_reason = res["summary"]
                     continue
 
                 if review_mode and tool == "code-review":
@@ -579,6 +643,33 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
                       {"task_id": task_id, "task": task["title"],
                        "status": next_status, "progress": progress},
                       workflow_run_id=run_id, task_id=task_id)
+
+        # Merge the run's private copy back into the live workspace: only the
+        # files this run changed are applied, under per-file leases — that is
+        # the single point where two agents could ever collide, and the lease
+        # serializes it (a live file that moved meanwhile is committed to git
+        # first, so no agent's work is silently lost).
+        if run_ws:
+            merged = await asyncio.to_thread(
+                workspace.merge_back_run_workspace,
+                project_id, run_id, run_ws, ws_manifest)
+            if merged["applied"]:
+                evidence.append(f"merged:{len(merged['applied'])}")
+                if merged.get("commit"):
+                    evidence.append("commit:" + merged["commit"])
+                _emit(project_id, "workspace.committed",
+                      {"agent_id": agent_id, "commit": merged.get("commit") or "",
+                       "files": merged["applied"][:30], "mode": mode},
+                      workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
+            if merged["conflicts"]:
+                _emit(project_id, "workspace.file_conflict",
+                      {"agent_id": agent_id, "task": task["title"],
+                       "files": merged["conflicts"][:20],
+                       "note": "live files changed after this run started; "
+                               "previous state committed before overwrite"},
+                      workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
+            if merged["error"]:
+                evidence.append("merge-error:" + merged["error"][:140])
 
         # Re-fetch task at this point — rework/fix cycles may have changed
         # blocked_reason, rework_count, or status on the DB row.
@@ -626,7 +717,7 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
             # review instead of handing known-broken code to QA.
             await _finish_dev_selftest_failed(run_id, project_id, task_id, agent_id, task,
                                               evidence, in_tokens, out_tokens, cost,
-                                              test_summary)
+                                              (selftest_reason or test_summary))
         else:
             await _finish_dev_run(run_id, ctrl, project_id, task_id, agent_id, task,
                                   evidence, in_tokens, out_tokens, cost, test_summary)
@@ -662,6 +753,15 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
     finally:
         with _registry_lock:
             _registry.pop(run_id, None)
+        if run_ws:
+            # Fire-and-forget so this is safe even when the task itself is
+            # being cancelled; anything left over is GC'd by the next run.
+            try:
+                asyncio.get_running_loop().run_in_executor(
+                    None, workspace.discard_run_workspace, run_ws)
+            except Exception:
+                logger.debug("run workspace cleanup skipped for %s", run_id,
+                             exc_info=True)
 
 
 async def _finish_dev_selftest_failed(run_id, project_id, task_id, agent_id, task,
@@ -949,12 +1049,14 @@ async def _finish_qa_run(run_id, ctrl, project_id, task_id, agent_id, task,
     unavailable. Reject -> task back to the developer ('Rework') with an
     error summary. After MAX_REWORK_CYCLES rejections the task is escalated
     to a human instead of looping forever."""
-    if test_summary.startswith(("tests passed", "pytest passed")):
-        # Baseline-tolerance results pass at TASK level: this task's own work
-        # is clean. Workspace-wide health (legacy failures) is enforced later
-        # by the sprint-level Tests gate (sprint_gate.run_sprint_gates).
-        verdict_pass = True
-        summary = ""
+    browser = ctrl.get("browser") or {}
+    browser_status = browser.get("status", "")
+    browser_summary = browser.get("summary", "")
+    if browser_status == "failed":
+        # Real browser evidence outranks everything else: the app broke in
+        # an actual browser, so no unit-test pass can carry this task.
+        verdict_pass = False
+        summary = f"QA browser smoke failed: {browser_summary[len('browser FAILED: '):].strip()}"
     elif test_summary.startswith(("tests FAILED", "pytest FAILED")):
         verdict_pass = False
         marker = "tests FAILED: " if test_summary.startswith("tests FAILED") else "pytest FAILED: "
@@ -962,10 +1064,24 @@ async def _finish_qa_run(run_id, ctrl, project_id, task_id, agent_id, task,
     elif test_summary.startswith("build FAILED"):
         verdict_pass = False
         summary = f"QA build smoke failed: {test_summary[len('build FAILED: '):].strip()}"
+    elif test_summary.startswith(("tests passed", "pytest passed")):
+        # Baseline-tolerance results pass at TASK level: this task's own work
+        # is clean. Workspace-wide health (legacy failures) is enforced later
+        # by the sprint-level Tests gate (sprint_gate.run_sprint_gates).
+        verdict_pass = True
+        summary = ""
+    elif browser_status == "passed":
+        # The app booted and worked in a real browser: a genuine pass, so
+        # the random fallback below never decides this task's fate.
+        verdict_pass = True
+        summary = ""
     else:
         verdict_pass = random.random() >= 0.15
         summary = "" if verdict_pass else f"QA found defects: {', '.join(random.sample(_QA_ISSUES, 1))}"
     dev_agent_id = task["qa_agent_id"] or agent_id
+    browser = ctrl.get("browser") or {}
+    browser_status = browser.get("status", "")
+    browser_summary = browser.get("summary", "")
     dev = query_one("SELECT name FROM agents WHERE id = ?", (dev_agent_id,))
     qa_agent = query_one("SELECT name FROM agents WHERE id = ?", (agent_id,))
 

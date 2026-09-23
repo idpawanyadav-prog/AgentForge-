@@ -383,6 +383,12 @@ function describeEvent(e: EventRow): string {
     case 'workflow.started': return `started: ${p.task || ''}`;
     case 'workflow.completed': return `completed: ${p.task || ''}`;
     case 'tool.started': return `tool ${p.tool} (${p.step || ''})`;
+    case 'tool.completed': return p.tool === 'browser.smoke'
+      ? `🌐 browser smoke ${p.result === 'ok' ? 'passed' : 'FAILED'}: ${String(p.summary || '').slice(0, 90)}`
+      : `tool ${p.tool} ${p.result || ''}`;
+    case 'workspace.run_isolated': return `🧪 isolated run workspace (no shared-file conflicts)`;
+    case 'workspace.committed': return `💾 merged back ${p.files?.length ?? 0} file(s)${p.commit ? ` @ ${p.commit}` : ''}`;
+    case 'workspace.file_conflict': return `⚠️ file conflict: ${p.files?.slice(0, 3).join(', ') || ''} (previous state committed)`;
     case 'agent.state_changed': return `${p.state}${p.activity ? ` — ${p.activity}` : ''}`;
     default: return e.event_type;
   }

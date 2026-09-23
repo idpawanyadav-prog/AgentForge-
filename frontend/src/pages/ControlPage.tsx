@@ -29,6 +29,7 @@ interface Summary {
 
 function eventColor(t: string): string {
   if (/(failed|error|blocked)/.test(t)) return 'dot-err';
+  if (/conflict/.test(t)) return 'dot-warn';
   if (/(completed|done|approved)/.test(t)) return 'dot-ok';
   if (/(paused|waiting|requested)/.test(t)) return 'dot-warn';
   return 'dot-info';
@@ -64,7 +65,9 @@ function eventText(e: EventRow): string {
     case 'workflow.paused': return `Execution paused`; 
     case 'workflow.resumed': return `Execution resumed`;
     case 'tool.started': return `Tool ${p.tool} started (${p.step})`;
-    case 'tool.completed': return `Tool ${p.tool} completed`;
+    case 'tool.completed': return p.tool === 'browser.smoke'
+      ? `🌐 Browser smoke ${p.result === 'ok' ? 'passed' : 'FAILED'}: ${String(p.summary || '').slice(0, 110)}`
+      : `Tool ${p.tool} completed`;
     case 'tool.failed': return `Tool ${p.tool} failed: ${p.error}`;
     case 'usage.recorded': return `Usage: ${p.input_tokens + p.output_tokens} tokens, $${p.cost_usd}`;
     case 'project.updated': return p.note || 'Project updated';
@@ -81,6 +84,9 @@ function eventText(e: EventRow): string {
     case 'sprint.gate.changed': return `${p.sprint} — ${p.gate} gate: ${p.status}${p.summary ? ` (${String(p.summary).slice(0, 80)})` : ''}`;
     case 'sprint.unlocked': return `🔓 Sprint "${p.sprint}" unlocked (next sprint ready)`;
     case 'task.blocked_by_sprint_gate': return `⛔ Task "${p.task}" blocked by sprint gate: ${p.reason}`;
+    case 'workspace.run_isolated': return `🧪 "${p.task}" running on an isolated workspace copy (no shared-file conflicts)`;
+    case 'workspace.committed': return `💾 committed ${p.commit || ''} — ${p.files?.length ?? 0} file(s) merged back`;
+    case 'workspace.file_conflict': return `⚠️ File conflict on ${p.files?.slice(0, 3).join(', ')}${(p.files?.length ?? 0) > 3 ? '…' : ''} — previous live state committed to git before overwrite`;
     case 'agent.status.changed': return p.activity ? `${p.agent}: ${p.activity}` : `${p.agent}: ${p.state}`;
     default: return e.event_type;
   }
