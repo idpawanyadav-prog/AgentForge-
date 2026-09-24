@@ -64,6 +64,18 @@ HELP_TEXT = """I can execute these typed commands:
 - `enable product owner` — the PO takes over with your full authority (autonomous mode)
 - `disable product owner` — control returns to you; all open tasks remain untouched
 
+**Project initiation (design phase / specs pipeline)**
+- `analyze project` — run the flow's Design Phase (roles author their documents in sequence, pausing at each approval gate); a flow with no design steps drafts BAS/PDS/TS then one approval
+- `start design phase` — (re)start the Design Phase explicitly
+- `approve` / `approve design` / `proceed` / `ok` — approve the step (or documents) now awaiting approval; when the phase finishes the SA writes the blueprint and breaks it into runnable sprints
+- `reject the documents <reason>` / `reject design <reason>` — send the current step back for revision
+- `revise the documents <what to change>` — re-draft with your feedback
+- `status` shows the current pipeline stage; document links are posted in chat
+
+**Task approval (flow gate)**
+- `approve task <id>` — sign off a task parked in Pending Approval (id prefix is enough; omit it when only one task waits)
+- `reject task <id>: <what to change>` — send it back to the developer as rework
+
 **Info**
 - `status` — project summary
 - `help` — this message
@@ -1244,6 +1256,77 @@ def _cmd_disable_po(project_id, args, ts) -> str:
             "run halted.")
 
 
+# ----------------------- spec pipeline (V3 Step 2) -----------------------
+
+def _project_flow(project_id):
+    from . import flows
+    from .db import query_one
+    project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    return flows.flow_for_project(project) if project else None
+
+
+def _cmd_analyze_project(project_id, args, ts) -> str:
+    from . import design, specs
+    flow = _project_flow(project_id)
+    if flow and flow.get("design"):
+        return design.start_run(project_id, flow)
+    return specs.start_pipeline(project_id)
+
+
+def _cmd_start_design(project_id, args, ts) -> str:
+    from . import design
+    flow = _project_flow(project_id)
+    if not flow or not flow.get("design"):
+        return "This project's flow has no Design Phase steps configured."
+    return design.start_run(project_id, flow)
+
+
+def _cmd_approve_baseline(project_id, args, ts) -> str:
+    from . import design, specs
+    if design.pending_step(project_id):
+        return design.approve_design(project_id)
+    return specs.chat_approve(project_id)
+
+
+def _clean_design_notes(notes: str) -> str:
+    import re
+    return re.sub(r"^\s*(?:the\s+)?(?:design(?:\s+phase)?(?:\s+step\s+\d+)?|"
+                  r"docs?(?:uments?)?|baseline|specs?)\s*[:\-]?\s*", "",
+                  notes or "", flags=re.IGNORECASE).strip()
+
+
+def _cmd_reject_baseline(project_id, args, ts) -> str:
+    from . import design, specs
+    notes = _clean_design_notes(str(args.get("notes") or ""))
+    if design.pending_step(project_id):
+        return design.reject_design(project_id, notes)
+    return specs.chat_reject(project_id, notes)
+
+
+def _cmd_revise_baseline(project_id, args, ts) -> str:
+    from . import design, specs
+    notes = _clean_design_notes(str(args.get("notes") or ""))
+    if not notes:
+        return ("Tell me what to change, e.g. `revise the documents keep the scope to a "
+                "read-only dashboard`.")
+    if design.pending_step(project_id):
+        return design.reject_design(project_id, notes)
+    return specs.chat_revise(project_id, notes)
+
+
+def _cmd_approve_task(project_id, args, ts) -> str:
+    from . import runtime
+    return runtime.resolve_task_approval(project_id, args.get("ref") or "", "approve")
+
+
+def _cmd_reject_task(project_id, args, ts) -> str:
+    from . import runtime
+    rest = str(args.get("rest") or "").strip()
+    ref, sep, notes = rest.partition(":")
+    if not sep:
+        ref, notes = rest, ""
+    return runtime.resolve_task_approval(project_id, ref.strip(), "rework", notes.strip())
+
 
 _COMMAND_HANDLERS = {
     "create_gateway": _cmd_create_gateway,
@@ -1274,6 +1357,13 @@ _COMMAND_HANDLERS = {
     "retry_failed": _cmd_retry_failed,
     "enable_po": _cmd_enable_po,
     "disable_po": _cmd_disable_po,
+    "analyze_project": _cmd_analyze_project,
+    "start_design": _cmd_start_design,
+    "approve_baseline": _cmd_approve_baseline,
+    "reject_baseline": _cmd_reject_baseline,
+    "revise_baseline": _cmd_revise_baseline,
+    "approve_task": _cmd_approve_task,
+    "reject_task": _cmd_reject_task,
 }
 
 
@@ -1289,8 +1379,19 @@ def _execute_command(project_id, command, args) -> str:
 INTENTS = [
     ("help", r"^\s*(help|commands|what can you do)\b"),
     ("status", r"^\s*(status|summary|project status|how are we doing)\b"),
-    ("confirm", r"^\s*(confirm|yes|approve|do it|go ahead)\b"),
+    ("analyze_project", r"^\s*(?:analyze (?:the )?project|start (?:the )?analysis|"
+                        r"(?:draft|create|generate) (?:the )?(?:spec(?:ification)?s?|"
+                        r"documents?|docs?))\b.*$"),
+    ("start_design", r"^\s*(?:start (?:the )?design(?: phase)?|run (?:the )?design(?: phase)?)\b.*$"),
+    ("approve_baseline", r"^\s*approve (?:the )?(?:documents?|docs?|baseline|specs?|"
+                         r"design(?: phase)?(?: step \d+)?)"
+                         r"(?:\s+(?:RB|AB)-[\d.]+)?\s*$"),
+    ("approve_task", r"^\s*approve\s+task(?:\s+(?P<ref>\S+))?\s*$"),
+    ("reject_task", r"^\s*(?:reject|decline)\s+task(?:\s+(?P<rest>.*?))?\s*$"),
+    ("confirm", r"^\s*(confirm|yes|approve|proceed|ok|okay|lgtm|sounds good|do it|go ahead)\b"),
     ("cancel_pending", r"^\s*(cancel that|discard|no thanks?|nevermind|never mind)\b"),
+    ("reject_baseline", r"^\s*reject(?: the? (?:documents?|docs?|baseline|specs?))?\b(?P<notes>.*)$"),
+    ("revise_baseline", r"^\s*(?:revise|request revision(?:\s+on)?)\s*(?:the? (?:documents?|docs?|baseline|specs?))?\b(?P<notes>.*)$"),
     ("show_pending", r"^\s*(?:show|share|display|see)\s+(?:me\s+)?(?:the\s+)?(?:proposed|purposed|drafted|pending|current)?\s*(?:sprint\s+)?(?:plan|proposal|sprint(?:\s+plan)?)\s*$"),
     ("show_pending", r"^\s*what(?:'s| is)?\s+(?:the\s+)?(?:proposed|purposed|drafted|pending)\s+(?:sprint|plan)\b"),
     ("create_gateway", r"create (?:a )?gateway\s+(?P<name>.+?)(?:\s+provider\s+(?P<provider>\S+))?(?:\s+(?:url|base[_ -]?url)\s+(?P<base_url>\S+))?(?:\s+(?:key|api[_ -]?key)\s+(?P<api_key>\S+))?\s*$"),
@@ -1447,6 +1548,12 @@ SUGGESTIONS = {
     "create_gateway": ["Test gateway", "Status", "Help"],
     "test_gateway": ["Create agent", "Status", "Help"],
     "install_toolchain": ["Status", "Help"],
+    "analyze_project": ["Status", "approve", "Help"],
+    "approve_baseline": ["Status", "start sprint", "Help"],
+    "approve_task": ["Status", "Help"],
+    "reject_task": ["Status", "Help"],
+    "reject_baseline": ["analyze project", "Status"],
+    "revise_baseline": ["Status", "approve"],
 }
 
 
@@ -1543,6 +1650,10 @@ def _context_brief(project_id) -> str:
         lines.append(f"Product Owner agent: {po_state['agent_name']} — authority "
                      + ("ENABLED (running the project autonomously)" if po_state["po_enabled"]
                        else "disabled (you make the decisions)"))
+    from . import specs
+    from . import design as _design
+    _dbrief = _design.brief(project_id)
+    lines.append(_dbrief or specs.pipeline_brief(project_id))
     return "\n".join(lines)
 
 
@@ -1578,6 +1689,12 @@ Available commands (name: args):
 - enable_po: {} — enable the project's Product Owner agent to act autonomously with the user's full authority (requires a Product Owner agent on the team; if missing, offer `hire_agent` with role "Product Owner" first)
 - disable_po: {} — hand control back to the user; existing tasks remain open
 - install_toolchain: {stack: "dotnet"|"go"|"node"|"python"} — when a task or QA report says a build toolchain is unavailable, offer to install it (e.g. `dotnet` for WPF/.NET, `go`, `node`/npm). A plan is proposed and the user must confirm before anything runs on the machine.
+- analyze_project: {} — start the initiation pipeline: BA drafts BAS + PDS, SA drafts TS, then ONE approval gate (a PO agent auto-reviews; otherwise the user approves with `approve`). Use this when the user "initiates/starts a new project" or wants specs/documents/analysis.
+- approve_baseline: {} — approve the pending documents baseline when the user says approve/proceed/ok/lgtm and a baseline is pending
+- reject_baseline: {notes?} — reject the pending documents (opens a change request)
+- revise_baseline: {notes} — re-draft the documents with the user's feedback
+- approve_task: {ref?} — approve a task parked in 'Pending Approval' by the project flow's approval gate; ref is a task id prefix or title (omit when only one task waits). Only use when the user explicitly approves a TASK (not the documents).
+- reject_task: {rest?} — send a pending-approval task back as rework; rest is "<ref>: <notes>" or just notes
 
 Rules:
 - Pick a command only when the user clearly wants that action; otherwise set command to null and just answer.
@@ -1590,7 +1707,8 @@ Rules:
 - If the user asks about status or progress, set command to null and summarize from the context.
 - Your reply is sent BEFORE the command runs; the real execution result is appended after it. Never claim an action already succeeded and never pre-announce outcomes (e.g. don't say "is now running" or "has been created") — describe what you are going to do.
 - start_sprint is fully autonomous: it auto-activates a planned sprint and auto-assigns tasks to team members by role. Never offer to assign tasks manually after starting; the run only surfaces for real blockers.
-- Workflow: tasks are matched to the agent's role family (dev/architecture/QA/BA/DevOps/design) — a development task never auto-assigns to QA or BA when a developer exists. After a developer finishes, the task may pass through review gates when enabled for the project ("SA Review" -> Solution Architect, "BA Review" -> Business Analyst; a rejection returns it to the developer as "Rework"); it then moves to "Waiting QA" and a QA-role agent verifies it; QA pass -> Done, QA rejection -> "Rework" back to the developer with a defect summary; two rejections escalate to the user.
+- Spec pipeline: when the user is clearly happy with the pending documents ("approve them", "looks good, go ahead") use approve_baseline; "reject"/"that's wrong" → reject_baseline or revise_baseline with concrete notes. Never approve a baseline the user did not actually approve — if in doubt, ask.
+- Workflow: the project's Flow (see the Flow Setup tab) defines the per-task stage chain; the built-in default is dev -> "SA Review" (Solution Architect) -> "BA Review" (Business Analyst) -> "Waiting QA" (QA agent) -> Done, and some flows add a final "Pending Approval" gate where the user (or the PO agent) signs the task off with `approve task` / `reject task`. A rejection at any stage returns the task to the developer as "Rework"; two rejections escalate to the user. Tasks are matched to the agent's role family — a development task never auto-assigns to QA or BA when a developer exists.
 - reply: short, friendly, concrete. suggestions: exactly 3 short follow-up messages the user might send next.
 
 Respond with ONLY a JSON object, no markdown fences:
@@ -1801,6 +1919,20 @@ def _confirm_pending(project_id: str, conversation_id: str) -> dict:
             "SELECT * FROM pending_commands WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 1",
             (conversation_id,))
         if not pending:
+            from . import design, specs
+            if design.pending_step(project_id):
+                # "approve"/"proceed"/"ok" while a design step awaits approval.
+                reply = design.approve_design(project_id)
+                _save_message(conversation_id, "assistant", reply)
+                return {"reply": reply,
+                        "suggestions": ["Status", "What are the agents doing?", "Help"]}
+            if specs.pending_requirement_baseline(project_id):
+                # "approve"/"proceed"/"ok" with no pending chat command but
+                # documents at the approval gate → decide the baseline.
+                reply = specs.chat_approve(project_id)
+                _save_message(conversation_id, "assistant", reply)
+                return {"reply": reply,
+                        "suggestions": ["Status", "What are the agents doing?", "Help"]}
             reply = "There is no pending command to confirm."
             _save_message(conversation_id, "assistant", reply)
             return {"reply": reply, "suggestions": ["Status", "Help"]}
@@ -1820,18 +1952,21 @@ def _confirm_pending(project_id: str, conversation_id: str) -> dict:
                 "suggestions": SUGGESTIONS.get(pending["command"], ["Status", "Help"])}
 
 
+def match_intent(text: str):
+    """Return (intent_name, regex_match) for the first INTENTS pattern that
+    matches, or (None, None). Matched against the ORIGINAL text so captured
+    titles keep their casing instead of being lowercased."""
+    for name, pattern in INTENTS:
+        m = re.match(pattern, text, re.IGNORECASE)
+        if m:
+            return name, m
+    return None, None
+
+
 def handle_message(project_id: str, conversation_id: str, text: str) -> dict:
     text = _prepare_message(conversation_id, text)
 
-    lowered = text.lower()
-    intent, match = None, None
-    for name, pattern in INTENTS:
-        # Match against the ORIGINAL text (case-insensitively) so captured
-        # titles keep their casing instead of being lowercased.
-        m = re.match(pattern, text, re.IGNORECASE)
-        if m:
-            intent, match = name, m
-            break
+    intent, match = match_intent(text)
 
     if intent == "confirm":
         return _confirm_pending(project_id, conversation_id)

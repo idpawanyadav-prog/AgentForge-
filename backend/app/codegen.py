@@ -658,12 +658,20 @@ def review_verdict(project, task, mode: str, agent_ref: str, deadline: float | N
         ac = (ac + "\n" if ac else "") + "FUNCTIONAL AC: " + task["functional_ac"]
     if task["technical_ac"]:
         ac = (ac + "\n" if ac else "") + "TECHNICAL AC: " + task["technical_ac"]
+    contracts_hint = ""
+    if mode == "sa":
+        try:
+            from . import specs as _specs
+            contracts_hint = _specs.dev_contracts_block(project["id"], task)
+        except Exception:
+            contracts_hint = ""
     user = (
         f"PROJECT: {project['name']}\nGOAL: {project['goal'] or 'n/a'}\n"
         f"STACK: {project['technology_stack'] or 'n/a'}\n"
         f"WORKSPACE FILES:\n{tree}\n\n"
         f"TASK: {task['title']}\n{task['description']}\n"
         f"ACCEPTANCE CRITERIA:\n{ac or 'n/a'}\n\n"
+        f"{contracts_hint}"
         f"CHANGE EVIDENCE: {(task['evidence'] or '')[:600]}"
         f"{_changed_files_block(project['workspace_path'], task['evidence'] or '')}\n\n"
         "Is this implementation acceptable from your reviewing role?")
@@ -696,6 +704,51 @@ def review_verdict(project, task, mode: str, agent_ref: str, deadline: float | N
     return {"decision": decision,
             "rework_class": str(data.get("rework_class") or "")[:60],
             "findings": str(data.get("findings") or "")[:600], **tokens}
+
+
+_APPROVE_SYSTEM = """You are the Product Owner approval gate for a finished task.
+The task already passed every automated stage of the project's delivery flow
+(development, reviews, tests). Your job is the final business sign-off.
+
+Judge ONLY what a product owner judges:
+- does the change deliver the task's goal and acceptance criteria?
+- is the evidence concrete (files changed, tests run, behaviour observed)?
+- anything shipped that the task never asked for?
+
+Reply with ONE JSON object and nothing else:
+{"decision": "approve" | "rework", "findings": "<one paragraph, <=400 chars>"}
+Use "rework" only for a real business gap, and say exactly what to change."""
+
+
+def approval_verdict(project, task, evidence: str) -> dict:
+    """PO-agent sign-off for a task parked in 'Pending Approval'. Returns
+    {"decision": "approve"|"rework"|"unavailable", "findings": ...}; an
+    unusable reply or missing gateway yields 'unavailable' so the caller can
+    leave the task with the human instead of guessing."""
+    empty = {"decision": "unavailable", "findings": ""}
+    b_ok, b_reason = budget.may_spend(project["id"])
+    if not b_ok:
+        return {**empty, "findings": b_reason}
+    gw, model = resolve_llm(project)
+    if not (gw and model):
+        return {**empty, "findings": "No LLM gateway configured"}
+    user = (f"PROJECT: {project['name']}\nGOAL: {project['goal'] or 'n/a'}\n"
+            f"TASK: {task['title']}\n{task['description']}\n"
+            f"ACCEPTANCE CRITERIA:\n{(task['acceptance_criteria'] or 'n/a')[:1200]}\n\n"
+            f"EVIDENCE: {(evidence or task['evidence'] or '')[:900]}\n\n"
+            "Sign off or send it back?")
+    try:
+        raw = call_llm(gw, model, _APPROVE_SYSTEM, user, max_tokens=400,
+                       trace_label="approval", timeout=120)
+        _charge_llm_call(project, model, raw)
+    except Exception as exc:
+        return {**empty, "findings": f"approval call failed: {str(exc)[:160]}"}
+    data = _extract_object(raw.get("text") or "")
+    decision = str(data.get("decision") or "").lower()
+    if decision not in ("approve", "rework"):
+        return {**empty, "findings": "PO returned unusable output — left for the human"}
+    return {"decision": decision,
+            "findings": str(data.get("findings") or "")[:600]}
 
 
 # ---------------------------------------------------------------- codegen
@@ -1307,12 +1360,23 @@ def generate_implementation(project, task, agent_ref: str, feedback: str = "",
                 main_block = src[:4000] + ("\n... (truncated)" if len(src) > 4000 else "")
             except OSError:
                 pass
+        # Blueprint contracts (V3 Step 2): when the SA has written file
+        # contracts for the files this task names, the dev must build exactly
+        # against them — the SA review gate then judges conformance to the
+        # same written contracts.
+        contracts_block = ""
+        try:
+            from . import specs as _specs
+            contracts_block = _specs.dev_contracts_block(project["id"], task)
+        except Exception:
+            contracts_block = ""
         user_prompt = (f"PROJECT: {project['name']}\nGOAL: {project['goal'] or 'n/a'}\n"
                        f"TECH STACK: {project['technology_stack'] or 'Python (FastAPI where appropriate)'}\n\n"
                        f"TASK TO IMPLEMENT: {task['title']}\n"
                        f"DESCRIPTION: {task['description'] or 'n/a'}\n"
                        f"ACCEPTANCE CRITERIA: {task['acceptance_criteria'] or 'n/a'}"
                        f"{feedback_block}\n"
+                       f"{contracts_block}"
                        f"EXISTING WORKSPACE FILES:\n{_existing_tree(ws_dir)}\n"
                        f"{helpers_block}\n"
                        f"CURRENT app/main.py:\n{main_block}"

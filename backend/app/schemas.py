@@ -57,6 +57,7 @@ class ProjectUpdate(BaseModel):
     default_model_id: Optional[str] = None
     team_id: Optional[str] = None
     status: Optional[str] = None
+    flow_id: Optional[str] = None
     po_enabled: Optional[bool] = None
     sa_review_enabled: Optional[bool] = None
     ba_review_enabled: Optional[bool] = None

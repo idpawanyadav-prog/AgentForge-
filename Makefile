@@ -42,7 +42,7 @@ deploy: frontend
 
 ## DRY_RUN smoke: one full no-cost LLM path (returns deterministic stubs)
 dry-run:
-	cd backend && DRY_RUN=1 $(PY) -c "from app import codegen; r = codegen.call_llm({'id':'g'},{'provider_model_id':'dry'},'s','u'); print('DRY_RUN ok:', r['dry_run'])"
+	cd backend && DRY_RUN=1 $(PY) -c "from app.codegen import call_llm; r = call_llm({'id':'g'},{'provider_model_id':'dry'},'s','u'); print('DRY_RUN ok:', r['dry_run'])"
 
 ## Time-stamped copy of the live DB before experiments
 db-backup:

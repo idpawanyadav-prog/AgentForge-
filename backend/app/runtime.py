@@ -16,7 +16,7 @@ import threading
 import time
 
 from . import db, workspace, codegen, toolchains, po, sprint_gate, browser_test, memory
-from . import config, governance, budget
+from . import config, governance, budget, flows
 from .db import emit_event, execute, insert, now, new_id, query_one, query, update, audit
 from .task_registry import background_tasks
 
@@ -936,6 +936,135 @@ def _qa_handoff(project_id, task, dev_agent_id, evidence_str):
     return True
 
 
+_STAGE_STATUS = {"sa": "SA Review", "ba": "BA Review"}
+
+
+def _advance_stage(project, task, from_stage, dev_agent_id, evidence_str):
+    """Walk the project's flow to the stage after ``from_stage`` and hand the
+    task over. Stages whose actor is unavailable (no reviewer / no QA agent)
+    are skipped, matching the pre-flow gate behaviour. Returns
+    (handed_off, outcome); (False, 'done') means the flow is exhausted."""
+    flow = flows.flow_for_project(project)
+    nxt = flows.next_after(flow, from_stage)
+    while nxt:
+        if nxt in _STAGE_STATUS:
+            if _request_review(project["id"], task, _STAGE_STATUS[nxt],
+                               dev_agent_id, evidence_str):
+                return True, f"{nxt}-review-handoff"
+        elif nxt == "qa":
+            if _qa_handoff(project["id"], task, dev_agent_id, evidence_str):
+                return True, "qa-handoff"
+        elif nxt == "approve":
+            if _request_approval(project, task, dev_agent_id, evidence_str):
+                return True, "approval-handoff"
+        nxt = flows.next_after(flow, nxt)
+    return False, "done"
+
+
+def _request_approval(project, task, dev_agent_id, evidence_str):
+    """Park a flow-finished task in 'Pending Approval': a human approves or
+    rejects it in the control chat, or the PO agent decides autonomously."""
+    update("tasks", task["id"], {"status": "Pending Approval", "progress": 97,
+                                 "assigned_agent_id": dev_agent_id,
+                                 "qa_agent_id": dev_agent_id,
+                                 "evidence": evidence_str, "updated_at": now()})
+    _emit(project["id"], "task.status_changed",
+          {"task_id": task["id"], "task": task["title"], "status": "Pending Approval",
+           "progress": 97}, task_id=task["id"])
+    _emit(project["id"], "task.approval_requested",
+          {"task_id": task["id"], "task": task["title"]},
+          task_id=task["id"], agent_id=dev_agent_id)
+    from . import specs
+    specs._post(project["id"],
+                f"🛑 **{task['title']}** has cleared every automated stage of the flow "
+                f"and awaits approval. Say `approve task {task['id'][:8]}` to finish it, "
+                f"or `reject task {task['id'][:8]}: <what to change>` to send it back.")
+    if po.po_enabled(project["id"]):
+        def _po_decide():
+            try:
+                verdict = codegen.approval_verdict(project, task, evidence_str)
+                decision = "approve" if verdict["decision"] == "approve" else "rework"
+                resolve_task_approval(project["id"], task["id"], decision,
+                                      verdict.get("findings") or "", actor="PO agent")
+            except Exception as exc:
+                logger.warning("PO approval decision failed for project %s: %s",
+                               project["id"], exc)
+        threading.Thread(target=_po_decide, daemon=True,
+                         name=f"approve-{task['id'][:8]}").start()
+    return True
+
+
+def _complete_task(project_id, task, evidence_str):
+    update("tasks", task["id"], {"status": "Done", "progress": 100,
+                                 "evidence": evidence_str, "blocked_reason": "",
+                                 "updated_at": now()})
+    _emit(project_id, "task.status_changed",
+          {"task_id": task["id"], "task": task["title"], "status": "Done",
+           "progress": 100}, task_id=task["id"])
+
+
+def resolve_task_approval(project_id, task_ref, decision, notes="", actor="user") -> str:
+    """Approve or reject a task parked in 'Pending Approval'."""
+    ref = (task_ref or "").strip()
+    pending = query("SELECT * FROM tasks WHERE project_id = ? AND status = 'Pending Approval' "
+                    "ORDER BY updated_at", (project_id,))
+    task = None
+    if ref:
+        for t in pending:
+            if t["id"].startswith(ref) or t["title"].lower() == ref.lower():
+                task = t
+                break
+        if not task:
+            pending_by_title = [t for t in pending if ref.lower() in t["title"].lower()]
+            task = pending_by_title[0] if pending_by_title else None
+    elif len(pending) == 1:
+        task = pending[0]
+    if not task:
+        if not pending:
+            return "No task is waiting for approval on this project."
+        return ("Several tasks await approval — name one, e.g. "
+                f"`{'approve' if decision == 'approve' else 'reject'} task "
+                f"{pending[0]['id'][:8]}`.")
+    dev_agent_id = task["qa_agent_id"] or task["assigned_agent_id"]
+    evidence_str = ((task["evidence"] + "; ") if task["evidence"] else "") + \
+        f"approval:{actor}={decision}"
+    if decision == "approve":
+        project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+        advanced, _ = _advance_stage(project, task, "approve", dev_agent_id, evidence_str)
+        if not advanced:
+            _complete_task(project_id, task, evidence_str)
+        audit("task_approved", "task", task["id"],
+              f"'{task['title']}' approved by {actor}", actor=actor)
+        return f"✅ **{task['title']}** approved by {actor} — marked Done."
+    rework = (task["rework_count"] or 0) + 1
+    reason = f"{actor} rejected: {(notes or 'no notes given')[:600]}"
+    if rework >= MAX_REWORK_CYCLES:
+        update("tasks", task["id"], {"status": "Blocked", "progress": 90,
+                                     "blocked_reason": reason, "rework_count": rework,
+                                     "evidence": evidence_str, "updated_at": now()})
+        _emit(project_id, "task.status_changed",
+              {"task_id": task["id"], "task": task["title"], "status": "Blocked",
+               "blocked_reason": reason}, task_id=task["id"])
+        audit("approval_escalated", "task", task["id"],
+              f"'{task['title']}' blocked after {rework} approval rejections", actor=actor)
+        return (f"⛔ **{task['title']}** rejected by {actor} {rework} times — "
+                "blocked for review.")
+    update("tasks", task["id"], {"status": "Rework", "assigned_agent_id": dev_agent_id,
+                                 "blocked_reason": f"Rework cycle {rework}: {reason}",
+                                 "rework_count": rework, "evidence": evidence_str,
+                                 "updated_at": now()})
+    _emit(project_id, "task.status_changed",
+          {"task_id": task["id"], "task": task["title"], "status": "Rework",
+           "blocked_reason": f"Rework cycle {rework}: {reason}"}, task_id=task["id"])
+    _emit(project_id, "task.approval_rejected",
+          {"task_id": task["id"], "task": task["title"], "actor": actor,
+           "notes": notes[:400], "cycle": rework}, task_id=task["id"])
+    audit("task_rejected", "task", task["id"],
+          f"'{task['title']}' sent back by {actor} (cycle {rework})", actor=actor)
+    return (f"🔁 **{task['title']}** sent back to the developer (cycle {rework}): "
+            f"{(notes or 'no notes given')[:300]}")
+
+
 async def _finish_dev_run(run_id, ctrl, project_id, task_id, agent_id, task,
                           evidence, in_tokens, out_tokens, cost, test_summary="",
                           merge_error=""):
@@ -984,16 +1113,7 @@ async def _finish_dev_run(run_id, ctrl, project_id, task_id, agent_id, task,
             _spawn(_po_review_merge())
         return
     project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
-    outcome = "dev-done"
-    handed_off = False
-    if project["sa_review_enabled"]:
-        handed_off = bool(_request_review(project_id, task, "SA Review", agent_id, evidence_str))
-        outcome = "sa-review-handoff"
-    if not handed_off and project["ba_review_enabled"]:
-        handed_off = bool(_request_review(project_id, task, "BA Review", agent_id, evidence_str))
-        outcome = "ba-review-handoff"
-    if not handed_off:
-        handed_off = _qa_handoff(project_id, task, agent_id, evidence_str)
+    handed_off, outcome = _advance_stage(project, task, "dev", agent_id, evidence_str)
     if handed_off:
         update("workflow_runs", run_id, {"status": "Completed", "current_step": outcome,
                                          "completed_at": now()})
@@ -1123,12 +1243,8 @@ async def _finish_review_run(run_id, ctrl, project_id, task_id, agent_id, task, 
                               findings, subject=task["title"], owner_agent_id=dev_agent_id)
     else:
         project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
-        advanced = False
-        if mode == "sa" and project["ba_review_enabled"]:
-            advanced = bool(_request_review(project_id, task, "BA Review",
-                                            dev_agent_id, evidence_str))
-        if not advanced:
-            advanced = _qa_handoff(project_id, task, dev_agent_id, evidence_str)
+        advanced, _outcome = _advance_stage(project, task, mode, dev_agent_id,
+                                            evidence_str)
         if not advanced:
             update("tasks", task_id, {"status": "Done", "progress": 100,
                                       "evidence": evidence_str,
@@ -1205,18 +1321,19 @@ async def _finish_qa_run(run_id, ctrl, project_id, task_id, agent_id, task,
 
     if verdict_pass:
         evidence = (task["evidence"] + "; " if task["evidence"] else "") + "qa:passed"
-        update("tasks", task_id, {"status": "Done", "progress": 100, "evidence": evidence,
-                                  "blocked_reason": "", "updated_at": now()})
-        update("workflow_runs", run_id, {"status": "Completed", "current_step": "done",
+        project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+        advanced, _outcome = _advance_stage(project, task, "qa", dev_agent_id, evidence)
+        update("workflow_runs", run_id, {"status": "Completed",
+                                         "current_step": "done" if not advanced else _outcome,
                                          "completed_at": now()})
-        _emit(project_id, "task.status_changed",
-              {"task_id": task_id, "task": task["title"], "status": "Done", "progress": 100},
-              workflow_run_id=run_id, task_id=task_id)
         _emit(project_id, "task.qa_passed",
               {"task_id": task_id, "task": task["title"], "qa": qa_agent["name"] if qa_agent else agent_id},
               workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
+        if not advanced:
+            _complete_task(project_id, task, evidence)
         _emit(project_id, "workflow.completed",
-              {"run_id": run_id, "task": task["title"], "outcome": "qa-passed",
+              {"run_id": run_id, "task": task["title"],
+               "outcome": "qa-passed" if not advanced else _outcome,
                "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens,
                          "cost_usd": cost}},
               workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
@@ -1917,6 +2034,12 @@ def start_sprint_execution(project_id: str, sprint_ref=None):
     project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     if not project:
         return {"error": "Project not found"}
+    # Spec pipeline (V3 Step 2): a project whose blueprint-derived sprint
+    # plan is ready enters Active Development the moment a sprint starts.
+    if (governance.governance_enabled(project_id)
+            and governance.current_state(project_id) == governance.READY_PLANNING):
+        governance.transition_project(project_id, governance.ACTIVE_DEV,
+                                      reason="sprint execution started", actor="user")
     g_ok, g_reason = governance.may_execute(project_id)
     if not g_ok:
         return {"error": f"SPRINT_BLOCKED_BY_LIFECYCLE: {g_reason}"}
@@ -1931,6 +2054,14 @@ def start_sprint_execution(project_id: str, sprint_ref=None):
             "SELECT * FROM sprints WHERE project_id = ? AND status IN ('Planned','Ready') "
             "ORDER BY created_at", (project_id,))
         if not planned:
+            if not _team_members(project_id):
+                # Brand-new projects usually lack BOTH a team and a sprint;
+                # naming only the sprint step strands users in a loop where
+                # the next sprint still cannot assign anything.
+                return {"error": "SETUP_INCOMPLETE: this project has no agents assigned yet. "
+                                 "First say \"align team <name> to this project\" in the control chat "
+                                 "(or pick a team in Project Settings), then \"create a sprint\"; "
+                                 "execution can start after that."}
             return {"error": "No sprint to start — create one first (e.g. say \"create a sprint\")"}
         sprint = planned
     with _schedulers_lock:

@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import chatbot, db, po, runtime, workspace
-from .routers import (agents, chat, events, gateways, governance, models,
+from .routers import (agents, chat, events, flows, gateways, governance, models,
                       playground, projects, roles, settings, tasks)
 from .rate_limit import rate_limit_middleware
 from .task_registry import background_tasks
@@ -90,6 +90,7 @@ app.include_router(chat.router)
 app.include_router(settings.router)
 app.include_router(events.router)
 app.include_router(governance.router)
+app.include_router(flows.router)
 app.include_router(playground.router)
 
 

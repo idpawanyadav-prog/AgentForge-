@@ -438,3 +438,13 @@ def test_review_gate_skips_when_budget_exhausted(monkeypatch):
                                  "sa", "agent")
     assert out["decision"] == "unavailable"
     assert "budget exhausted" in out["findings"]
+
+
+def test_start_sprint_without_agents_explains_setup():
+    # A brand-new project has neither sprint nor agents; the refusal must
+    # name BOTH missing setup steps, not just the sprint one.
+    from app import runtime
+    _seed_project("pr-setup")
+    res = runtime.start_sprint_execution("pr-setup")
+    assert res["error"].startswith("SETUP_INCOMPLETE")
+    assert "align team" in res["error"] and "create a sprint" in res["error"]

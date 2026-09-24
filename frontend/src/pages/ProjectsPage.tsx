@@ -1,6 +1,7 @@
 import React from 'react';
 import { get, getPage, post, patch, del, Page } from '../api';
 import { Badge, Field, Modal, useAsyncData, ErrorNote, Pagination } from '../components';
+import { MarkdownText } from '../MarkdownText';
 import { TASK_STATE_CLASS } from '../api';
 import { BacklogSchema, ProjectSchema, SprintSchema, TaskSchema } from '../validation';
 
@@ -13,7 +14,7 @@ export default function ProjectsPage({ activeProject, setActiveProject, onOpenCo
   const { data: teams } = useAsyncData<any[]>(() => get('/api/v1/teams'), []);
   const { data: gateways } = useAsyncData<any[]>(() => get('/api/v1/gateways'), []);
   const [selected, setSelected] = React.useState<string | null>(activeProject);
-  const [tab, setTab] = React.useState<'backlog' | 'governance' | 'sprints' | 'tasks' | 'settings'>('tasks');
+  const [tab, setTab] = React.useState<'backlog' | 'governance' | 'sprints' | 'tasks' | 'docs' | 'design' | 'settings'>('tasks');
   const [modal, setModal] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
@@ -69,7 +70,7 @@ export default function ProjectsPage({ activeProject, setActiveProject, onOpenCo
               </div>
             </div>
             <div className="row" style={{ marginTop: 10 }}>
-              {(['tasks', 'backlog', 'sprints', 'governance', 'settings'] as const).map((t) => (
+              {(['tasks', 'backlog', 'sprints', 'docs', 'design', 'governance', 'settings'] as const).map((t) => (
                 <button key={t} className={`btn small ${tab === t ? 'primary' : ''}`}
                   onClick={() => setTab(t)}>{t[0].toUpperCase() + t.slice(1)}</button>
               ))}
@@ -78,6 +79,8 @@ export default function ProjectsPage({ activeProject, setActiveProject, onOpenCo
               {tab === 'tasks' && <TasksTab projectId={project.id} onError={fail} onChanged={refresh} />}
               {tab === 'backlog' && <BacklogTab projectId={project.id} onError={fail} onChanged={refresh} />}
               {tab === 'sprints' && <SprintsTab projectId={project.id} onError={fail} onChanged={refresh} />}
+              {tab === 'docs' && <DocsTab projectId={project.id} />}
+              {tab === 'design' && <DesignTab projectId={project.id} onError={fail} />}
               {tab === 'governance' && <GovernanceTab project={project} onError={fail} onChanged={refresh} />}
               {tab === 'settings' && (
                 <SettingsTab project={project} teams={teams ?? []} gateways={gateways ?? []}
@@ -98,8 +101,15 @@ export default function ProjectsPage({ activeProject, setActiveProject, onOpenCo
 
 function ProjectForm({ onClose, onSaved, teams, gateways }:
   { onClose: () => void; onSaved: (id: string) => void; teams: any[]; gateways: any[] }) {
-  const [f, setF] = React.useState({ name: '', goal: '', description: '', technology_stack: '', repository_url: '', workspace_path: '', team_id: '', default_gateway_id: '', default_model_id: '' });
+  const [f, setF] = React.useState({ name: '', goal: '', description: '', technology_stack: '', repository_url: '', workspace_path: '', team_id: '', default_gateway_id: '', default_model_id: '', flow_id: '' });
   const [validationError, setValidationError] = React.useState('');
+  const { data: flows } = useAsyncData<any[]>(() => get('/api/v1/flows'), []);
+  React.useEffect(() => {
+    if (!f.flow_id && flows?.length) {
+      setF((prev) => ({ ...prev, flow_id: (flows.find((x) => x.is_default === 1) ?? flows[0]).id }));
+    }
+  }, [flows, f.flow_id]);
+  const flow = (flows ?? []).find((x) => x.id === f.flow_id);
   const { data: models } = useAsyncData<any[]>(
     () => (f.default_gateway_id ? get(`/api/v1/gateways/${f.default_gateway_id}/models`) : Promise.resolve([])),
     [f.default_gateway_id]);
@@ -120,6 +130,25 @@ function ProjectForm({ onClose, onSaved, teams, gateways }:
             <option value="">— none —</option>
             {teams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
           </select>
+          {!f.team_id && (
+            <div className="muted small" style={{ marginTop: 4 }}>
+              {flow?.team?.length
+                ? `Left empty, the flow provisions its own team (${flow.team.map((t: any) => `${t.count}× ${t.role}`).join(', ')}).`
+                : 'No team means no agents to assign tasks to. Pick one here, or say “align team <name> to this project” in the Project Control chat later.'}
+            </div>
+          )}
+        </Field>
+        <Field label="Delivery flow">
+          <select value={f.flow_id} onChange={upd('flow_id')}>
+            <option value="">— none —</option>
+            {(flows ?? []).map((fl) => <option key={fl.id} value={fl.id}>{fl.name}</option>)}
+          </select>
+          {flow && (
+            <div className="muted small" style={{ marginTop: 4 }}>
+              Per task: {flow.stages.join(' → ')}.
+              {flow.design?.length ? ` Design phase: ${flow.design.map((d: any, i: number) => `${i + 1}. ${d.role}${d.approval_required ? ' 🛑' : ''}`).join(' → ')}.` : ''}
+            </div>
+          )}
         </Field>
         <Field label="Default gateway">
           <select value={f.default_gateway_id} onChange={(e) => setF({ ...f, default_gateway_id: e.target.value, default_model_id: '' })}>
@@ -139,7 +168,7 @@ function ProjectForm({ onClose, onSaved, teams, gateways }:
         const checked = ProjectSchema.safeParse(f);
         if (!checked.success) { setValidationError(checked.error.issues[0]?.message ?? 'Invalid project'); return; }
         setValidationError('');
-        try { const p = await post('/api/v1/projects', { ...checked.data, team_id: f.team_id || null, default_gateway_id: f.default_gateway_id || null, default_model_id: f.default_model_id || null }); onSaved(p.id); }
+        try { const p = await post('/api/v1/projects', { ...checked.data, team_id: f.team_id || null, default_gateway_id: f.default_gateway_id || null, default_model_id: f.default_model_id || null, flow_id: f.flow_id || null }); onSaved(p.id); }
         catch (e: any) { setValidationError(e.message || String(e)); }
       }}>Create Project</button>
     </Modal>
@@ -571,10 +600,230 @@ function GovernanceTab({ project, onError, onChanged }: any) {
   );
 }
 
+const DOC_ORDER = ['BAS', 'PDS', 'TS', 'BLUEPRINT', 'SPRINT-PLAN'];
+const DOC_BADGE: Record<string, string> = {
+  approved: 'ok', pending_approval: 'warn', draft: 'dim',
+  superseded: 'dim', rejected: 'err', revision_requested: 'err',
+};
+
+function DocsTab({ projectId }: { projectId: string }) {
+  const { data: docs, loading } = useAsyncData<any[]>(
+    () => get(`/api/v1/projects/${projectId}/documents`), [projectId]);
+  const byKind = React.useMemo(() => {
+    const m = new Map<string, any[]>();
+    for (const d of docs ?? []) {
+      const arr = m.get(d.kind) ?? [];
+      arr.push(d);
+      m.set(d.kind, arr);
+    }
+    for (const arr of m.values()) arr.sort((a, b) => a.version - b.version);
+    return m;
+  }, [docs]);
+  const kinds = React.useMemo(() => {
+    const present = [...byKind.keys()];
+    return [...DOC_ORDER.filter((k) => present.includes(k)),
+            ...present.filter((k) => !DOC_ORDER.includes(k))];
+  }, [byKind]);
+  const [selected, setSelected] = React.useState<string>('');
+  React.useEffect(() => {
+    if (kinds.length && !kinds.includes(selected)) setSelected(kinds[0]);
+  }, [kinds, selected]);
+  const { data: content, loading: contentLoading } = useAsyncData<string>(
+    () => (selected
+      ? fetch(`/api/v1/projects/${projectId}/documents/${selected}`)
+          .then(async (r) => (r.ok ? r.text() : ''))
+      : Promise.resolve('')),
+    [projectId, selected]);
+
+  if (loading) return <div className="muted">Loading documents…</div>;
+  if (!kinds.length) {
+    return (
+      <div className="empty">
+        No documents yet. Projects on a flow with the <b>docs gate</b> author the
+        BAS, PDS and TS during initiation, then the Solution Blueprint and Sprint
+        Plan. Run the initiation pipeline (or enable the docs gate) to generate them.
+      </div>
+    );
+  }
+
+  const versions = byKind.get(selected) ?? [];
+  const latest = versions[versions.length - 1];
+  return (
+    <div className="grid" style={{ gridTemplateColumns: '240px 1fr', alignItems: 'start', gap: 14 }}>
+      <div>
+        {kinds.map((k) => {
+          const arr = byKind.get(k) ?? [];
+          const last = arr[arr.length - 1];
+          return (
+            <div key={k} className="list-row"
+              style={{ cursor: 'pointer', borderColor: selected === k ? 'var(--accent)' : 'var(--border)' }}
+              onClick={() => setSelected(k)}>
+              <div className="grow">
+                <b>{k}</b> <Badge kind={DOC_BADGE[last.status] ?? 'dim'}>{last.status}</Badge>
+                <div className="kv small">{last.title}</div>
+                <div className="muted small">{arr.length} version{arr.length > 1 ? 's' : ''}</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="card">
+        {latest && (
+          <div className="spread" style={{ marginBottom: 8 }}>
+            <div>
+              <b>{latest.title}</b>
+              <div className="muted small">
+                {latest.kind} · v{latest.version} · <Badge kind={DOC_BADGE[latest.status] ?? 'dim'}>{latest.status}</Badge>
+                {' '}· updated {latest.updated_at?.slice(0, 10)}
+              </div>
+            </div>
+            {versions.length > 1 && (
+              <div className="muted small">showing latest of {versions.length}</div>
+            )}
+          </div>
+        )}
+        {contentLoading
+          ? <div className="muted">Loading…</div>
+          : content
+            ? <MarkdownText text={content} />
+            : <div className="muted small">No content available.</div>}
+        {versions.length > 1 && (
+          <div style={{ marginTop: 12 }}>
+            <b className="small">Version history</b>
+            {versions.slice().reverse().map((v) => (
+              <div key={v.id} className="kv small">
+                v{v.version} · <Badge kind={DOC_BADGE[v.status] ?? 'dim'}>{v.status}</Badge>
+                {' '}· {v.updated_at?.slice(0, 10)}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const DESIGN_STATE_BADGE: Record<string, string> = {
+  approved: 'ok', in_progress: 'info', running: 'info', awaiting_approval: 'warn',
+  in_revision: 'err', rejected: 'err', pending: 'dim', completed: 'ok',
+};
+
+function DesignTab({ projectId, onError }: { projectId: string; onError: (e: any) => void }) {
+  const { data: st, loading, reload } = useAsyncData<any>(
+    () => get(`/api/v1/projects/${projectId}/design`), [projectId]);
+  const [comments, setComments] = React.useState('');
+  const [flash, setFlash] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+
+  React.useEffect(() => {
+    if (st && st.status !== 'completed') {
+      const id = setInterval(reload, 5000);
+      return () => clearInterval(id);
+    }
+  }, [st, reload]);
+
+  async function act(decision: string) {
+    setBusy(true);
+    try {
+      const r = await post<{ message: string }>(`/api/v1/projects/${projectId}/design/decide`,
+        { decision, comments });
+      setComments('');
+      setFlash(r?.message || '');
+      reload();
+    } catch (e: any) { onError(e); }
+    finally { setBusy(false); }
+  }
+
+  if (loading) return <div className="muted">Loading design phase…</div>;
+  if (!st) {
+    return (
+      <div className="empty">
+        No design phase run yet. The design phase runs the flow's role sequence — each
+        step's role authors its documents, pausing at approval gates — before the task
+        stage chain begins.
+        {flash && <div className="small" style={{ marginTop: 8 }}>{flash}</div>}
+        <div className="btn-row" style={{ marginTop: 10 }}>
+          <button className="btn primary" disabled={busy} onClick={async () => {
+            setBusy(true);
+            try {
+              const r = await post<{ message: string }>(`/api/v1/projects/${projectId}/design/start`, {});
+              setFlash(r?.message || 'Started');
+              reload();
+            } catch (e: any) { onError(e); } finally { setBusy(false); }
+          }}>Start Design Phase</button>
+        </div>
+      </div>
+    );
+  }
+  const awaiting = st.status === 'awaiting_approval';
+  return (
+    <div>
+      {flash && <div className="card small" style={{ marginBottom: 10 }}>{flash}</div>}
+      <div className="row" style={{ marginBottom: 10 }}>
+        <Badge kind={DESIGN_STATE_BADGE[st.status] ?? 'dim'}>{st.status.replace(/_/g, ' ')}</Badge>
+        <span className="muted small">step {st.current_seq} of {st.steps.length}</span>
+        <span style={{ flex: 1 }} />
+        <button className="btn small" onClick={reload}>Refresh</button>
+      </div>
+      {st.steps.map((s: any) => (
+        <div className="card" key={s.seq} style={{ marginBottom: 8 }}>
+          <div className="spread">
+            <div className="row">
+              <b style={{ minWidth: 24 }}>{s.seq}.</b>
+              <b>{s.role}</b>
+              <Badge kind={DESIGN_STATE_BADGE[s.state] ?? 'dim'}>{(s.state || '').replace(/_/g, ' ')}</Badge>
+              {s.approval_required && <Badge kind="dim">approval required</Badge>}
+            </div>
+            <div className="row small muted">
+              {s.processes.map((p: string) => <span className="chip" key={p}>{p}</span>)}
+            </div>
+          </div>
+          {awaiting && s.seq === st.current_seq && (
+            <div style={{ marginTop: 10 }}>
+              <textarea className="input" rows={2} placeholder="Approval comments / what to fix on reject…"
+                value={comments} onChange={(e) => setComments(e.target.value)} />
+              <div className="btn-row" style={{ marginTop: 6 }}>
+                <button className="btn primary small" disabled={busy} onClick={() => act('approve')}>
+                  Approve step</button>
+                <button className="btn danger small" disabled={busy} onClick={() => act('reject')}>
+                  Reject → revision</button>
+              </div>
+            </div>
+          )}
+        </div>
+      ))}
+      <div className="card" style={{ marginTop: 10 }}>
+        <b className="small">Approval history</b>
+        {st.history.length === 0 ? <div className="muted small" style={{ marginTop: 6 }}>
+          No approvals recorded yet.</div> : (
+          <table className="table" style={{ marginTop: 8, width: '100%' }}>
+            <thead><tr><th>Step</th><th>Role</th><th>Decision</th><th>By</th>
+              <th>When</th><th>Comments</th></tr></thead>
+            <tbody>
+              {st.history.map((h: any) => (
+                <tr key={h.id}>
+                  <td>{h.seq}</td>
+                  <td>{h.role}</td>
+                  <td><Badge kind={h.decision === 'approve' ? 'ok' : 'err'}>{h.decision}</Badge></td>
+                  <td>{h.actor} <span className="muted small">({h.actor_type})</span></td>
+                  <td className="small muted">{h.created_at?.slice(0, 16).replace('T', ' ')}</td>
+                  <td className="small">{h.comments || '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function SettingsTab({ project, teams, gateways, onError, onChanged }: any) {
   const [f, setF] = React.useState({ ...project });
   const [confirmDelete, setConfirmDelete] = React.useState(false);
   React.useEffect(() => setF({ ...project }), [project]);
+  const { data: flows } = useAsyncData<any[]>(() => get('/api/v1/flows'), []);
+  const flow = (flows ?? []).find((x) => x.id === f.flow_id);
   const { data: models } = useAsyncData<any[]>(
     () => (f.default_gateway_id ? get(`/api/v1/gateways/${f.default_gateway_id}/models`) : Promise.resolve([])),
     [f.default_gateway_id]);
@@ -589,6 +838,18 @@ function SettingsTab({ project, teams, gateways, onError, onChanged }: any) {
       <div className="form-grid">
         <Field label="Repository URL"><input value={f.repository_url ?? ''} onChange={upd('repository_url')} /></Field>
         <Field label="Workspace path"><input value={f.workspace_path ?? ''} onChange={upd('workspace_path')} /></Field>
+        <Field label="Delivery flow">
+          <select value={f.flow_id ?? ''} onChange={upd('flow_id')}>
+            <option value="">— none (uses SA/BA review flags) —</option>
+            {(flows ?? []).map((fl) => <option key={fl.id} value={fl.id}>{fl.name}</option>)}
+          </select>
+          {flow && (
+            <div className="muted small" style={{ marginTop: 4 }}>
+              Per task: {flow.stages.join(' → ')}.
+              {flow.design?.length ? ` Design phase: ${flow.design.map((d: any, i: number) => `${i + 1}. ${d.role}${d.approval_required ? ' 🛑' : ''}`).join(' → ')}.` : ''}
+            </div>
+          )}
+        </Field>
         <Field label="Team">
           <select value={f.team_id ?? ''} onChange={upd('team_id')}>
             <option value="">— none —</option>
@@ -613,7 +874,7 @@ function SettingsTab({ project, teams, gateways, onError, onChanged }: any) {
       </div>
       <div className="btn-row">
         <button className="btn primary" onClick={async () => {
-          try { await patch(`/api/v1/projects/${project.id}`, { ...f, team_id: f.team_id || null, default_gateway_id: f.default_gateway_id || null, default_model_id: f.default_model_id || null }); onChanged(); }
+          try { await patch(`/api/v1/projects/${project.id}`, { ...f, team_id: f.team_id || null, flow_id: f.flow_id || null, default_gateway_id: f.default_gateway_id || null, default_model_id: f.default_model_id || null }); onChanged(); }
           catch (e: any) { onError(e); }
         }}>Save Changes</button>
         <button className="btn danger" onClick={() => setConfirmDelete(true)}>Delete Project</button>

@@ -7,7 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel
 
-from .. import governance, sprint_gate, workspace
+from .. import flows, governance, sprint_gate, workspace
 from ..db import audit, emit_event, execute, insert, new_id, now, query, query_one, run_idempotent, update
 from ..schemas import BacklogUpdate, ProjectUpdate, SprintUpdate, TaskUpdate
 from ._util import or_404 as _or_404
@@ -25,6 +25,7 @@ class ProjectIn(BaseModel):
     default_gateway_id: str | None = None
     default_model_id: str | None = None
     team_id: str | None = None
+    flow_id: str | None = None
 
 
 class BacklogIn(BaseModel):
@@ -68,6 +69,12 @@ def create_project(body: ProjectIn, idempotency_key: Optional[str] = Header(None
             (body.default_model_id, body.default_gateway_id),
         ), "Model")
 
+    flow = None
+    if body.flow_id:
+        flow = flows.get_flow(body.flow_id)
+        if not flow:
+            raise HTTPException(400, "Unknown flow_id")
+
     def _create():
         pid = new_id()
         ts = now()
@@ -77,6 +84,7 @@ def create_project(body: ProjectIn, idempotency_key: Optional[str] = Header(None
                             "default_gateway_id": body.default_gateway_id,
                             "default_model_id": body.default_model_id,
                             "team_id": body.team_id,
+                            "flow_id": body.flow_id,
                             "status": "Active", "created_at": ts, "updated_at": ts})
         project = query_one("SELECT * FROM projects WHERE id = ?", (pid,))
         ws = workspace.prepare_workspace(project)
@@ -85,9 +93,26 @@ def create_project(body: ProjectIn, idempotency_key: Optional[str] = Header(None
             "git_init": ws["git_init"], "note": ws["note"],
             "source": "git-clone" if ws["cloned"] else "local-projects-folder",
         })
+        provisioned: list = []
+        team_warnings: list = []
+        if flow:
+            if flow.get("design") and not project["governance_enabled"]:
+                update("projects", pid, {"governance_enabled": 1, "updated_at": now()})
+            if flow["po_enabled"] and not project["po_enabled"]:
+                update("projects", pid, {"po_enabled": 1, "updated_at": now()})
+            if body.team_id:
+                team_warnings = flows.team_gaps(flow, body.team_id)
+            else:
+                done = flows.provision_team(flow, project)
+                provisioned = done["created_agents"]
+                team_warnings = done["warnings"]
+                project = query_one("SELECT * FROM projects WHERE id = ?", (pid,))
         audit("create_project", "project", pid,
-              f"Created project '{body.name}' with workspace at {ws['workspace_path']}")
-        return {**project, "workspace_path": ws["workspace_path"], "_seq": _seq}
+              f"Created project '{body.name}' with workspace at {ws['workspace_path']}"
+              + (f" on flow '{flow['name']}'" if flow else ""))
+        return {**project, "workspace_path": ws["workspace_path"], "_seq": _seq,
+                "flow": flow, "provisioned_agents": provisioned,
+                "team_warnings": team_warnings}
 
     return run_idempotent(idempotency_key, "POST /projects", _create)
 
@@ -104,9 +129,11 @@ def update_project(pid: str, body: ProjectUpdate):
     allowed = {k: v for k, v in data.items() if k in ("name", "goal", "description", "technology_stack",
                                                       "repository_url", "workspace_path",
                                                       "default_gateway_id", "default_model_id",
-                                                      "team_id", "status", "po_enabled",
+                                                      "team_id", "status", "flow_id", "po_enabled",
                                                       "sa_review_enabled", "ba_review_enabled",
                                                       "governance_enabled", "budget_usd")}
+    if allowed.get("flow_id"):
+        _or_404(query_one("SELECT id FROM project_flows WHERE id=?", (allowed["flow_id"],)), "Flow")
     if "budget_usd" in allowed:
         try:
             allowed["budget_usd"] = max(0.0, float(allowed["budget_usd"] or 0))

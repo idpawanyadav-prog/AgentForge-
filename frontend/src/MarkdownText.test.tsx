@@ -18,4 +18,12 @@ describe('safe markdown rendering', () => {
     expect(container.querySelector('script')).toBeNull();
     expect(container.querySelector('li')?.textContent).toContain('<script>');
   });
+
+  it('turns relative document links into same-origin anchors', () => {
+    const { container } = render(
+      <MarkdownText text={'- **BAS**: [read BAS](/api/v1/projects/p1/documents/BAS)'} />);
+    const anchor = container.querySelector('a');
+    expect(anchor?.getAttribute('href')).toBe(`${window.location.origin}/api/v1/projects/p1/documents/BAS`);
+    expect(anchor?.getAttribute('rel')).toContain('noopener');
+  });
 });

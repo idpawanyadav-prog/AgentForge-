@@ -9,13 +9,14 @@ import { useAppStore } from './store';
 const ControlPage = React.lazy(() => import('./pages/ControlPage'));
 const ProjectsPage = React.lazy(() => import('./pages/ProjectsPage'));
 const ProjectFlowPage = React.lazy(() => import('./pages/ProjectFlowPage'));
+const FlowSetupPage = React.lazy(() => import('./pages/FlowSetupPage'));
 const TeamsPage = React.lazy(() => import('./pages/TeamsPage'));
 const PlaygroundPage = React.lazy(() => import('./pages/PlaygroundPage'));
 const ModelsPage = React.lazy(() => import('./pages/ModelsPage'));
 const MemoryPage = React.lazy(() => import('./pages/MemoryPage'));
 const SettingsPage = React.lazy(() => import('./pages/SettingsPage'));
 
-type Page = 'control' | 'flow' | 'projects' | 'teams' | 'playground' | 'models' | 'memory' | 'settings';
+type Page = 'control' | 'flow' | 'flowsetup' | 'projects' | 'teams' | 'playground' | 'models' | 'memory' | 'settings';
 
 const loadUi = (key: string, fallback: string) => {
   try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
@@ -27,6 +28,7 @@ const saveUi = (key: string, value: string) => {
 const NAV: { id: Page; icon: string; label: string }[] = [
   { id: 'control', icon: '◉', label: 'Project Control' },
   { id: 'flow', icon: '⇄', label: 'Project Flow' },
+  { id: 'flowsetup', icon: '⌗', label: 'Flow Setup' },
   { id: 'projects', icon: '▤', label: 'Projects' },
   { id: 'teams', icon: '⧉', label: 'Teams' },
   { id: 'playground', icon: '⚗', label: 'Playground' },
@@ -153,6 +155,7 @@ function AppShell() {
             <Route path="/" element={<Navigate to={`/${loadUi('ao.page', 'control')}`} replace />} />
             <Route path="/control" element={<ControlPage activeProject={activeProject} setActiveProject={setActiveProject} />} />
             <Route path="/flow" element={<ProjectFlowPage activeProject={activeProject} setActiveProject={setActiveProject} />} />
+            <Route path="/flowsetup" element={<FlowSetupPage />} />
             <Route path="/projects" element={<ProjectsPage activeProject={activeProject} setActiveProject={setActiveProject} onOpenControl={() => navigate('/control')} />} />
             <Route path="/teams" element={<TeamsPage />} />
             <Route path="/playground" element={<PlaygroundPage />} />

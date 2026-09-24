@@ -40,11 +40,12 @@ const TASK_ICON: Record<string, string> = {
   'Done': '✅', 'In Progress': '🔄', 'Review': '🔍', 'Testing': '🧪',
   'Ready': '🟡', 'Todo': '⏳', 'Blocked': '⛔', 'Cancelled': '✖️',
   'Waiting QA': '🧫', 'Rework': '🔁', 'SA Review': '🏛️', 'BA Review': '📋',
+  'Pending Approval': '🛑',
 };
 const taskIcon = (s: string) => TASK_ICON[s] ?? '⏳';
 
 const TASK_STATUSES = ['Todo', 'Ready', 'In Progress', 'Testing', 'Review',
-  'SA Review', 'BA Review', 'Waiting QA', 'Rework', 'Blocked', 'Done', 'Cancelled'];
+  'SA Review', 'BA Review', 'Waiting QA', 'Pending Approval', 'Rework', 'Blocked', 'Done', 'Cancelled'];
 
 const loadUi = (key: string, fallback: string) => {
   try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }

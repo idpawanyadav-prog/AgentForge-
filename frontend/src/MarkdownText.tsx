@@ -9,7 +9,10 @@ function inline(text: string): React.ReactNode[] {
     const link = /^\[([^\]]+)\]\(([^\s)]+)\)$/.exec(part);
     if (link) {
       try {
-        const url = new URL(link[2]);
+        // Relative app links (e.g. chat document links like
+        // /api/v1/projects/<id>/documents/BAS) resolve against the origin so
+        // the browser navigates within the SPA; absolute http(s) stay as-is.
+        const url = new URL(link[2], window.location.origin);
         if (url.protocol === 'https:' || url.protocol === 'http:')
           return <a key={index} href={url.href} target="_blank" rel="noopener noreferrer">{link[1]}</a>;
       } catch { /* show invalid links as inert text */ }

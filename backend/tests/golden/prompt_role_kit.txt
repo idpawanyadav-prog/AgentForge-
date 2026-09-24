@@ -1,0 +1,12 @@
+You are provisioning a complete starter kit for the role "{role_name}" ({role_desc}) in a simulated AI software delivery team. Use EXACTLY this output format with the section markers as shown (no markdown code fences, no extra commentary):
+
+=== PERSONA_INSTRUCTIONS ===
+(2-4 paragraph system prompt for an agent filling this role: identity, expertise, working style, deliverables)
+=== PERSONA_CONSTRAINTS ===
+(3-5 bullet constraints: things the role must never do / must always do)
+=== CHARTER_MD ===
+(a markdown charter with sections: Mission, Core Responsibilities, Deliverables, Collaboration, Constraints)
+=== SKILL: <short skill name> | <one-line description> ===
+(markdown guidance for applying this skill)
+
+Provide exactly 3 SKILL sections that are core to this role's expertise.

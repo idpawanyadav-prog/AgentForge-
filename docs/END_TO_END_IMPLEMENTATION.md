@@ -495,13 +495,13 @@ All routes are mounted under `/api/v1`.
 | `test_review_chain.py` | SA/BA review gate flow |
 | `test_model_resolution.py` | Failover chain, model selection |
 | `test_task_registry.py` | Background task lifecycle |
-| `test_lifecycle_fixes.py` | Governance V3 lifecycle |
+| `test_run_lifecycle_recovery.py` | Orphan recovery, atomic claim, merge-back |
 | `test_governance_step1.py` | Governance step 1 enforcement |
-| `test_critical_fixes.py` | Critical regression tests |
-| `test_process_improvements.py` | Scheduler, event archiving, quarantine |
+| `test_delete_and_outage_integrity.py` | FK deletes, outage classification, health API |
+| `test_pitfalls_and_review_context.py` | Pitfall ledger, reviewer context, QA honesty |
 | `test_codegen_happy_path.py` | Code generation happy path |
 | `test_async_chat.py` | Async chatbot routing |
-| `test_issue_plan_fixes.py` | Issue plan validation |
+| `test_codegen_resource_bounds.py` | Codegen correctness and size bounds |
 | `test_local_project_boundaries.py` | Project data isolation |
 
 ### 9.2 Frontend (Vitest)

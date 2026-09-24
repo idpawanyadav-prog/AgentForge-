@@ -102,8 +102,12 @@ def may_execute(project_id: str) -> tuple[bool, str]:
     state = current_state(project_id)
     if state in DEV_PERMITTED:
         return True, ""
-    return False, (f"Project lifecycle state is '{state}' — development may run "
-                   f"in {sorted(DEV_PERMITTED)} only (governance is enabled).")
+    reason = (f"Project lifecycle state is '{state}' — development may run "
+              f"in {sorted(DEV_PERMITTED)} only (governance is enabled).")
+    if state in (DRAFT, REQ_ANALYSIS, CHANGE_REQUESTED):
+        reason += (" Say `analyze project` in the control chat to have the BA draft "
+                   "BAS/PDS and the SA draft TS, then approve the documents.")
+    return False, reason
 
 
 def transition_project(project_id: str, to_state: str, reason: str = "",
@@ -252,6 +256,33 @@ def _propose_baseline_locked(project_id: str, kind: str, actor: str) -> dict:
     return {"baseline": query_one("SELECT * FROM project_baselines WHERE id = ?", (bid,))}
 
 
+def record_approved_baseline(project_id: str, kind: str = "architecture",
+                             approved_by: str = "system") -> dict:
+    """Freeze the current scope as AB-n.0/RB-n.0 already APPROVED — used by
+    the single-gate spec pipeline where the requirement-baseline approval
+    also covers the derived architecture blueprint (no second gate)."""
+    project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not project or kind not in KIND_PREFIX:
+        return {"error": "Unknown project or baseline kind"}
+    count = query_one("SELECT COUNT(*) AS n FROM project_baselines "
+                      "WHERE project_id = ? AND kind = ?", (project_id, kind))["n"]
+    code = f"{KIND_PREFIX[kind]}-{count + 1}.0"
+    ts = now()
+    bid = new_id()
+    insert("project_baselines", {
+        "id": bid, "project_id": project_id, "kind": kind, "code": code,
+        "content_json": json.dumps(_baseline_snapshot(project, kind)),
+        "status": "approved", "approved_by": approved_by, "approved_at": ts,
+        "created_at": ts, "updated_at": ts})
+    emit_event(project_id, "baseline.approved",
+               {"baseline_id": bid, "code": code, "kind": kind, "auto": True,
+                "decided_by": approved_by})
+    audit("baseline_auto_approved", "project", project_id,
+          f"Baseline {code} ({kind}) recorded — covered by the requirement-baseline "
+          f"approval ({approved_by})", actor="agent")
+    return query_one("SELECT * FROM project_baselines WHERE id = ?", (bid,))
+
+
 def decide_baseline(project_id: str, baseline_id: str, decision: str,
                     notes: str = "", actor: str = "user") -> dict:
     """Approve / reject / request revision on a pending baseline.
@@ -276,6 +307,14 @@ def decide_baseline(project_id: str, baseline_id: str, decision: str,
                    {"baseline_id": baseline_id, "code": b["code"], "decided_by": actor})
         audit("baseline_approved", "project", project_id,
               f"Baseline {b['code']} approved by {actor}", actor=actor)
+        if ok and b["kind"] == "requirement":
+            # Single-gate spec pipeline (V3 Step 2): an approved requirement
+            # baseline unlocks blueprint authoring + sprint breakdown.
+            try:
+                from . import specs
+                specs.on_requirements_approved(project_id)
+            except Exception:
+                pass
         return {"ok": ok, "error": err, "state": current_state(project_id)}
     new_status = "rejected" if decision == "reject" else "revision_requested"
     execute("UPDATE project_baselines SET status = ?, approved_by = ?, updated_at = ? "

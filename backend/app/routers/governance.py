@@ -1,8 +1,10 @@
 """V3 Step 1 governance routes — lifecycle, requirements, baselines,
-change requests (spec §4/§10/§11; AF3-001/005/007)."""
+change requests (spec §4/§10/§11; AF3-001/005/007) — plus V3 Step 2 spec
+pipeline documents (BAS/PDS/TS/BLUEPRINT/SPRINT-PLAN) for chat links."""
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from .. import governance
@@ -91,6 +93,25 @@ def baseline_decision(pid: str, bid: str, body: DecisionIn):
     return {"state": result["state"]}
 
 
+@router.get("/projects/{pid}/documents")
+def list_documents(pid: str):
+    _project_or_404(pid)
+    from .. import specs
+    return [{"kind": d["kind"], "title": d["title"], "version": d["version"],
+             "status": d["status"], "updated_at": d["updated_at"]}
+            for d in specs.docs(pid)]
+
+
+@router.get("/projects/{pid}/documents/{kind}", response_class=PlainTextResponse)
+def get_document(pid: str, kind: str):
+    _project_or_404(pid)
+    from .. import specs
+    doc = specs.latest_doc(pid, kind)
+    if not doc:
+        raise HTTPException(404, f"No {kind.upper()} document for this project yet")
+    return doc["content_md"]
+
+
 @router.get("/projects/{pid}/change_requests")
 def change_requests(pid: str):
     _project_or_404(pid)
@@ -105,3 +126,38 @@ def change_request_decision(pid: str, cid: str, body: CRDecisionIn):
     if result.get("error"):
         raise HTTPException(409, result["error"])
     return {"state": result["state"]}
+
+
+# ------------------------------------------------------------------ design phase
+
+class DesignDecisionIn(BaseModel):
+    decision: str
+    comments: str = ""
+
+
+@router.get("/projects/{pid}/design")
+def design_state(pid: str):
+    _project_or_404(pid)
+    from .. import design
+    return design.state(pid)
+
+
+@router.post("/projects/{pid}/design/start")
+def design_start(pid: str):
+    _project_or_404(pid)
+    from .. import design, flows
+    from ..db import query_one
+    project = query_one("SELECT * FROM projects WHERE id = ?", (pid,))
+    flow = flows.flow_for_project(project)
+    return {"message": design.start_run(pid, flow)}
+
+
+@router.post("/projects/{pid}/design/decide")
+def design_decide(pid: str, body: DesignDecisionIn):
+    _project_or_404(pid)
+    from .. import design
+    if body.decision == "approve":
+        return {"message": design.approve_design(pid)}
+    if body.decision == "reject":
+        return {"message": design.reject_design(pid, body.comments)}
+    raise HTTPException(400, "decision must be approve | reject")

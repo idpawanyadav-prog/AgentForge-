@@ -58,6 +58,56 @@ def test_golden_base_python_system():
     _check("system_base_python.txt", codegen._system_for("python"))
 
 
+@pytest.mark.parametrize("stack", ["dotnet", "go", "node"])
+def test_golden_base_system_per_stack(stack):
+    _check(f"system_base_{stack}.txt", codegen._system_for(stack))
+
+
+def test_golden_junior_dev_system():
+    # The Junior Developer has its own codegen system prompt (reusable-helper
+    # specialty), so its exact text is pinned like the stack bases.
+    _check("system_jr_dev.txt", codegen._JR_DEV_SYSTEM)
+
+
+@pytest.mark.parametrize("mode", ["sa", "ba"])
+def test_golden_review_gate_systems(mode):
+    _check(f"system_review_{mode}.txt", codegen._REVIEW_SYSTEM[mode])
+
+
+def test_golden_task_plan_system():
+    # The Product Owner's sprint-planning prompt is the last in-code role
+    # prompt that shapes agent behavior and deserves a pin.
+    from app import runtime
+    _check("system_task_plan.txt", runtime._TASK_PLAN_SYSTEM)
+
+
+def test_golden_approval_system():
+    _check("system_approval.txt", codegen._APPROVE_SYSTEM)
+
+
+def test_golden_role_kit_prompt():
+    from app import chatbot
+    _check("prompt_role_kit.txt", chatbot._ROLE_KIT_PROMPT)
+
+
+@pytest.mark.parametrize("kind", ["BAS", "PDS", "TS"])
+def test_golden_spec_doc_systems(kind):
+    # The un-voiced (no persona) BA/SA document systems — the exact sections
+    # each initiation document must contain.
+    from app import specs
+    title, role, sections = specs.DOC_SPECS[kind]
+    _check(f"system_spec_{kind}.txt",
+           specs._DOC_SYSTEM.format(kind=kind, title=title, role=role,
+                                    sections=sections, voice=""))
+
+
+def test_golden_blueprint_and_breakdown_systems():
+    from app import specs
+    _check("system_blueprint.txt", specs.BLUEPRINT_SYSTEM)
+    _check("system_sprint_plan.txt", specs.SPRINT_PLAN_SYSTEM)
+    _check("system_po_doc_review.txt", specs.PO_DOC_REVIEW_SYSTEM)
+
+
 def test_golden_full_composed_system():
     persona = _seed_prompt_source()
     prompt = codegen.build_system_prompt("python", persona, "r1")

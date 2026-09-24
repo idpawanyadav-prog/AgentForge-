@@ -51,6 +51,7 @@ function stageOfStatus(status: string): Stage | null {
     case 'SA Review': return 'sa';
     case 'BA Review': return 'ba';
     case 'Waiting QA': case 'Testing': case 'Review': return 'qa';
+    case 'Pending Approval': return 'done';
     case 'Done': return 'done';
     case 'Rework': return 'dev';
     default: return null;
