@@ -11,8 +11,17 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     sourcemap: true, // separate .map files for production builds
-  },
-  esbuild: {
-    sourcemap: 'inline', // inline source maps for dev builds
+    rollupOptions: {
+      output: {
+        // Rolldown (Vite 8) requires the function form of manualChunks.
+        manualChunks(id: string) {
+          if (!id.includes('node_modules')) return;
+          if (/[\\/]node_modules[\\/](react|react-dom|react-router|react-router-dom|scheduler)[\\/]/.test(id)) {
+            return 'react';
+          }
+          return 'vendor';
+        },
+      },
+    },
   },
 });

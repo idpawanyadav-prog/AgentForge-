@@ -1,15 +1,21 @@
 import React from 'react';
+import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { get, put } from './api';
 import { isApiReachable, DisconnectedBanner } from './offline';
-import ControlPage from './pages/ControlPage';
-import ProjectsPage from './pages/ProjectsPage';
-import ProjectFlowPage from './pages/ProjectFlowPage';
-import TeamsPage from './pages/TeamsPage';
-import ModelsPage from './pages/ModelsPage';
-import MemoryPage from './pages/MemoryPage';
-import SettingsPage from './pages/SettingsPage';
+import { useAppStore } from './store';
 
-type Page = 'control' | 'flow' | 'projects' | 'teams' | 'models' | 'memory' | 'settings';
+// Route-level code splitting: each page ships as its own lazy chunk so the
+// initial download only includes the shell + the page being opened.
+const ControlPage = React.lazy(() => import('./pages/ControlPage'));
+const ProjectsPage = React.lazy(() => import('./pages/ProjectsPage'));
+const ProjectFlowPage = React.lazy(() => import('./pages/ProjectFlowPage'));
+const TeamsPage = React.lazy(() => import('./pages/TeamsPage'));
+const PlaygroundPage = React.lazy(() => import('./pages/PlaygroundPage'));
+const ModelsPage = React.lazy(() => import('./pages/ModelsPage'));
+const MemoryPage = React.lazy(() => import('./pages/MemoryPage'));
+const SettingsPage = React.lazy(() => import('./pages/SettingsPage'));
+
+type Page = 'control' | 'flow' | 'projects' | 'teams' | 'playground' | 'models' | 'memory' | 'settings';
 
 const loadUi = (key: string, fallback: string) => {
   try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
@@ -23,22 +29,26 @@ const NAV: { id: Page; icon: string; label: string }[] = [
   { id: 'flow', icon: '⇄', label: 'Project Flow' },
   { id: 'projects', icon: '▤', label: 'Projects' },
   { id: 'teams', icon: '⧉', label: 'Teams' },
+  { id: 'playground', icon: '⚗', label: 'Playground' },
   { id: 'models', icon: '◈', label: 'Models' },
   { id: 'memory', icon: '✦', label: 'Agent Memory' },
   { id: 'settings', icon: '⚙', label: 'Settings' },
 ];
 
 export default function App() {
-  const [page, setPage] = React.useState<Page>(() => {
-    const saved = loadUi('ao.page', 'control');
-    return (NAV.some((n) => n.id === saved) ? saved : 'control') as Page;
-  });
-  const [theme, setTheme] = React.useState<'dark' | 'bright'>(() => {
-    const saved = loadUi('ao.theme', 'dark');
-    return saved === 'bright' ? 'bright' : 'dark';
-  });
-  const [activeProject, setActiveProject] = React.useState<string | null>(() => loadUi('ao.project', '') || null);
-  const [collapsed, setCollapsed] = React.useState<boolean>(() => loadUi('ao.sidebar', '') === 'collapsed');
+  return <BrowserRouter><AppShell /></BrowserRouter>;
+}
+
+function AppShell() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const page = location.pathname.slice(1) as Page;
+  const theme = useAppStore((s) => s.theme);
+  const setTheme = useAppStore((s) => s.setTheme);
+  const activeProject = useAppStore((s) => s.activeProject);
+  const setActiveProject = useAppStore((s) => s.setActiveProject);
+  const collapsed = useAppStore((s) => s.collapsed);
+  const setCollapsed = useAppStore((s) => s.setCollapsed);
   const [online, setOnline] = React.useState(true);
 
   const probeApi = React.useCallback(() => {
@@ -75,7 +85,9 @@ export default function App() {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
 
-  React.useEffect(() => { saveUi('ao.page', page); }, [page]);
+  React.useEffect(() => {
+    if (NAV.some((n) => n.id === page)) saveUi('ao.page', page);
+  }, [page]);
   React.useEffect(() => { saveUi('ao.sidebar', collapsed ? 'collapsed' : 'open'); }, [collapsed]);
   React.useEffect(() => { if (activeProject) saveUi('ao.project', activeProject); }, [activeProject]);
 
@@ -103,7 +115,7 @@ export default function App() {
           <button
             key={n.id}
             className={`nav-item ${page === n.id ? 'active' : ''}`}
-            onClick={() => setPage(n.id)}
+            onClick={() => navigate(`/${n.id}`)}
             title={n.label}
           >
             <span className="nav-icon">{n.icon}</span>
@@ -136,19 +148,20 @@ export default function App() {
       </aside>
       <main className="main">
         {!online && <DisconnectedBanner onRetry={probeApi} />}
-        {page === 'control' && (
-          <ControlPage activeProject={activeProject} setActiveProject={setActiveProject} />
-        )}
-        {page === 'flow' && (
-          <ProjectFlowPage activeProject={activeProject} setActiveProject={setActiveProject} />
-        )}
-        {page === 'projects' && (
-          <ProjectsPage activeProject={activeProject} setActiveProject={setActiveProject} onOpenControl={() => setPage('control')} />
-        )}
-        {page === 'teams' && <TeamsPage />}
-        {page === 'models' && <ModelsPage />}
-        {page === 'memory' && <MemoryPage />}
-        {page === 'settings' && <SettingsPage />}
+        <React.Suspense fallback={<div className="empty" style={{ padding: 24 }}>Loading…</div>}>
+          <Routes>
+            <Route path="/" element={<Navigate to={`/${loadUi('ao.page', 'control')}`} replace />} />
+            <Route path="/control" element={<ControlPage activeProject={activeProject} setActiveProject={setActiveProject} />} />
+            <Route path="/flow" element={<ProjectFlowPage activeProject={activeProject} setActiveProject={setActiveProject} />} />
+            <Route path="/projects" element={<ProjectsPage activeProject={activeProject} setActiveProject={setActiveProject} onOpenControl={() => navigate('/control')} />} />
+            <Route path="/teams" element={<TeamsPage />} />
+            <Route path="/playground" element={<PlaygroundPage />} />
+            <Route path="/models" element={<ModelsPage />} />
+            <Route path="/memory" element={<MemoryPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
+            <Route path="*" element={<Navigate to="/control" replace />} />
+          </Routes>
+        </React.Suspense>
       </main>
     </div>
   );

@@ -5,23 +5,15 @@ Verdict-priority unit tests run against a throwaway SQLite DB
 Two integration tests boot a real app + headless Chromium and are
 skipped automatically when Playwright/Chromium is unavailable.
 
-Run: "%USERPROFILE%\\.verdent\\agentforge-venv\\Scripts\\python.exe" -m pytest backend/tests/test_browser_smoke.py -q
+Run: python -m pytest backend/tests/test_browser_smoke.py -q
 """
 import asyncio
 import os
-import sys
-import tempfile
-
-_DB = os.path.join(tempfile.mkdtemp(prefix="af_browsetest_"), "test.db")
-os.environ["AGENT_OFFICE_DB"] = _DB
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest  # noqa: E402
 
 from app import db as appdb  # noqa: E402
 from app import browser_test, runtime  # noqa: E402
-
-appdb.init_db()
 
 PID = "proj-br-1"
 TID = "team-br-1"

@@ -5,15 +5,11 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from ..db import audit, checksum, execute, insert, new_id, now, query, query_one, update
+from ..prompt_lint import lint_prompt
 from ..schemas import InstructionUpdate, PersonaUpdate, RoleUpdate, SkillUpdate
+from ._util import or_404 as _or_404
 
 router = APIRouter(prefix="/api/v1", tags=["roles"])
-
-
-def _or_404(row, what="Resource"):
-    if row is None:
-        raise HTTPException(404, f"{what} not found")
-    return row
 
 
 class RoleIn(BaseModel):
@@ -76,8 +72,19 @@ def create_instruction(rid: str, body: InstructionIn):
     insert("instruction_files", {"id": iid, "role_id": rid, "filename": filename,
                                  "description": body.description, "content": body.content,
                                  "version": 1, "created_at": ts, "updated_at": ts})
+    _snapshot_instruction_version(iid, 1, filename, body.content, ts)
     audit("create_instruction", "instruction_file", iid, f"Created instruction '{filename}'")
-    return query_one("SELECT * FROM instruction_files WHERE id = ?", (iid,))
+    row = query_one("SELECT * FROM instruction_files WHERE id = ?", (iid,))
+    row["lint_warnings"] = lint_prompt(body.content)
+    return row
+
+
+def _snapshot_instruction_version(iid: str, version: int, filename: str,
+                                  content: str, ts: str):
+    insert("instruction_file_versions", {
+        "id": new_id(), "instruction_file_id": iid, "version": version,
+        "filename": filename, "content": content,
+        "checksum": checksum(content), "created_at": ts})
 
 
 @router.patch("/instructions/{iid}")
@@ -85,8 +92,13 @@ def update_instruction(iid: str, body: InstructionUpdate):
     instr = _or_404(query_one("SELECT * FROM instruction_files WHERE id=?", (iid,)), "Instruction")
     data = body.model_dump(exclude_unset=True)
     allowed = {k: v for k, v in data.items() if k in ("filename", "description", "content")}
+    warnings: list[str] = []
     if "content" in allowed and allowed["content"] != instr["content"]:
         allowed["version"] = instr["version"] + 1
+        _snapshot_instruction_version(iid, allowed["version"],
+                                      allowed.get("filename", instr["filename"]),
+                                      allowed["content"], now())
+        warnings = lint_prompt(allowed["content"])
     if "active" in data:
         allowed["active"] = 1 if data["active"] in (True, 1, "1", "on") else 0
         if allowed["active"] == 0:
@@ -97,11 +109,49 @@ def update_instruction(iid: str, body: InstructionUpdate):
                   f"Enabled instruction '{instr['filename']}'")
     allowed["updated_at"] = now()
     update("instruction_files", iid, allowed)
-    return query_one("SELECT * FROM instruction_files WHERE id = ?", (iid,))
+    row = query_one("SELECT * FROM instruction_files WHERE id = ?", (iid,))
+    row["lint_warnings"] = warnings
+    return row
+
+
+@router.get("/instructions/{iid}/versions")
+def list_instruction_versions(iid: str):
+    _or_404(query_one("SELECT id FROM instruction_files WHERE id=?", (iid,)), "Instruction")
+    return query("SELECT id, version, filename, checksum, created_at, "
+                 "LENGTH(content) AS content_chars FROM instruction_file_versions "
+                 "WHERE instruction_file_id=? ORDER BY version DESC", (iid,))
+
+
+@router.post("/instructions/{iid}/restore")
+def restore_instruction_version(iid: str, body: dict):
+    """Roll an instruction file back to an earlier version (or to the
+    seeded baseline with {"version": 1}). The restore itself becomes a new
+    version so history is append-only."""
+    instr = _or_404(query_one("SELECT * FROM instruction_files WHERE id=?", (iid,)), "Instruction")
+    try:
+        version = int(body.get("version"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Provide {\"version\": <int>}")
+    snap = query_one("SELECT * FROM instruction_file_versions "
+                     "WHERE instruction_file_id=? AND version=?", (iid, version))
+    if not snap:
+        raise HTTPException(404, f"No stored version {version} for this instruction")
+    if snap["content"] == instr["content"]:
+        return {**instr, "restored": False, "note": f"Already at version {version} content"}
+    new_v = instr["version"] + 1
+    ts = now()
+    update("instruction_files", iid, {"content": snap["content"], "version": new_v,
+                                      "updated_at": ts})
+    _snapshot_instruction_version(iid, new_v, instr["filename"], snap["content"], ts)
+    audit("restore_instruction", "instruction_file", iid,
+          f"Restored to version {version} (now v{new_v})")
+    row = query_one("SELECT * FROM instruction_files WHERE id = ?", (iid,))
+    return {**row, "restored": True, "restored_from": version}
 
 
 @router.delete("/instructions/{iid}")
 def delete_instruction(iid: str):
+    execute("DELETE FROM instruction_file_versions WHERE instruction_file_id=?", (iid,))
     execute("DELETE FROM instruction_files WHERE id=?", (iid,))
     return {"ok": True}
 
@@ -201,7 +251,9 @@ def create_persona(role_id: str, body: PersonaIn):
                                 "constraints_text": body.constraints_text,
                                 "checksum": checksum(body.instructions), "created_at": ts})
     audit("create_persona", "persona", pid, f"Created persona '{body.name}'")
-    return query_one("SELECT * FROM personas WHERE id = ?", (pid,))
+    row = query_one("SELECT * FROM personas WHERE id = ?", (pid,))
+    row["lint_warnings"] = lint_prompt(body.instructions) + lint_prompt(body.constraints_text)
+    return row
 
 
 @router.patch("/personas/{pid}")
@@ -221,7 +273,48 @@ def update_persona(pid: str, body: PersonaUpdate):
         audit("version_persona", "persona", pid, f"Persona versioned to v{new_version}")
     allowed["updated_at"] = now()
     update("personas", pid, allowed)
-    return query_one("SELECT * FROM personas WHERE id = ?", (pid,))
+    row = query_one("SELECT * FROM personas WHERE id = ?", (pid,))
+    row["lint_warnings"] = (lint_prompt(allowed.get("instructions", ""))
+                            + lint_prompt(allowed.get("constraints_text", "")))
+    return row
+
+
+@router.get("/personas/{pid}/versions")
+def list_persona_versions(pid: str):
+    _or_404(query_one("SELECT id FROM personas WHERE id=?", (pid,)), "Persona")
+    return query("SELECT id, version, checksum, created_at, "
+                 "LENGTH(instructions) AS instructions_chars FROM persona_versions "
+                 "WHERE persona_id=? ORDER BY version DESC", (pid,))
+
+
+@router.post("/personas/{pid}/restore")
+def restore_persona_version(pid: str, body: dict):
+    """Restore a persona to a stored earlier version (v1 = seeded baseline).
+    Append-only: the restore itself is recorded as a new version."""
+    persona = _or_404(query_one("SELECT * FROM personas WHERE id=?", (pid,)), "Persona")
+    try:
+        version = int(body.get("version"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Provide {\"version\": <int>}")
+    snap = query_one("SELECT * FROM persona_versions WHERE persona_id=? AND version=?",
+                     (pid, version))
+    if not snap:
+        raise HTTPException(404, f"No stored version {version} for this persona")
+    if snap["instructions"] == persona["instructions"] and \
+            snap["constraints_text"] == persona["constraints_text"]:
+        return {**persona, "restored": False, "note": f"Already at version {version} content"}
+    new_v = persona["version"] + 1
+    ts = now()
+    insert("persona_versions", {
+        "id": new_id(), "persona_id": pid, "version": new_v,
+        "instructions": snap["instructions"], "constraints_text": snap["constraints_text"],
+        "checksum": checksum(snap["instructions"]), "created_at": ts})
+    update("personas", pid, {"instructions": snap["instructions"],
+                             "constraints_text": snap["constraints_text"],
+                             "version": new_v, "updated_at": ts})
+    audit("restore_persona", "persona", pid, f"Restored to version {version} (now v{new_v})")
+    row = query_one("SELECT * FROM personas WHERE id = ?", (pid,))
+    return {**row, "restored": True, "restored_from": version}
 
 
 @router.delete("/personas/{pid}")
@@ -292,6 +385,7 @@ def update_skill(sid: str, body: SkillUpdate):
 @router.delete("/skills/{sid}")
 def delete_skill(sid: str):
     execute("DELETE FROM persona_skills WHERE skill_id=?", (sid,))
+    execute("DELETE FROM role_skills WHERE skill_id=?", (sid,))
     execute("DELETE FROM skills WHERE id=?", (sid,))
     return {"ok": True}
 
@@ -320,5 +414,7 @@ def create_binding(body: BindingIn):
 
 @router.delete("/model-bindings/{bid}")
 def delete_binding(bid: str):
+    if query_one("SELECT id FROM agents WHERE model_binding_id=? LIMIT 1", (bid,)):
+        raise HTTPException(409, "Model is assigned to an agent — reassign the agent first")
     execute("DELETE FROM model_bindings WHERE id=?", (bid,))
     return {"ok": True}

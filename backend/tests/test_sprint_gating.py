@@ -4,22 +4,12 @@ Runs against a throwaway SQLite DB (AGENT_OFFICE_DB env var) — never the
 live database. Toolchain/LLM calls are monkeypatched so gates are tested
 in isolation.
 
-Run: "%USERPROFILE%\\.verdent\\agentforge-venv\\Scripts\\python.exe" -m pytest backend/tests/test_sprint_gating.py -q
+Run: python -m pytest backend/tests/test_sprint_gating.py -q
 """
-import os
-import sys
-import tempfile
-
-_DB = os.path.join(tempfile.mkdtemp(prefix="af_gate_"), "test.db")
-os.environ["AGENT_OFFICE_DB"] = _DB
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 import pytest  # noqa: E402
 
 from app import db as appdb  # noqa: E402
 from app import sprint_gate  # noqa: E402
-
-appdb.init_db()
 
 PID = "proj-test-1"
 

@@ -1,0 +1,17 @@
+{
+  "name": "Unit test suite",
+  "about": "Write pytest coverage for an existing module, including edge cases.",
+  "title": "Write unit tests for {module}",
+  "description": "Add pytest coverage for {module}.\nCover the happy path, error paths and at least two edge cases.\nUse fixtures, not module-level mutable state.",
+  "acceptance_criteria": "Given the current implementation of {module}\nWhen pytest runs tests/test_{module}.py\nThen all tests pass\nAnd every public function has at least one test\nAnd failure modes (exceptions, empty input) are covered",
+  "story_points": 2,
+  "priority": 2,
+  "suggested_role": "QA Engineer",
+  "variables": [
+    {
+      "name": "module",
+      "label": "Module name",
+      "example": "governance"
+    }
+  ]
+}

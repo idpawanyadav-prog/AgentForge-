@@ -2,6 +2,7 @@ import React from 'react';
 import { get, getPage, post, patch, del, Page } from '../api';
 import { Badge, Field, Modal, useAsyncData, ErrorNote, Pagination } from '../components';
 import { TASK_STATE_CLASS } from '../api';
+import { BacklogSchema, ProjectSchema, SprintSchema, TaskSchema } from '../validation';
 
 export default function ProjectsPage({ activeProject, setActiveProject, onOpenControl }:
   { activeProject: string | null; setActiveProject: (id: string) => void; onOpenControl: () => void }) {
@@ -12,7 +13,7 @@ export default function ProjectsPage({ activeProject, setActiveProject, onOpenCo
   const { data: teams } = useAsyncData<any[]>(() => get('/api/v1/teams'), []);
   const { data: gateways } = useAsyncData<any[]>(() => get('/api/v1/gateways'), []);
   const [selected, setSelected] = React.useState<string | null>(activeProject);
-  const [tab, setTab] = React.useState<'backlog' | 'sprints' | 'tasks' | 'settings'>('tasks');
+  const [tab, setTab] = React.useState<'backlog' | 'governance' | 'sprints' | 'tasks' | 'settings'>('tasks');
   const [modal, setModal] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
@@ -68,7 +69,7 @@ export default function ProjectsPage({ activeProject, setActiveProject, onOpenCo
               </div>
             </div>
             <div className="row" style={{ marginTop: 10 }}>
-              {(['tasks', 'backlog', 'sprints', 'settings'] as const).map((t) => (
+              {(['tasks', 'backlog', 'sprints', 'governance', 'settings'] as const).map((t) => (
                 <button key={t} className={`btn small ${tab === t ? 'primary' : ''}`}
                   onClick={() => setTab(t)}>{t[0].toUpperCase() + t.slice(1)}</button>
               ))}
@@ -77,6 +78,7 @@ export default function ProjectsPage({ activeProject, setActiveProject, onOpenCo
               {tab === 'tasks' && <TasksTab projectId={project.id} onError={fail} onChanged={refresh} />}
               {tab === 'backlog' && <BacklogTab projectId={project.id} onError={fail} onChanged={refresh} />}
               {tab === 'sprints' && <SprintsTab projectId={project.id} onError={fail} onChanged={refresh} />}
+              {tab === 'governance' && <GovernanceTab project={project} onError={fail} onChanged={refresh} />}
               {tab === 'settings' && (
                 <SettingsTab project={project} teams={teams ?? []} gateways={gateways ?? []}
                   onError={fail} onChanged={refresh} />
@@ -97,6 +99,7 @@ export default function ProjectsPage({ activeProject, setActiveProject, onOpenCo
 function ProjectForm({ onClose, onSaved, teams, gateways }:
   { onClose: () => void; onSaved: (id: string) => void; teams: any[]; gateways: any[] }) {
   const [f, setF] = React.useState({ name: '', goal: '', description: '', technology_stack: '', repository_url: '', workspace_path: '', team_id: '', default_gateway_id: '', default_model_id: '' });
+  const [validationError, setValidationError] = React.useState('');
   const { data: models } = useAsyncData<any[]>(
     () => (f.default_gateway_id ? get(`/api/v1/gateways/${f.default_gateway_id}/models`) : Promise.resolve([])),
     [f.default_gateway_id]);
@@ -131,9 +134,13 @@ function ProjectForm({ onClose, onSaved, teams, gateways }:
           </select>
         </Field>
       </div>
-      <button className="btn primary" disabled={!f.name} onClick={async () => {
-        try { const p = await post('/api/v1/projects', { ...f, team_id: f.team_id || null, default_gateway_id: f.default_gateway_id || null, default_model_id: f.default_model_id || null }); onSaved(p.id); }
-        catch (e: any) { alert(e.message); }
+      <ErrorNote error={validationError} />
+      <button className="btn primary" disabled={!f.name.trim()} onClick={async () => {
+        const checked = ProjectSchema.safeParse(f);
+        if (!checked.success) { setValidationError(checked.error.issues[0]?.message ?? 'Invalid project'); return; }
+        setValidationError('');
+        try { const p = await post('/api/v1/projects', { ...checked.data, team_id: f.team_id || null, default_gateway_id: f.default_gateway_id || null, default_model_id: f.default_model_id || null }); onSaved(p.id); }
+        catch (e: any) { setValidationError(e.message || String(e)); }
       }}>Create Project</button>
     </Modal>
   );
@@ -183,7 +190,9 @@ function TasksTab({ projectId, onError, onChanged }: { projectId: string; onErro
           <Badge kind={TASK_STATE_CLASS[t.status] ?? 'dim'}>{t.status}</Badge>
           <div className="btn-row">
             {t.status === 'Todo' && <button className="btn small" onClick={() => transition(t, 'Ready')}>Ready</button>}
-            {['Todo', 'Ready'].includes(t.status) && <button className="btn small" onClick={() => transition(t, 'In Progress')}>Start</button>}
+            {/* Backend TASK_TRANSITIONS only allows Ready -> In Progress; a
+                Todo "Start" was guaranteed to fail with 409. */}
+            {t.status === 'Ready' && <button className="btn small" onClick={() => transition(t, 'In Progress')}>Start</button>}
             {t.status === 'In Progress' && <button className="btn small" onClick={() => transition(t, 'Review')}>Review</button>}
             {['Review', 'Testing'].includes(t.status) && <button className="btn small" onClick={() => transition(t, 'Done')}>Done</button>}
             {!['Done', 'Cancelled'].includes(t.status) && <button className="btn small danger" onClick={() => transition(t, 'Cancelled')}>✕</button>}
@@ -200,9 +209,49 @@ function TasksTab({ projectId, onError, onChanged }: { projectId: string; onErro
 
 function TaskForm({ projectId, sprints, tasks, agents, onClose, onSaved }: any) {
   const [f, setF] = React.useState({ title: '', description: '', acceptance_criteria: '', story_points: 3, priority: 2, sprint_id: '', backlog_item_id: null, assigned_agent_id: '', depends_on: [] as string[] });
+  const [validationError, setValidationError] = React.useState('');
+  const { data: templates } = useAsyncData<any[]>(() => get('/api/v1/task-templates'), []);
+  const [tplId, setTplId] = React.useState('');
+  const [tplVars, setTplVars] = React.useState<Record<string, string>>({});
+  const tpl = (templates ?? []).find((t: any) => t.id === tplId);
   const upd = (k: string) => (e: any) => setF({ ...f, [k]: e.target.value });
+  const applyTemplate = async () => {
+    try {
+      const a = await post(`/api/v1/task-templates/${tplId}/preview`, tplVars);
+      setF({ ...f, title: a.title, description: a.description,
+        acceptance_criteria: a.acceptance_criteria,
+        story_points: a.story_points ?? f.story_points,
+        priority: a.priority ?? f.priority });
+      setValidationError(a.missing_variables?.length
+        ? `Template variables still missing: ${a.missing_variables.join(', ')}` : '');
+    } catch (e: any) { setValidationError(e.message || String(e)); }
+  };
   return (
     <Modal title="Add Task" onClose={onClose}>
+      {!!templates?.length && (
+        <Field label="Start from template">
+          <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+            <select style={{ width: 220 }} value={tplId}
+              onChange={(e) => { setTplId(e.target.value); setTplVars({ }); }}>
+              <option value="">— blank task —</option>
+              {templates.map((t: any) => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </select>
+            {tpl && <button className="btn small primary" onClick={applyTemplate}>Apply to form</button>}
+          </div>
+          {tpl && (
+            <div className="muted small" style={{ marginTop: 4 }}>
+              {tpl.about}
+              <div className="row" style={{ gap: 8, flexWrap: 'wrap', marginTop: 6 }}>
+                {(tpl.variables ?? []).map((v: any) => (
+                  <input key={v.name} style={{ width: 170 }} placeholder={`${v.label} (e.g. ${v.example})`}
+                    value={tplVars[v.name] ?? ''}
+                    onChange={(e) => setTplVars({ ...tplVars, [v.name]: e.target.value })} />
+                ))}
+              </div>
+            </div>
+          )}
+        </Field>
+      )}
       <Field label="Title"><input value={f.title} onChange={upd('title')} /></Field>
       <Field label="Description"><textarea value={f.description} onChange={upd('description')} /></Field>
       <Field label="Acceptance criteria"><textarea value={f.acceptance_criteria} onChange={upd('acceptance_criteria')} /></Field>
@@ -227,9 +276,13 @@ function TaskForm({ projectId, sprints, tasks, agents, onClose, onSaved }: any) 
           {tasks.filter((t: any) => t.sprint_id).map((t: any) => <option key={t.id} value={t.id}>{t.title}</option>)}
         </select>
       </Field>
-      <button className="btn primary" disabled={!f.title} onClick={async () => {
-        try { await post(`/api/v1/projects/${projectId}/tasks`, { ...f, sprint_id: f.sprint_id || null, assigned_agent_id: f.assigned_agent_id || null }); onSaved(); }
-        catch (e: any) { alert(e.message); }
+      <ErrorNote error={validationError} />
+      <button className="btn primary" disabled={!f.title.trim()} onClick={async () => {
+        const checked = TaskSchema.safeParse(f);
+        if (!checked.success) { setValidationError(checked.error.issues[0]?.message ?? 'Invalid task'); return; }
+        setValidationError('');
+        try { await post(`/api/v1/projects/${projectId}/tasks`, { ...checked.data, sprint_id: f.sprint_id || null, assigned_agent_id: f.assigned_agent_id || null }); onSaved(); }
+        catch (e: any) { setValidationError(e.message || String(e)); }
       }}>Create Task</button>
     </Modal>
   );
@@ -276,6 +329,7 @@ function BacklogTab({ projectId, onError, onChanged }: { projectId: string; onEr
 
 function BacklogForm({ onClose, onSaved }: any) {
   const [f, setF] = React.useState({ title: '', description: '', acceptance_criteria: '', priority: 2, story_points: 3 });
+  const [validationError, setValidationError] = React.useState('');
   const upd = (k: string) => (e: any) => setF({ ...f, [k]: e.target.value });
   return (
     <Modal title="Add Backlog Item" onClose={onClose}>
@@ -286,7 +340,13 @@ function BacklogForm({ onClose, onSaved }: any) {
         <Field label="Priority (1 high)"><input type="number" min={1} max={5} value={f.priority} onChange={upd('priority')} /></Field>
         <Field label="Story points"><input type="number" value={f.story_points} onChange={upd('story_points')} /></Field>
       </div>
-      <button className="btn primary" disabled={!f.title} onClick={() => onSaved(f)}>Add Item</button>
+      <ErrorNote error={validationError} />
+      <button className="btn primary" disabled={!f.title.trim()} onClick={() => {
+        const checked = BacklogSchema.safeParse(f);
+        if (!checked.success) { setValidationError(checked.error.issues[0]?.message ?? 'Invalid backlog item'); return; }
+        setValidationError('');
+        onSaved(checked.data);
+      }}>Add Item</button>
     </Modal>
   );
 }
@@ -342,19 +402,178 @@ function SprintsTab({ projectId, onError, onChanged }: { projectId: string; onEr
 
 function SprintFields({ onSaved }: { onSaved: (body: any) => void }) {
   const [f, setF] = React.useState({ name: '', goal: '', capacity: 40 });
+  const [validationError, setValidationError] = React.useState('');
   const upd = (k: string) => (e: any) => setF({ ...f, [k]: e.target.value });
   return (
     <>
       <Field label="Name"><input value={f.name} onChange={upd('name')} /></Field>
       <Field label="Sprint goal"><input value={f.goal} onChange={upd('goal')} /></Field>
       <Field label="Capacity (story points)"><input type="number" value={f.capacity} onChange={upd('capacity')} /></Field>
-      <button className="btn primary" disabled={!f.name} onClick={() => onSaved(f)}>Create Sprint</button>
+      <ErrorNote error={validationError} />
+      <button className="btn primary" disabled={!f.name.trim()} onClick={() => {
+        const checked = SprintSchema.safeParse(f);
+        if (!checked.success) { setValidationError(checked.error.issues[0]?.message ?? 'Invalid sprint'); return; }
+        setValidationError('');
+        onSaved(checked.data);
+      }}>Create Sprint</button>
+    </>
+  );
+}
+
+function GovernanceTab({ project, onError, onChanged }: any) {
+  const { data: view, reload } = useAsyncData<any>(
+    () => get(`/api/v1/projects/${project.id}/lifecycle`), [project.id]);
+  const [to, setTo] = React.useState('');
+  const [req, setReq] = React.useState({ title: '', content: '' });
+  const [decisionModal, setDecisionModal] = React.useState<{
+    kind: 'baseline' | 'change'; id: string; code: string; decision: string;
+  } | null>(null);
+  const [decisionNotes, setDecisionNotes] = React.useState('');
+  const run = async (fn: () => Promise<any>) => {
+    try { await fn(); reload(); onChanged(); } catch (e: any) { onError(e); }
+  };
+  const decide = (bid: string, decision: string) => {
+    setDecisionNotes('');
+    setDecisionModal({ kind: 'baseline', id: bid, code: 'Baseline', decision });
+  };
+  const decideCr = (cid: string, code: string, decision: string) => {
+    setDecisionNotes('');
+    setDecisionModal({ kind: 'change', id: cid, code, decision });
+  };
+  const submitDecision = async () => {
+    if (!decisionModal) return;
+    try {
+      const path = decisionModal.kind === 'baseline'
+        ? `/api/v1/projects/${project.id}/baseline/${decisionModal.id}/decision`
+        : `/api/v1/projects/${project.id}/change_requests/${decisionModal.id}/decision`;
+      await post(path, { decision: decisionModal.decision, notes: decisionNotes });
+      setDecisionModal(null);
+      reload();
+      onChanged();
+    } catch (e: any) { onError(e); }
+  };
+  if (!view) return <div className="muted">Loading governance…</div>;
+  const badge = view.state === 'Completed' ? 'ok'
+    : ['Blocked', 'Cancelled', 'Change Requested'].includes(view.state) ? 'err'
+      : ['Pending PO Approval', 'Paused'].includes(view.state) ? 'warn' : 'info';
+  const stateBadge = (s: string) => s === 'approved' ? 'ok' : s === 'pending_approval' ? 'warn'
+    : ['rejected', 'revision_requested'].includes(s) ? 'err' : 'dim';
+  return (
+    <>
+      <div className="spread">
+        <div>
+          <b>Lifecycle </b><Badge kind={badge}>{view.state}</Badge>
+          <div className="muted small">
+            {view.governance_enabled
+              ? 'Enforcement ON — sprints and tasks only run in Active Development / Final Validation.'
+              : 'Enforcement OFF — the state machine tracks and audits, execution is unaffected.'}
+          </div>
+        </div>
+        <label className="kv" style={{ cursor: 'pointer' }}>
+          <input type="checkbox" checked={!!project.governance_enabled} onChange={() =>
+            run(() => patch(`/api/v1/projects/${project.id}`, { governance_enabled: !project.governance_enabled }))
+          } /> governance gate
+        </label>
+      </div>
+
+      <div style={{ marginTop: 12 }}>
+        <b className="small">Move to state</b>
+        <div className="btn-row" style={{ marginTop: 4 }}>
+          <select value={to} onChange={(e) => setTo(e.target.value)} style={{ width: 220 }}>
+            <option value="">— allowed next states —</option>
+            {(view.allowed_transitions ?? []).map((s: string) => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <button className="btn small primary" disabled={!to} onClick={() =>
+            run(() => post(`/api/v1/projects/${project.id}/lifecycle/transition`, { to, reason: 'moved via UI' }))
+          }>Transition</button>
+        </div>
+      </div>
+
+      {(view.pending_baselines ?? []).length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <b className="small">Awaiting PO approval</b>
+          {view.pending_baselines.map((b: any) => (
+            <div key={b.id} className="list-row" style={{ borderColor: 'var(--warn)' }}>
+              <div className="grow"><b>{b.code}</b> <span className="muted small">{b.kind}</span></div>
+              <div className="btn-row">
+                <button className="btn small primary" onClick={() => decide(b.id, 'approve')}>Approve</button>
+                <button className="btn small" onClick={() => decide(b.id, 'request_revision')}>Request revision</button>
+                <button className="btn small danger" onClick={() => decide(b.id, 'reject')}>Reject</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ marginTop: 12 }}>
+        <div className="spread"><b className="small">Baselines</b>
+          <button className="btn small" onClick={() =>
+            run(() => post(`/api/v1/projects/${project.id}/baseline`, { kind: 'requirement' }))
+          }>+ Freeze requirement baseline (RB)</button>
+        </div>
+        {(view.baselines ?? []).map((b: any) => (
+          <div key={b.id} className="kv">
+            {b.code} · <Badge kind={stateBadge(b.status)}>{b.status}</Badge>
+            {b.approved_by ? ` by ${b.approved_by}` : ''} · {b.created_at?.slice(0, 10)}
+          </div>
+        ))}
+        {!view.baselines?.length && <div className="muted small">No baselines yet — record requirements, then freeze RB-1.0 for approval.</div>}
+      </div>
+
+      <div style={{ marginTop: 12 }}>
+        <b className="small">Requirements (versioned, append-only)</b>
+        {(view.requirements ?? []).map((r: any) => (
+          <div key={r.id} className="kv">{r.title} · v{r.version} <span className="muted">({r.source_type})</span></div>
+        ))}
+        {!view.requirements?.length && <div className="muted small">None recorded yet.</div>}
+        <div className="form-grid" style={{ marginTop: 6 }}>
+          <Field label="Title"><input value={req.title} onChange={(e) => setReq({ ...req, title: e.target.value })} /></Field>
+          <Field label="Content">
+            <textarea value={req.content} rows={2} onChange={(e) => setReq({ ...req, content: e.target.value })} />
+          </Field>
+        </div>
+        <button className="btn small primary" disabled={!req.title.trim()} onClick={() => run(async () => {
+          await post(`/api/v1/projects/${project.id}/requirements`,
+            { title: req.title.trim(), content: req.content });
+          setReq({ title: '', content: '' });
+        })}>Add requirement</button>
+      </div>
+
+      <div style={{ marginTop: 12 }}>
+        <b className="small">Change requests</b>
+        {(view.change_requests ?? []).map((c: any) => (
+          <div key={c.id} className="list-row">
+            <div className="grow">
+              <b>{c.code}</b> {c.title} <Badge kind={c.status === 'open' ? 'warn' : 'dim'}>{c.status}</Badge>
+              {c.description && <div className="muted small">{c.description}</div>}
+            </div>
+            {c.status === 'open' && (
+              <div className="btn-row">
+                <button className="btn small" onClick={() => decideCr(c.id, c.code, 'incorporate')}>Incorporate</button>
+                <button className="btn small danger" onClick={() => decideCr(c.id, c.code, 'decline')}>Decline</button>
+              </div>
+            )}
+          </div>
+        ))}
+        {!view.change_requests?.length && <div className="muted small">None.</div>}
+      </div>
+      {decisionModal && <Modal title={`${decisionModal.decision.replace('_', ' ')} ${decisionModal.code}`}
+        onClose={() => setDecisionModal(null)}>
+        <Field label="Notes or reason">
+          <textarea value={decisionNotes} onChange={(e) => setDecisionNotes(e.target.value)} rows={3} />
+        </Field>
+        <div className="btn-row">
+          <button className="btn" onClick={() => setDecisionModal(null)}>Cancel</button>
+          <button className="btn primary" onClick={submitDecision}>Confirm decision</button>
+        </div>
+      </Modal>}
     </>
   );
 }
 
 function SettingsTab({ project, teams, gateways, onError, onChanged }: any) {
   const [f, setF] = React.useState({ ...project });
+  const [confirmDelete, setConfirmDelete] = React.useState(false);
   React.useEffect(() => setF({ ...project }), [project]);
   const { data: models } = useAsyncData<any[]>(
     () => (f.default_gateway_id ? get(`/api/v1/gateways/${f.default_gateway_id}/models`) : Promise.resolve([])),
@@ -388,17 +607,30 @@ function SettingsTab({ project, teams, gateways, onError, onChanged }: any) {
             {(models ?? []).map((m: any) => <option key={m.id} value={m.id}>{m.provider_model_id}</option>)}
           </select>
         </Field>
+        <Field label="LLM budget USD (0 = unlimited; tasks/sprints block when spent)">
+          <input type="number" min={0} step="0.5" value={f.budget_usd ?? 0} onChange={upd('budget_usd')} />
+        </Field>
       </div>
       <div className="btn-row">
         <button className="btn primary" onClick={async () => {
           try { await patch(`/api/v1/projects/${project.id}`, { ...f, team_id: f.team_id || null, default_gateway_id: f.default_gateway_id || null, default_model_id: f.default_model_id || null }); onChanged(); }
           catch (e: any) { onError(e); }
         }}>Save Changes</button>
-        <button className="btn danger" onClick={async () => {
-          if (!confirm(`Delete project "${project.name}"?`)) return;
-          try { await del(`/api/v1/projects/${project.id}`); onChanged(); } catch (e: any) { onError(e); }
-        }}>Delete Project</button>
+        <button className="btn danger" onClick={() => setConfirmDelete(true)}>Delete Project</button>
       </div>
+      {confirmDelete && <Modal title="Delete project" onClose={() => setConfirmDelete(false)}>
+        <p>Delete “{project.name}” and its project data?</p>
+        <div className="btn-row">
+          <button className="btn" onClick={() => setConfirmDelete(false)}>Cancel</button>
+          <button className="btn danger" onClick={async () => {
+            try {
+              await del(`/api/v1/projects/${project.id}`);
+              setConfirmDelete(false);
+              onChanged();
+            } catch (e: any) { onError(e); }
+          }}>Delete project</button>
+        </div>
+      </Modal>}
     </>
   );
 }

@@ -1,0 +1,32 @@
+{
+  "name": "API endpoint",
+  "about": "Add or extend a FastAPI endpoint with request/response models and tests.",
+  "title": "Implement {feature} endpoint",
+  "description": "Implement the {method} /api/{resource} endpoint for {feature}.\nValidate input with Pydantic models; return typed responses.\nHandle 404/409 cases explicitly.",
+  "acceptance_criteria": "Given a valid request to {method} /api/{resource}\nWhen the endpoint is called\nThen it returns {success_status} with the expected payload\nAnd invalid input returns 422\nAnd a missing resource returns 404\nAnd there is a passing pytest covering success and error paths",
+  "story_points": 3,
+  "priority": 2,
+  "suggested_role": "Senior Developer",
+  "variables": [
+    {
+      "name": "feature",
+      "label": "Feature name",
+      "example": "ticket comments"
+    },
+    {
+      "name": "method",
+      "label": "HTTP method",
+      "example": "POST"
+    },
+    {
+      "name": "resource",
+      "label": "Resource path",
+      "example": "tickets/{id}/comments"
+    },
+    {
+      "name": "success_status",
+      "label": "Success status",
+      "example": "201"
+    }
+  ]
+}

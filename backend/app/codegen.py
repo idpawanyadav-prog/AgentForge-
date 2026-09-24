@@ -11,23 +11,213 @@ deterministic, runnable FastAPI + pytest scaffold so the workspace always
 contains working code.
 """
 import json
+import asyncio
 import os
 import re
 import shutil
+import tempfile
+import threading
 import time
 import urllib.error as uerr
+import httpx
 
 from .db import get_gateway_key, query, query_one
 from .llm.resolver import resolve_project_model
-from . import toolchains
+from . import budget, config, memory, toolchains
+
+
+def _charge_llm_call(project, model, resp: dict) -> None:
+    """Record a live call's estimated cost against the project's in-flight
+    budget so the NEXT call in the same run sees the spend (usage_records
+    only land at run end)."""
+    if resp.get("dry_run"):
+        return
+    pid = (project or {}).get("id") if isinstance(project, dict) else None
+    if not pid:
+        return
+    in_rate = float((model or {}).get("input_cost_per_m") or config.LLM_INPUT_COST_PER_M)
+    out_rate = float((model or {}).get("output_cost_per_m") or config.LLM_OUTPUT_COST_PER_M)
+    cost = (resp.get("input_tokens") or 0) / 1e6 * in_rate + \
+           (resp.get("output_tokens") or 0) / 1e6 * out_rate
+    budget.add_inflight(pid, cost)
+
+
+# ---------------------------------------------------------------
+# Persona / role instruction injection into LLM prompts
+# ---------------------------------------------------------------
+
+def _role_instructions_block(role_id: str) -> str:
+    """Collect active instruction files for a role and format them
+    as a prompt fragment the LLM can follow. Returns '' when the role
+    has no instructions or role_id is falsy."""
+    if not role_id:
+        return ""
+    rows = query(
+        "SELECT filename, content FROM instruction_files "
+        "WHERE role_id = ? AND active = 1 ORDER BY filename",
+        (role_id,),
+    )
+    if not rows:
+        return ""
+    parts = []
+    for row in rows:
+        fn = row["filename"] or "instruction"
+        content = (row["content"] or "").strip()
+        if content:
+            parts.append(f"### {fn}\n{content}")
+    if not parts:
+        return ""
+    return (
+        "\n\n## YOUR ROLE INSTRUCTIONS (follow these exactly)\n"
+        + "\n\n".join(parts)
+        + "\n"
+    )
+
+
+def _persona_block(persona: dict) -> str:
+    """Format a persona record as a prompt fragment."""
+    if not persona:
+        return ""
+    parts = []
+    instr = (persona.get("instructions") or "").strip()
+    if instr:
+        parts.append(f"## Persona: {persona.get('name', 'Unnamed')}\n{instr}")
+    constraints = (persona.get("constraints_text") or "").strip()
+    if constraints:
+        parts.append(f"## Hard Constraints\n{constraints}")
+    if not parts:
+        return ""
+    return "\n\n" + "\n\n".join(parts) + "\n"
+
+
+def _persona_override() -> dict | None:
+    """PERSONA_OVERRIDE=/path/to.json swaps the ENTIRE persona + role
+    instruction source for a test run, so a developer can iterate on one
+    role's prompts from a local file without touching the database (and
+    without affecting other roles). Expected JSON shape:
+
+    {"junior": false,
+     "role_instructions": [{"name": "...", "content": "..."}],
+     "persona": {"name": "...", "instructions": "...", "constraints_text": "..."}}
+    """
+    path = os.environ.get("PERSONA_OVERRIDE", "").strip()
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def build_system_prompt(stack: str, persona: dict, role_id: str) -> str:
+    """Compose the full  for a code generation run.
+
+    Order (highest-priority last, so it overrides earlier generic text):
+    1. Stack-specific system (_CODEGEN_SYSTEMS / _JR_DEV_SYSTEM)
+    2. Role instruction files from the database
+    3. Persona instructions + constraints from the database
+
+    The persona/constraints are intentionally placed last so they override
+    any generic guidance in the stack prompt without duplicating it.
+
+    With PERSONA_OVERRIDE set, steps 2-3 come from the local JSON file
+    instead of the database — the whole system prompt is then editable and
+    diffable from one file.
+    """
+    ov = _persona_override()
+    if ov is not None:
+        base = _JR_DEV_SYSTEM if (stack == "python" and ov.get("junior")) else _system_for(stack)
+        role_block = "".join(
+            f"\n\n## {r.get('name', 'Role instruction')}\n{(r.get('content') or '').strip()}"
+            for r in ov.get("role_instructions") or [] if (r.get("content") or "").strip())
+        p = ov.get("persona") or {}
+        persona_block = _persona_block({
+            "name": p.get("name") or "Override Persona",
+            "instructions": p.get("instructions") or "",
+            "constraints_text": p.get("constraints_text") or "",
+        }) if (p.get("instructions") or p.get("constraints_text")) else ""
+        return base + role_block + persona_block
+
+    is_jr = False
+    if persona and persona.get("role_id"):
+        is_jr = bool(query_one(
+            "SELECT 1 FROM roles WHERE id = ? AND lower(name) = lower('Junior Developer') LIMIT 1",
+            (persona["role_id"],),
+        ))
+    base = _JR_DEV_SYSTEM if (stack == "python" and is_jr) else _system_for(stack)
+
+    role_block = _role_instructions_block(role_id)
+    persona_block = _persona_block(persona)
+
+    return base + role_block + persona_block
 
 
 # ---------------------------------------------------------------- LLM access
 
-def call_llm(gw, model, system_prompt: str, user_text: str, max_tokens: int = 8000) -> dict:
+def _truthy_env(key: str) -> bool:
+    return (os.environ.get(key) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dry_run_enabled() -> bool:
+    """DRY_RUN=1 makes every LLM call return a deterministic stub instead of
+    hitting a provider: iterate on prompts/personas in milliseconds at zero
+    cost. The stub is valid codegen JSON (empty file list), so the full
+    runtime path still executes."""
+    return _truthy_env("DRY_RUN")
+
+
+_DRY_RUN_TEXT = json.dumps({"summary": "dry run: no code generated (DRY_RUN=1)", "files": []})
+_trace_lock = threading.Lock()
+_trace_seq = 0
+
+
+def _trace_prompt(system_prompt: str, user_text: str, label: str,
+                  model: str, dry_run: bool) -> None:
+    """DEBUG_PROMPTS=1 dumps the FINAL composed prompt (the one thing you
+    can't reconstruct from logs: task + workspace + persona + helpers +
+    memory all merged) to backend/debug/prompts/ for post-mortem debugging."""
+    global _trace_seq
+    if not _truthy_env("DEBUG_PROMPTS"):
+        return
+    try:
+        with _trace_lock:
+            _trace_seq += 1
+            seq = _trace_seq
+        out_dir = os.path.join(
+            os.environ.get("DEBUG_PROMPTS_DIR")
+            or os.path.join(os.path.dirname(__file__), "..", "debug", "prompts"),
+            (label or "llm").replace("/", "-").replace(" ", "_"))
+        os.makedirs(out_dir, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%dT%H-%M-%S", time.gmtime())
+        path = os.path.join(out_dir, f"{stamp}-{seq:04d}-{model or 'none'}.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(f"# AgentForge prompt trace\n"
+                     f"# time: {stamp}Z  label: {label}  model: {model}  dry_run: {dry_run}\n"
+                     f"# system_chars: {len(system_prompt or '')}  user_chars: {len(user_text or '')}\n\n"
+                     f"===== SYSTEM PROMPT =====\n{system_prompt}\n\n"
+                     f"===== USER PROMPT =====\n{user_text}\n")
+    except OSError:
+        pass  # tracing must never break the call it instruments
+
+
+def _dry_run_response() -> dict:
+    return {"text": _DRY_RUN_TEXT, "input_tokens": 0, "output_tokens": 0,
+            "latency_ms": 0, "dry_run": True}
+
+
+def call_llm(gw, model, system_prompt: str, user_text: str, max_tokens: int = 8000,
+             timeout: int = 300, trace_label: str = "") -> dict:
     """Live inference call. Returns {"text", "input_tokens", "output_tokens"}."""
     import urllib.error as uerr
     import urllib.request as ureq
+
+    dry = _dry_run_enabled()
+    _trace_prompt(system_prompt, user_text, trace_label,
+                  (model or {}).get("provider_model_id") or "", dry)
+    if dry:
+        return _dry_run_response()
 
     api_key = get_gateway_key(gw["id"])
     if not api_key:
@@ -41,8 +231,13 @@ def call_llm(gw, model, system_prompt: str, user_text: str, max_tokens: int = 80
             url = base + "/messages"
         else:
             url = base + "/v1/messages"
+        # Anthropic prompt caching: the system block is stable within a task
+        # (persona + role instructions + stack base) and re-sent on every
+        # self-fix/retry call, so mark it ephemeral-cacheable — repeated
+        # calls then read it at ~10% of the input price (AGENT_DEV_SPEEDUP 3.1).
         payload = {"model": model["provider_model_id"], "max_tokens": max_tokens,
-                   "system": system_prompt,
+                   "system": [{"type": "text", "text": system_prompt,
+                               "cache_control": {"type": "ephemeral"}}],
                    "messages": [{"role": "user", "content": user_text}]}
         headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
                    "Content-Type": "application/json"}
@@ -57,7 +252,7 @@ def call_llm(gw, model, system_prompt: str, user_text: str, max_tokens: int = 80
     req = ureq.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
     started = time.perf_counter()
     try:
-        with ureq.urlopen(req, timeout=300) as resp:
+        with ureq.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
     except uerr.HTTPError as e:
         raise RuntimeError(f"Gateway returned HTTP {e.code}: {e.read().decode(errors='replace')[:200]}")
@@ -80,17 +275,67 @@ def call_llm(gw, model, system_prompt: str, user_text: str, max_tokens: int = 80
     }
 
 
+async def acall_llm(gw, model, system_prompt: str, user_text: str,
+                    max_tokens: int = 8000, timeout: int = 300,
+                    trace_label: str = "") -> dict:
+    """Async transport for chat so HTTP and retry backoff use no worker slot."""
+    dry = _dry_run_enabled()
+    _trace_prompt(system_prompt, user_text, trace_label,
+                  (model or {}).get("provider_model_id") or "", dry)
+    if dry:
+        return _dry_run_response()
+
+    api_key = get_gateway_key(gw["id"])
+    if not api_key:
+        raise RuntimeError("No API key stored for the configured gateway")
+    base = gw["base_url"].rstrip("/")
+    anthropic = gw["api_type"] == "anthropic-messages"
+    if anthropic:
+        url = base if base.endswith("/messages") else base + ("/messages" if base.endswith("/v1") else "/v1/messages")
+        payload = {"model": model["provider_model_id"], "max_tokens": max_tokens,
+                   "system": [{"type": "text", "text": system_prompt,
+                               "cache_control": {"type": "ephemeral"}}],
+                   "messages": [{"role": "user", "content": user_text}]}
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+    else:
+        url = (base if "/v1" in base else base + "/v1") + "/chat/completions"
+        payload = {"model": model["provider_model_id"], "max_tokens": max_tokens,
+                   "messages": [{"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_text}]}
+        headers = {"Authorization": f"Bearer {api_key}"}
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"Gateway returned HTTP {exc.response.status_code}: {exc.response.text[:200]}") from exc
+    except (httpx.RequestError, ValueError) as exc:
+        raise RuntimeError(f"Could not reach gateway: {exc}") from exc
+    usage = data.get("usage") or {}
+    if anthropic:
+        message = "\n".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+        in_toks, out_toks = usage.get("input_tokens") or 0, usage.get("output_tokens") or 0
+    else:
+        message = data["choices"][0]["message"]["content"] or ""
+        in_toks, out_toks = usage.get("prompt_tokens") or 0, usage.get("completion_tokens") or 0
+    return {"text": message, "input_tokens": in_toks, "output_tokens": out_toks,
+            "latency_ms": int((time.perf_counter() - started) * 1000)}
+
+
 # ---------------------------------------------------------------------------
 # Circuit breaker + retry wrapper
 # ---------------------------------------------------------------------------
 
 class _BreakerState:
     """Per-gateway circuit breaker state."""
-    __slots__ = ("consecutive_failures", "opened_at", "last_failure")
+    __slots__ = ("consecutive_failures", "opened_at", "opened_at_wall", "last_failure")
 
     def __init__(self):
         self.consecutive_failures: int = 0
         self.opened_at: float = 0.0
+        self.opened_at_wall: float = 0.0
         self.last_failure: str = ""
 
     @property
@@ -106,13 +351,69 @@ class _BreakerState:
     def record_success(self):
         self.consecutive_failures = 0
         self.opened_at = 0.0
+        self.opened_at_wall = 0.0
         self.last_failure = ""
 
     def record_failure(self, reason: str):
         self.consecutive_failures += 1
         if self.is_open:
             self.opened_at = time.monotonic()
+            self.opened_at_wall = time.time()
         self.last_failure = reason
+
+
+_BREAKER_STATE_FILE = os.path.join(os.path.dirname(config.DB_PATH), "breaker_state.json")
+
+
+def _load_breakers() -> dict[str, _BreakerState]:
+    """Restore only still-active cooldowns, converting wall time to monotonic."""
+    try:
+        with open(_BREAKER_STATE_FILE, encoding="utf-8") as fh:
+            saved = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(saved, dict):
+        return {}
+    breakers = {}
+    for gateway_id, state in saved.items():
+        try:
+            failures = max(0, int(state["consecutive_failures"]))
+            opened_wall = float(state.get("opened_at_wall") or 0)
+            elapsed = max(0.0, time.time() - opened_wall)
+            if failures >= 5 and elapsed >= 60:
+                continue
+            breaker = _BreakerState()
+            breaker.consecutive_failures = failures
+            if failures >= 5:
+                breaker.opened_at_wall = opened_wall
+                breaker.opened_at = time.monotonic() - elapsed
+                breaker.last_failure = "prior provider failure"
+            breakers[str(gateway_id)] = breaker
+        except (TypeError, ValueError, KeyError, AttributeError):
+            continue
+    return breakers
+
+
+def _save_breakers(breakers: dict[str, _BreakerState]) -> None:
+    """Persist breaker counters atomically without writing error details."""
+    data = {gateway_id: {
+        "consecutive_failures": state.consecutive_failures,
+        "opened_at_wall": state.opened_at_wall,
+    } for gateway_id, state in breakers.items() if state.consecutive_failures}
+    directory = os.path.dirname(_BREAKER_STATE_FILE)
+    try:
+        os.makedirs(directory, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix=".breaker-", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            os.replace(temp_path, _BREAKER_STATE_FILE)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+    except OSError:
+        # Breaker persistence is best effort; inference must still work.
+        pass
 
 
 class GatewayClient:
@@ -128,8 +429,20 @@ class GatewayClient:
         text = result["text"]
     """
 
-    _breakers: dict[str, _BreakerState] = {}
-    _lock = __import__("threading").Lock()
+    _breakers: dict[str, _BreakerState] = _load_breakers()
+    _lock = threading.Lock()
+
+    @classmethod
+    def _record_success(cls, breaker: _BreakerState):
+        with cls._lock:
+            breaker.record_success()
+            _save_breakers(cls._breakers)
+
+    @classmethod
+    def _record_failure(cls, breaker: _BreakerState, reason: str):
+        with cls._lock:
+            breaker.record_failure(reason)
+            _save_breakers(cls._breakers)
 
     @classmethod
     def _breaker(cls, gateway_id: str) -> _BreakerState:
@@ -142,7 +455,7 @@ class GatewayClient:
     def call(cls, gw: dict, model: dict, message: str,
              system_prompt: str = "",
              max_tokens: int = 8000,
-             *, retries: int = 2) -> dict:
+             *, retries: int = 2, trace: str = "gateway") -> dict:
         """Call the LLM with circuit breaker and exponential backoff retry.
 
         On transient errors (timeout, connection reset) the call is retried
@@ -161,8 +474,9 @@ class GatewayClient:
         last_exc: Exception | None = None
         for attempt in range(max(1, retries + 1)):
             try:
-                result = call_llm(gw, model, system_prompt, message, max_tokens)
-                breaker.record_success()
+                result = call_llm(gw, model, system_prompt, message, max_tokens,
+                                  trace_label=trace)
+                cls._record_success(breaker)
                 latency_ms = result.get("latency_ms", 0)
                 result["latency_ms"] = latency_ms
                 return result
@@ -172,9 +486,9 @@ class GatewayClient:
                 is_transient = isinstance(exc, RuntimeError) and (
                     "Could not reach gateway" in str(exc) or is_timeout)
                 if not is_transient:
-                    breaker.record_failure(str(exc))
+                    cls._record_failure(breaker, str(exc))
                     raise
-                breaker.record_failure(str(exc))
+                cls._record_failure(breaker, str(exc))
                 wait = min(2 ** attempt, 8)
                 time.sleep(wait)
 
@@ -182,6 +496,31 @@ class GatewayClient:
             f"Gateway '{gw.get('name', gw['id'])}' unreachable after {retries + 1} attempts: "
             f"{last_exc}"
         )
+
+    @classmethod
+    async def acall(cls, gw: dict, model: dict, message: str,
+                    system_prompt: str = "", max_tokens: int = 8000,
+                    *, retries: int = 2, trace: str = "gateway") -> dict:
+        breaker = cls._breaker(gw["id"])
+        if breaker.is_open and not breaker.is_half_open:
+            raise RuntimeError(f"Circuit breaker open for gateway '{gw.get('name', gw['id'])}'. Retry after 60 s.")
+        last_exc = None
+        for attempt in range(max(1, retries + 1)):
+            try:
+                result = await acall_llm(gw, model, system_prompt, message, max_tokens,
+                                         trace_label=trace)
+                cls._record_success(breaker)
+                return result
+            except (TimeoutError, RuntimeError) as exc:
+                last_exc = exc
+                cls._record_failure(breaker, str(exc))
+                transient = isinstance(exc, TimeoutError) or "Could not reach gateway" in str(exc)
+                if not transient:
+                    raise
+                if attempt < retries:
+                    await asyncio.sleep(min(2 ** attempt, 8))
+        raise RuntimeError(
+            f"Gateway '{gw.get('name', gw['id'])}' unreachable after {retries + 1} attempts: {last_exc}")
 
 
 def resolve_llm(project):
@@ -196,28 +535,73 @@ def is_llm_outage(error: str) -> bool:
     """True when a codegen error is an LLM outage/quota condition — the
     caller must stop retrying (each retry burns quota) and block with the
     clear reason instead of burning self-fix / health rounds."""
-    return bool(error) and _llm_outage_reason(error) != "" or \
-        (error or "").lower().startswith(("llm usage limit", "llm quota",
-                                          "llm rate limited", "llm provider overloaded"))
+    return bool(error) and (
+        _llm_outage_reason(error) != ""
+        or error.lower().startswith(("llm usage limit", "llm quota",
+                                     "llm rate limited", "llm provider overloaded"))
+    )
+
+
+_MAX_FILE_SIZE_BYTES = 1_048_576
+_MAX_TOTAL_GENERATED_BYTES = 5_242_880
+
+
+def _extract_object(text: str) -> dict:
+    """Parse a complete model JSON object without chatbot-specific fields."""
+    start = text.find("{")
+    if start < 0:
+        return {}
+    try:
+        value, _ = json.JSONDecoder().raw_decode(text[start:])
+    except (ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _validate_generated_files(files: list[tuple[str, str]]) -> str:
+    """Return an error before any generated file is written, or an empty string."""
+    total = 0
+    for rel, content in files:
+        size = len(content.encode("utf-8"))
+        if size > _MAX_FILE_SIZE_BYTES:
+            return f"File {rel} exceeds size limit ({size} > {_MAX_FILE_SIZE_BYTES} bytes)"
+        total += size
+        if total > _MAX_TOTAL_GENERATED_BYTES:
+            return ("Total generated size exceeds limit "
+                    f"({total} > {_MAX_TOTAL_GENERATED_BYTES} bytes)")
+    return ""
 
 
 def _llm_outage_reason(text: str) -> str:
-    """Detect an LLM outage / quota / rate-limit message in the response
-    text. Returns a clean reason string, or '' when this looks like a
-    normal (but unusable) reply. These must surface as outages, not
-    'no usable files' — the model literally cannot help right now."""
+    """Detect an LLM outage / quota / rate-limit / unreachable-gateway
+    message in a response text OR a raised error string. Returns a clean
+    reason string, or '' when this looks like a normal (but unusable)
+    reply. These must surface as outages, not 'no usable files' — the
+    model literally cannot help right now, and a scaffold must never
+    mask that (the contract in generate_implementation)."""
     low = text.lower()
     for pat, label in (
         ("usage limit", "LLM usage limit reached (quota exhausted)"),
         ("quota", "LLM quota exhausted"),
         ("rate limit", "LLM rate limited"),
+        ("rate_limit", "LLM rate limited"),
+        ("http 429", "LLM rate limited (HTTP 429)"),
+        ("too many requests", "LLM rate limited (HTTP 429)"),
         ("overloaded", "LLM provider overloaded"),
         ("insufficient", "LLM insufficient credits/balance"),
         ("temporarily unavailable", "LLM temporarily unavailable"),
         ("service unavailable", "LLM service unavailable"),
+        ("could not reach gateway", "LLM gateway unreachable"),
+        ("unreachable after", "LLM gateway unreachable"),
+        ("circuit breaker open", "LLM gateway circuit breaker open"),
+        ("timed out", "LLM gateway request timed out"),
+        ("timeout", "LLM gateway request timed out"),
     ):
         if pat in low:
             return label
+    # 5xx from the HTTPError text ("Gateway returned HTTP 502: ...")
+    if re.search(r"http 5\d\d", low):
+        return "LLM gateway server error (HTTP 5xx)"
     return ""
 
 
@@ -246,17 +630,28 @@ _REVIEW_SYSTEM = {
 }
 
 
-def review_verdict(project, task, mode: str) -> dict:
+def review_verdict(project, task, mode: str, agent_ref: str, deadline: float | None = None) -> dict:
     """One LLM call for an SA or BA review gate. Returns
     {"decision": "approved"|"rework"|"unavailable", "rework_class",
      "findings", "input_tokens", "output_tokens"}. 'unavailable' means the
     gate could not run (no gateway, outage, unusable reply) — the pipeline
-    skips the gate instead of punishing the developer."""
+    skips the gate instead of punishing the developer. ``deadline`` (a
+    time.monotonic() stamp) bounds the HTTP call so a slow provider cannot
+    hang the review run."""
     empty = {"decision": "unavailable", "rework_class": "", "findings": "",
              "input_tokens": 0, "output_tokens": 0}
+    b_ok, b_reason = budget.may_spend(project["id"])
+    if not b_ok:
+        return {**empty, "findings": f"{b_reason} — review gate skipped"}
     gw, model = resolve_llm(project)
     if not (gw and model):
         return {**empty, "findings": "No LLM gateway configured — review gate skipped"}
+    call_timeout = 300
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining < 15:
+            return {**empty, "findings": "review phase budget exhausted — gate skipped"}
+        call_timeout = max(15, min(300, int(remaining) - 5))
     tree = _existing_tree(project["workspace_path"])[:2500]
     ac = task["acceptance_criteria"] or ""
     if task["functional_ac"]:
@@ -269,15 +664,28 @@ def review_verdict(project, task, mode: str) -> dict:
         f"WORKSPACE FILES:\n{tree}\n\n"
         f"TASK: {task['title']}\n{task['description']}\n"
         f"ACCEPTANCE CRITERIA:\n{ac or 'n/a'}\n\n"
-        f"CHANGE EVIDENCE: {(task['evidence'] or '')[:600]}\n\n"
+        f"CHANGE EVIDENCE: {(task['evidence'] or '')[:600]}"
+        f"{_changed_files_block(project['workspace_path'], task['evidence'] or '')}\n\n"
         "Is this implementation acceptable from your reviewing role?")
     try:
-        raw = call_llm(gw, model, _REVIEW_SYSTEM[mode], user, max_tokens=500)
+        review_sys = _REVIEW_SYSTEM.get(mode, "")
+        agent_row = query_one(
+            "SELECT a.persona_id, a.role_id, r.name AS role_name FROM agents a "
+            "JOIN roles r ON r.id = a.role_id "
+            "WHERE a.id = ? OR lower(a.name) = lower(?) LIMIT 1",
+            (agent_ref, agent_ref or ""),
+        )
+        if agent_row:
+            p = query_one("SELECT * FROM personas WHERE id = ?", (agent_row["persona_id"],)) if agent_row.get("persona_id") else None
+            review_sys = review_sys + _persona_block(p) + _role_instructions_block(agent_row.get("role_id"))
+        raw = call_llm(gw, model, review_sys, user, max_tokens=500,
+                       trace_label="review",
+                       timeout=call_timeout)
+        _charge_llm_call(project, model, raw)
     except Exception as exc:
         return {**empty, "findings": f"review call failed: {str(exc)[:160]}"}
     text = raw.get("text") or ""
-    from .chatbot import _extract_json  # lazy: chatbot imports runtime, runtime imports codegen
-    data = _extract_json(text) or {}
+    data = _extract_object(text)
     decision = str(data.get("decision") or "").lower()
     tokens = {"input_tokens": raw.get("input_tokens", 0),
               "output_tokens": raw.get("output_tokens", 0)}
@@ -398,7 +806,41 @@ def _is_junior_dev(agent_ref: str) -> bool:
     return bool(row) and "junior" in (row["role_name"] or "").lower()
 
 
+def _tree_stamp(ws_dir: str) -> tuple:
+    """Cheap fingerprint of a workspace's file layout: max mtime over all
+    directories plus the total file count. Creating/removing/renaming any
+    file changes its directory's mtime, so the pair detects layout changes
+    without building the tree string."""
+    max_mtime = 0.0
+    file_count = 0
+    for root, dirs, files in os.walk(ws_dir):
+        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", ".pytest_cache", "node_modules")]
+        file_count += len(files)
+        try:
+            max_mtime = max(max_mtime, os.stat(root).st_mtime)
+        except OSError:
+            pass
+    return (round(max_mtime, 4), file_count)
+
+
+# ws_dir -> (layout fingerprint, rendered tree). Bounded: one entry per active
+# workspace; projects are few, and stale workspaces age out on first miss.
+_tree_cache: dict[str, tuple] = {}
+_TREE_CACHE_MAX = 32
+
+
 def _existing_tree(ws_dir: str, limit: int = 60) -> str:
+    # Identical workspace layout (the common case across retries and
+    # self-fix rounds of one task) reuses the cached string instead of
+    # re-walking and re-rendering the tree on every LLM call.
+    try:
+        stamp = _tree_stamp(ws_dir)
+    except OSError:
+        stamp = None
+    if stamp is not None:
+        hit = _tree_cache.get(ws_dir)
+        if hit and hit[0] == stamp:
+            return hit[1]
     entries = []
     for root, dirs, files in os.walk(ws_dir):
         dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", ".pytest_cache", "node_modules")]
@@ -406,7 +848,85 @@ def _existing_tree(ws_dir: str, limit: int = 60) -> str:
         for f in files:
             entries.append(os.path.normpath(os.path.join(rel, f)).replace("\\", "/"))
     entries = sorted(entries)[:limit]
-    return "\n".join(entries) or "(empty workspace)"
+    out = "\n".join(entries) or "(empty workspace)"
+    if stamp is not None:
+        if len(_tree_cache) >= _TREE_CACHE_MAX and ws_dir not in _tree_cache:
+            _tree_cache.pop(next(iter(_tree_cache)))
+        _tree_cache[ws_dir] = (stamp, out)
+    return out
+
+
+_SKIP_DIRS = (".git", "__pycache__", ".pytest_cache", "node_modules")
+_SRC_SUFFIXES = (".py", ".js", ".ts", ".tsx", ".go", ".cs", ".html", ".css")
+
+
+def _read_capped(ws_dir: str, rel: str, cap: int) -> str | None:
+    safe = _safe_rel_path(rel)
+    if not safe:
+        return None
+    path = os.path.join(ws_dir, safe.replace("/", os.sep))
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+    except OSError:
+        return None
+    return f"--- {safe} ---\n{src[:cap]}" + ("\n... (truncated)" if len(src) > cap else "")
+
+
+def _changed_files_block(ws_dir: str, evidence: str, max_files: int = 4,
+                         per_file: int = 3500) -> str:
+    """Contents of the files THIS task actually wrote (its evidence carries
+    a 'code:<path>' entry per written file). SA/BA reviewers must judge the
+    real code, not a filename tree."""
+    if not (ws_dir and evidence):
+        return ""
+    seen, blocks = set(), []
+    for m in re.finditer(r"code:([^;]+)", evidence):
+        rel = m.group(1).strip().replace("\\", "/")
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+        b = _read_capped(ws_dir, rel, per_file)
+        if b:
+            blocks.append(b)
+        if len(blocks) >= max_files:
+            break
+    if not blocks:
+        return ""
+    return ("\n\nFILES CHANGED BY THIS TASK (actual current content):\n"
+            + "\n".join(blocks))
+
+
+def _task_relevant_files(ws_dir: str, task: dict, exclude: set,
+                         max_files: int = 3, per_file: int = 3000) -> str:
+    """Existing source files whose path matches the task's own terminology,
+    included with real content: the dev integrates with the codebase
+    instead of guessing at it from a filename list."""
+    text = f"{task.get('title') or ''} {task.get('description') or ''}".lower()
+    words = re.findall(r"[a-z0-9]{4,}", text)
+    if not words or not ws_dir:
+        return ""
+    candidates = []
+    for root, dirs, files in os.walk(ws_dir):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        rel_dir = os.path.relpath(root, ws_dir).replace("\\", "/")
+        for f in files:
+            rel = f if rel_dir == "." else f"{rel_dir}/{f}"
+            if rel in exclude or not rel.endswith(_SRC_SUFFIXES):
+                continue
+            hay = rel.lower().replace("_", " ").replace(".", " ").replace("/", " ")
+            score = sum(hay.count(w) for w in words)
+            if score:
+                candidates.append((score, rel))
+    candidates.sort(key=lambda t: (-t[0], t[1]))
+    blocks = [b for b in (_read_capped(ws_dir, rel, per_file)
+                          for _, rel in candidates[:max_files]) if b]
+    if not blocks:
+        return ""
+    return ("\n\nRELATED EXISTING CODE (same terminology as the task — extend and "
+            "integrate with these files, never duplicate them):\n" + "\n".join(blocks))
 
 
 def _safe_rel_path(p: str) -> str | None:
@@ -677,8 +1197,42 @@ def _ordered_for_pin(chain: list, pinned_ref):
     return pinned + rest
 
 
+def _output_budget(task, project_id: str | None = None) -> int:
+    """Estimated max output tokens for one codegen call. Small/fix-up tasks
+    rarely need the full 8000-token envelope; a tight budget makes the
+    provider stream faster and bills less, while anything ambiguous keeps the
+    generous default so a file is never cut off mid-JSON. When the project
+    has a capped budget, the remaining headroom shrinks the envelope so a
+    nearly-spent project degrades to small replies instead of big ones."""
+    try:
+        points = int(task["points"] or 0)
+    except (KeyError, IndexError, TypeError, ValueError):
+        points = 0
+    if points and points <= 2:
+        cap = 4000
+    else:
+        cap = 8000
+        text = ""
+        for key in ("title", "description"):
+            try:
+                text += f" {task[key] or ''}"
+            except (KeyError, IndexError, TypeError):
+                pass
+        lowered = text.lower()
+        if points <= 3 and any(w in lowered for w in
+                               ("fix", "rename", "typo", "copy", "label",
+                                "config", "message", "text", "icon")):
+            cap = 4000
+    if project_id:
+        headroom = budget.headroom_usd(project_id)
+        if headroom is not None:
+            cap = min(cap, 1500 if headroom < 1 else 4000 if headroom < 5 else cap)
+    return cap
+
+
 def generate_implementation(project, task, agent_ref: str, feedback: str = "",
-                            pinned_ref: str | None = None) -> dict:
+                            pinned_ref: str | None = None,
+                            deadline: float | None = None) -> dict:
     """Generate real code files for a task into the project workspace.
 
     Returns {"files": [relative paths], "summary": str, "mode": "llm"|"scaffold",
@@ -692,6 +1246,10 @@ def generate_implementation(project, task, agent_ref: str, feedback: str = "",
     next. ``pinned_ref`` (the member that already worked earlier in the SAME
     task) is tried first so the chain isn't re-probed on every call —
     re-checking from the top happens only when a new task run starts.
+    ``deadline`` (time.monotonic() stamp) bounds the whole call: each HTTP
+    request is capped at the remaining budget and the chain stops trying new
+    members when it runs out, so the worker thread returns before the
+    runtime's hard phase-timeout backstop (which would strand it).
     Never raises: python LLM failures degrade to the deterministic scaffold;
     non-python stacks return an error so the rework loop reports honestly
     instead of bolting a FastAPI file onto a Go/.NET/Node project.
@@ -700,7 +1258,8 @@ def generate_implementation(project, task, agent_ref: str, feedback: str = "",
     stack = toolchains.detect_stack(project, ws_dir)
     result = {"files": [], "summary": "", "mode": "scaffold", "input_tokens": 0,
               "output_tokens": 0, "error": "", "pinned_ref": None,
-              "used_model_id": None, "used_provider_model_id": None, "fallbacks": []}
+              "used_model_id": None, "used_gateway_id": None,
+              "used_provider_model_id": None, "fallbacks": []}
     if not ws_dir or not os.path.isdir(ws_dir):
         result["error"] = "workspace missing"
         return result
@@ -719,9 +1278,25 @@ def generate_implementation(project, task, agent_ref: str, feedback: str = "",
 
     chain, role_name = _model_chain(project, agent_ref)
     if chain:
-        from .chatbot import _extract_json
-        system_prompt = (_JR_DEV_SYSTEM if stack == "python" and _is_junior_dev(role_name or agent_ref)
-                         else _system_for(stack))
+        # Resolve the agent's persona and role once, so both the
+        # stack-specific base system and the per-role overrides flow
+        # into the same LLM call.
+        agent_row = query_one(
+            "SELECT a.*, r.name AS role_name FROM agents a "
+            "JOIN roles r ON r.id = a.role_id "
+            "WHERE a.id = ? OR lower(a.name) = lower(?) LIMIT 1",
+            (agent_ref, agent_ref or ""),
+        )
+        persona = None
+        persona_id = None
+        role_id = None
+        if agent_row:
+            role_id = agent_row.get("role_id")
+            persona_id = agent_row.get("persona_id")
+        if persona_id:
+            persona = query_one("SELECT * FROM personas WHERE id = ?", (persona_id,)) or None
+        stack_token = stack or "python"
+        system_prompt = build_system_prompt(stack_token, persona, role_id)
         feedback_block = f"\n\nPREVIOUS ATTEMPT FEEDBACK (fix these issues):\n{feedback}\n" if feedback else ""
         main_py = os.path.join(ws_dir, "app", "main.py")
         main_block = "(app/main.py does not exist yet)"
@@ -741,11 +1316,13 @@ def generate_implementation(project, task, agent_ref: str, feedback: str = "",
                        f"EXISTING WORKSPACE FILES:\n{_existing_tree(ws_dir)}\n"
                        f"{helpers_block}\n"
                        f"CURRENT app/main.py:\n{main_block}"
-                       f"{_feedback_file_blocks(ws_dir, feedback)}\n\n"
+                       f"{_task_relevant_files(ws_dir, task, {'app/main.py', HELPERS_REL_PATH})}"
+                       f"{_feedback_file_blocks(ws_dir, feedback)}"
+                       f"{memory.pitfalls_block(project['id'])}\n\n"
                        "Implement this task now. Return the JSON object with complete file contents.")
 
         def _usable_files(text: str):
-            data = _extract_json(text)
+            data = _extract_object(text)
             files = []
             if data and isinstance(data.get("files"), list):
                 for f in data["files"]:
@@ -761,17 +1338,48 @@ def generate_implementation(project, task, agent_ref: str, feedback: str = "",
         for entry in _ordered_for_pin(chain, pinned_ref):
             gw, model = entry["gw"], entry["model"]
             model_label = model.get("provider_model_id") or model.get("display_name") or "?"
+            b_ok, b_reason = budget.may_spend(project["id"])
+            if not b_ok:
+                # Mid-run enforcement: self-fix cycles and chain fall-through
+                # bill against the in-flight ledger, so a run can stop the
+                # moment the project's cap is reached instead of after it.
+                result["fallbacks"].append({"model": model_label, "error": b_reason})
+                result["error"] = b_reason
+                break
+            max_out = _output_budget(task, project["id"])
+            call_timeout = 300
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining < 20:
+                    # Out of phase budget — record honestly and stop trying
+                    # members; the caller's evidence shows the exhaustion.
+                    result["fallbacks"].append(
+                        {"model": model_label, "error": "phase budget exhausted"})
+                    result["error"] = result["error"] or \
+                        "LLM phase budget exhausted before this member was tried"
+                    break
+                call_timeout = max(15, min(300, int(remaining) - 10))
             try:
-                resp = call_llm(gw, model, system_prompt, user_prompt, max_tokens=8000)
+                resp = call_llm(gw, model, system_prompt, user_prompt, max_tokens=max_out,
+                                trace_label=f"codegen-task-{str(task.get('id') if isinstance(task, dict) else task['id'])[:8]}",
+                                timeout=call_timeout)
+                _charge_llm_call(project, model, resp)
                 data, files = _usable_files(resp["text"])
                 if not files:
                     retry_prompt = (user_prompt + "\n\nIMPORTANT: your previous reply was not the "
                                     "required JSON object. Reply with ONLY the raw JSON object "
                                     '{"summary": ..., "files": [{"path": ..., "content": ...}]} '
                                     "starting with { and ending with }.")
-                    resp = call_llm(gw, model, system_prompt, retry_prompt, max_tokens=8000)
+                    resp = call_llm(gw, model, system_prompt, retry_prompt, max_tokens=max_out,
+                                    timeout=call_timeout)
+                    _charge_llm_call(project, model, resp)
                     data, files = _usable_files(resp["text"])
                 if files:
+                    size_error = _validate_generated_files(files)
+                    if size_error:
+                        result["error"] = size_error
+                        result["summary"] = f"failed: {size_error}"
+                        return result
                     for rel, content in files:
                         dest = os.path.join(ws_dir, rel.replace("/", os.sep))
                         os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -783,6 +1391,7 @@ def generate_implementation(project, task, agent_ref: str, feedback: str = "",
                                    "output_tokens": resp["output_tokens"],
                                    "pinned_ref": entry.get("ref"),
                                    "used_model_id": entry.get("model_id"),
+                                   "used_gateway_id": gw.get("id"),
                                    "used_provider_model_id": model.get("provider_model_id")})
                     if stack == "python":
                         toolchains.ensure_pyproject(ws_dir)
@@ -793,7 +1402,9 @@ def generate_implementation(project, task, agent_ref: str, feedback: str = "",
             except Exception as exc:
                 error = str(exc)[:200]
             # This member failed — record it as a fallback step and try the next.
-            result["fallbacks"].append({"model": model_label, "error": error[:160]})
+            result["fallbacks"].append({"model": model_label,
+                                         "gateway_id": gw.get("id"),
+                                         "error": error[:160]})
             result["error"] = error[:200]
         # Whole chain failed. A genuine outage (quota / rate limit / provider
         # down) must surface as a clear, non-retryable error and NOT fall
@@ -813,6 +1424,11 @@ def generate_implementation(project, task, agent_ref: str, feedback: str = "",
 
     # Deterministic runnable scaffold fallback (python only).
     files = _scaffold_files(project, task, feedback)
+    size_error = _validate_generated_files(files)
+    if size_error:
+        result["error"] = size_error
+        result["summary"] = f"failed: {size_error}"
+        return result
     for rel, content in files:
         dest = os.path.join(ws_dir, rel.replace("/", os.sep))
         os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -855,11 +1471,12 @@ def _scaffold_files(project, task, feedback: str) -> list[tuple[str, str]]:
 Auto-generated feature module for project '{project['name']}'.
 \"\"\"
 from fastapi import APIRouter, HTTPException
+from itertools import count
 
 router = APIRouter(prefix=\"/{slug}\")
 
 _ITEMS: dict[int, dict] = {{}}
-_NEXT = [1]
+_next_id = count(1)
 
 
 @router.get(\"/health\")
@@ -871,8 +1488,7 @@ def health():
 def create_item(payload: dict):
     if not isinstance(payload, dict) or not payload:
         raise HTTPException(status_code=422, detail=\"payload required\")
-    item_id = _NEXT[0]
-    _NEXT[0] += 1
+    item_id = next(_next_id)
     _ITEMS[item_id] = {{\"id\": item_id, **payload}}
     return _ITEMS[item_id]
 

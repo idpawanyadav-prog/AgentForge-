@@ -1,4 +1,5 @@
 import React from 'react';
+import { useAppStore } from './store';
 
 export function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
   return (
@@ -28,6 +29,7 @@ export function Badge({ kind, children }: { kind: string; children: React.ReactN
 }
 
 export function useAsyncData<T>(loader: () => Promise<T>, deps: any[] = []) {
+  const dataRevision = useAppStore((state) => state.dataRevision);
   const [data, setData] = React.useState<T | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);
@@ -39,7 +41,7 @@ export function useAsyncData<T>(loader: () => Promise<T>, deps: any[] = []) {
       .finally(() => setLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps);
-  React.useEffect(() => { reload(); }, [reload]);
+  React.useEffect(() => { reload(); }, [reload, dataRevision]);
   return { data, error, loading, reload, setData };
 }
 

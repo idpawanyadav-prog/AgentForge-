@@ -9,6 +9,7 @@ venv/
 *.db-wal
 *.db-shm
 *.db.corrupt.bak
+breaker_state.json
 
 # Windows reserved device-name artifact (zero-byte, never commit)
 NUL
@@ -36,3 +37,6 @@ Thumbs.db
 # Local runtime logs
 server*.log
 t1*.log
+
+# Prompt traces (DEBUG_PROMPTS=1) and local experiments
+backend/debug/

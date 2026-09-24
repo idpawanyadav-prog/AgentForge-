@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
+import os
 from collections import defaultdict, deque
 
 from fastapi import Request
@@ -28,6 +30,23 @@ _hits: dict[str, deque] = defaultdict(deque)
 _lock = threading.Lock()
 _last_prune = 0.0
 _PRUNE_INTERVAL_S = 60.0
+
+_redis = None
+if os.environ.get("RATE_LIMIT_REDIS_URL"):
+    try:
+        import redis
+        _redis = redis.Redis.from_url(os.environ["RATE_LIMIT_REDIS_URL"],
+                                      socket_connect_timeout=0.5, socket_timeout=0.5)
+    except (ImportError, ValueError):
+        _redis = None
+
+_REDIS_SLIDING_WINDOW = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1] - ARGV[2])
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then return 0 end
+redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])
+redis.call('EXPIRE', KEYS[1], math.ceil(ARGV[2]) + 1)
+return 1
+"""
 
 
 def _key(request: Request) -> str:
@@ -46,6 +65,18 @@ def _prune_all(now: float):
 
 
 def _allow(request: Request) -> bool:
+    global _redis
+    limit = (MUTATION_LIMIT
+             if request.method in ("POST", "PATCH", "PUT", "DELETE")
+             else DEFAULT_LIMIT)
+    if _redis is not None:
+        try:
+            return bool(_redis.eval(
+                _REDIS_SLIDING_WINDOW, 1, f"agentforge:rate:{_key(request)}",
+                time.time(), WINDOW_S, limit, uuid.uuid4().hex))
+        except Exception:
+            # An unavailable Redis server must not take down the local API.
+            _redis = None
     now = time.monotonic()
     with _lock:
         global _last_prune
@@ -56,9 +87,6 @@ def _allow(request: Request) -> bool:
         dq = _hits[key]
         while dq and dq[0] <= now - WINDOW_S:
             dq.popleft()
-        limit = (MUTATION_LIMIT
-                 if request.method in ("POST", "PATCH", "PUT", "DELETE")
-                 else DEFAULT_LIMIT)
         if len(dq) >= limit:
             return False
         dq.append(now)

@@ -1,0 +1,27 @@
+{
+  "name": "Frontend component",
+  "about": "Build a React component/page wired to a REST endpoint.",
+  "title": "Build {component} UI",
+  "description": "Implement the {component} component in the React frontend.\nFetch data from {endpoint} with loading/error/empty states.\nKeep the component under 200 lines; extract hooks if it grows.",
+  "acceptance_criteria": "Given the app is running with data in {endpoint}\nWhen the user opens {route}\nThen {component} renders the data\nAnd loading, error and empty states are handled\nAnd npm run build succeeds with no TypeScript errors",
+  "story_points": 3,
+  "priority": 2,
+  "suggested_role": "Senior Developer",
+  "variables": [
+    {
+      "name": "component",
+      "label": "Component name",
+      "example": "ChatWidget"
+    },
+    {
+      "name": "endpoint",
+      "label": "API endpoint",
+      "example": "/api/v1/conversations"
+    },
+    {
+      "name": "route",
+      "label": "Page route",
+      "example": "/projects"
+    }
+  ]
+}

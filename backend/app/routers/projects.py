@@ -7,17 +7,12 @@ from typing import Optional
 from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel
 
-from .. import sprint_gate, workspace
-from ..db import audit, execute, insert, new_id, now, query, query_one, run_idempotent, update
+from .. import governance, sprint_gate, workspace
+from ..db import audit, emit_event, execute, insert, new_id, now, query, query_one, run_idempotent, update
 from ..schemas import BacklogUpdate, ProjectUpdate, SprintUpdate, TaskUpdate
+from ._util import or_404 as _or_404
 
 router = APIRouter(prefix="/api/v1", tags=["projects"])
-
-
-def _or_404(row, what="Resource"):
-    if row is None:
-        raise HTTPException(404, f"{what} not found")
-    return row
 
 
 class ProjectIn(BaseModel):
@@ -85,8 +80,7 @@ def create_project(body: ProjectIn, idempotency_key: Optional[str] = Header(None
                             "status": "Active", "created_at": ts, "updated_at": ts})
         project = query_one("SELECT * FROM projects WHERE id = ?", (pid,))
         ws = workspace.prepare_workspace(project)
-        _emit = __import__("app.db", fromlist=["emit_event"]).emit_event
-        _seq = _emit(pid, "project.workspace_ready", {
+        _seq = emit_event(pid, "project.workspace_ready", {
             "workspace_path": ws["workspace_path"], "cloned": ws["cloned"],
             "git_init": ws["git_init"], "note": ws["note"],
             "source": "git-clone" if ws["cloned"] else "local-projects-folder",
@@ -111,7 +105,13 @@ def update_project(pid: str, body: ProjectUpdate):
                                                       "repository_url", "workspace_path",
                                                       "default_gateway_id", "default_model_id",
                                                       "team_id", "status", "po_enabled",
-                                                      "sa_review_enabled", "ba_review_enabled")}
+                                                      "sa_review_enabled", "ba_review_enabled",
+                                                      "governance_enabled", "budget_usd")}
+    if "budget_usd" in allowed:
+        try:
+            allowed["budget_usd"] = max(0.0, float(allowed["budget_usd"] or 0))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "budget_usd must be a number")
     gateway_id = allowed.get("default_gateway_id")
     if gateway_id is None and "default_model_id" in allowed:
         current = query_one("SELECT default_gateway_id FROM projects WHERE id=?", (pid,))
@@ -134,27 +134,42 @@ def update_project(pid: str, body: ProjectUpdate):
             allowed[flag] = 1 if allowed[flag] else 0
     allowed["updated_at"] = now()
     update("projects", pid, allowed)
-    _db = __import__("app.db", fromlist=["emit_event"])
-    emit = _db.emit_event(pid, "project.updated", {"note": "Project configuration updated"})
+    emit = emit_event(pid, "project.updated", {"note": "Project configuration updated"})
     return {**query_one("SELECT * FROM projects WHERE id = ?", (pid,)), "_seq": emit}
+
+
+# Every V3 governance/memory table (migration 009) carries a NOT NULL FK to
+# projects — delete_project must clear them all or deleting any executed
+# project fails with an unhandled FOREIGN KEY 500.
+_PROJECT_GOV_TABLES = (
+    "project_requirements", "project_baselines", "architecture_decisions",
+    "interface_contracts", "file_contracts", "file_ownership", "component_registry",
+    "dependency_requests", "task_reviews", "project_memory", "memory_checkpoints",
+    "agent_messages", "change_requests", "context_cache",
+)
 
 
 @router.delete("/projects/{pid}")
 def delete_project(pid: str):
-    for tbl, col in (("task_dependencies", ""), ("tasks", "project_id"),
-                     ("sprint_gate_executions", "sprint"), ("sprint_acceptance_criteria", "sprint"),
-                     ("sprints", "project_id"),
-                     ("backlog_items", "project_id"), ("messages", ""), ("conversations", "project_id"),
-                     ("execution_events", "project_id")):
-        if tbl == "task_dependencies":
-            execute("DELETE FROM task_dependencies WHERE task_id IN (SELECT id FROM tasks WHERE project_id=?) "
-                    "OR depends_on_task_id IN (SELECT id FROM tasks WHERE project_id=?)", (pid, pid))
-        elif tbl == "messages":
-            execute("DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE project_id=?)", (pid,))
-        elif tbl in ("sprint_gate_executions", "sprint_acceptance_criteria"):
-            execute(f"DELETE FROM {tbl} WHERE sprint_id IN (SELECT id FROM sprints WHERE project_id=?)", (pid,))
-        else:
-            execute(f"DELETE FROM {tbl} WHERE {col} = ?", (pid,))
+    for tbl in _PROJECT_GOV_TABLES:
+        execute(f"DELETE FROM {tbl} WHERE project_id = ?", (pid,))
+    # usage_records has no FK but joins through workflow_runs — clear it too so
+    # deleted projects can't leave orphan token/cost rows behind.
+    execute("DELETE FROM usage_records WHERE workflow_run_id IN "
+            "(SELECT id FROM workflow_runs WHERE project_id=?)", (pid,))
+    execute("DELETE FROM workflow_runs WHERE project_id = ?", (pid,))
+    execute("DELETE FROM task_requirements WHERE task_id IN "
+            "(SELECT id FROM tasks WHERE project_id=?)", (pid,))
+    execute("DELETE FROM task_dependencies WHERE task_id IN (SELECT id FROM tasks WHERE project_id=?) "
+            "OR depends_on_task_id IN (SELECT id FROM tasks WHERE project_id=?)", (pid, pid))
+    execute("DELETE FROM tasks WHERE project_id = ?", (pid,))
+    execute("DELETE FROM sprint_gate_executions WHERE sprint_id IN (SELECT id FROM sprints WHERE project_id=?)", (pid,))
+    execute("DELETE FROM sprint_acceptance_criteria WHERE sprint_id IN (SELECT id FROM sprints WHERE project_id=?)", (pid,))
+    execute("DELETE FROM sprints WHERE project_id = ?", (pid,))
+    execute("DELETE FROM backlog_items WHERE project_id = ?", (pid,))
+    execute("DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE project_id=?)", (pid,))
+    execute("DELETE FROM conversations WHERE project_id = ?", (pid,))
+    execute("DELETE FROM execution_events WHERE project_id = ?", (pid,))
     execute("DELETE FROM projects WHERE id=?", (pid,))
     audit("delete_project", "project", pid, "Deleted project")
     return {"ok": True}
@@ -277,6 +292,9 @@ def activate_sprint(pid: str, sid: str):
                                  f"({active['status']}) — complete or cancel it first")
     if sprint["status"] == sprint_gate.COMPLETED:
         raise HTTPException(409, "Sprint is already completed")
+    g_ok, g_reason = governance.may_execute(pid)
+    if not g_ok:
+        raise HTTPException(409, g_reason)
     from ..services.sprints import transition_sprint
     ok, err = transition_sprint(sid, sprint_gate.ACTIVE,
                                 "Activated via API", executed_by="user")

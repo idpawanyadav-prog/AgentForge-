@@ -18,6 +18,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -116,11 +117,12 @@ def _static_index(ws: str) -> str | None:
 
 
 class _App:
-    def __init__(self, proc, base_url, kind, entry):
+    def __init__(self, proc, base_url, kind, entry, boot_log=None):
         self.proc = proc
         self.base_url = base_url
         self.kind = kind      # "fastapi" | "static"
         self.entry = entry
+        self.boot_log = boot_log  # (file_handle, path) or None
 
     def stop(self):
         try:
@@ -132,18 +134,44 @@ class _App:
                     self.proc.kill()
         except Exception:
             pass
+        self._close_boot_log()
+
+    def _close_boot_log(self):
+        if self.boot_log:
+            fh, path = self.boot_log
+            try:
+                fh.close()
+            except OSError:
+                pass
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            self.boot_log = None
 
 
-def _spawn_boot(ws: str, port: int, env: dict) -> subprocess.Popen:
+def _spawn_boot(ws: str, port: int, env: dict) -> tuple[subprocess.Popen, tuple]:
+    """Boot the generated app with console output sent to a log FILE. An
+    undrained PIPE deadlocks a chatty app as soon as the OS buffer fills —
+    the app then hangs mid-request and the smoke run stalls until its boot
+    timeout fires."""
     entry = _python_entry(ws)
     script = _PY_BOOT.format(ws=ws, entries=entry[0], port=port)
-    return subprocess.Popen([sys.executable, "-c", script], cwd=ws, env=env,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    fd, path = tempfile.mkstemp(prefix="af-boot-", suffix=".log")
+    fh = os.fdopen(fd, "w", encoding="utf-8", errors="replace")
+    proc = subprocess.Popen([sys.executable, "-c", script], cwd=ws, env=env,
+                            stdout=fh, stderr=subprocess.STDOUT, text=True)
+    return proc, (fh, path)
 
 
-def _boot_failure_tail(proc) -> str:
+def _boot_failure_tail(proc, boot_log=None) -> str:
+    out = ""
     try:
-        out = (proc.stdout.read() if proc.stdout else "") or ""
+        if boot_log:
+            with open(boot_log[1], encoding="utf-8", errors="replace") as fh:
+                out = fh.read()
+        elif proc.stdout:
+            out = proc.stdout.read() or ""
     except Exception:
         out = ""
     lines = [l for l in out.strip().splitlines() if l.strip()]
@@ -165,7 +193,7 @@ def _wait_boot(app: "_App", kind: str) -> bool:
     return False
 
 
-def launch_app(project) -> tuple[_App | None, str]:
+def launch_app(project, _port_attempt: int = 0) -> tuple[_App | None, str]:
     """Start the generated app on a private port. (app, '') on success or
     (None, reason) when no runnable web entry exists / boot fails."""
     ws = project["workspace_path"]
@@ -177,8 +205,9 @@ def launch_app(project) -> tuple[_App | None, str]:
            **toolchains._lib_env(ws), "PYTHONUNBUFFERED": "1"}
     env.pop("AGENT_OFFICE_DB", None)  # generated app must never touch our DB
 
+    boot_log = None
     if stack == "python" and _python_entry(ws):
-        proc = _spawn_boot(ws, port, env)
+        proc, boot_log = _spawn_boot(ws, port, env)
         kind, desc = "fastapi", _python_entry(ws)[1]
     elif _static_index(ws):
         rel = _static_index(ws)
@@ -192,10 +221,11 @@ def launch_app(project) -> tuple[_App | None, str]:
     else:
         return None, "no runnable web entry detected"
 
-    app = _App(proc, f"http://127.0.0.1:{port}", kind, desc)
+    app = _App(proc, f"http://127.0.0.1:{port}", kind, desc, boot_log=boot_log)
     if _wait_boot(app, kind):
         return app, ""
-    why = "app exited on boot: " + _boot_failure_tail(proc) if proc.poll() is not None else \
+    why = "app exited on boot: " + _boot_failure_tail(proc, boot_log) \
+        if proc.poll() is not None else \
         f"app did not answer within {BOOT_TIMEOUT_S}s"
     # Self-heal obvious implicit deps: FastAPI Form usage asks for
     # python-multipart by name at import time; source imports are already
@@ -209,12 +239,24 @@ def launch_app(project) -> tuple[_App | None, str]:
             env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
                    **toolchains._lib_env(ws), "PYTHONUNBUFFERED": "1"}
             env.pop("AGENT_OFFICE_DB", None)
-            proc = _spawn_boot(ws, port, env)
+            app._close_boot_log()
+            proc, boot_log = _spawn_boot(ws, port, env)
             app.proc = proc
+            app.boot_log = boot_log
             if _wait_boot(app, kind):
                 return app, ""
-            why = "app exited on boot: " + _boot_failure_tail(proc)
+            why = "app exited on boot: " + _boot_failure_tail(proc, boot_log)
+    # The ephemeral port is released by _free_port before the child binds.
+    # Another process can claim it in that gap; retry with a fresh port when
+    # the child reports a bind collision or another server answers there.
+    collision = (proc.poll() is not None and (
+        "address already in use" in why.lower()
+        or "winerror 10048" in why.lower()
+        or _http_status(app.base_url + "/", timeout=0.5) != 0
+    ))
     app.stop()
+    if collision and _port_attempt < 2:
+        return launch_app(project, _port_attempt + 1)
     return None, why
 
 

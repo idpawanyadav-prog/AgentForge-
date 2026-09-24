@@ -18,7 +18,10 @@ sys.path.insert(0, HERE)
 os.environ.setdefault("AGENT_OFFICE_WORKSPACES",
                       os.path.join(os.path.expanduser("~"), ".verdent", "agentforge-projects"))
 
-handlers = [logging.FileHandler(os.path.join(os.path.dirname(HERE), "server.log"))]
+from logging.handlers import RotatingFileHandler
+
+handlers = [RotatingFileHandler(os.path.join(os.path.dirname(HERE), "server.log"),
+                                maxBytes=10_485_760, backupCount=5)]
 if sys.stderr is not None:
     handlers.append(logging.StreamHandler(sys.stderr))
 logging.basicConfig(

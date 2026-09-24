@@ -1,20 +1,10 @@
 import json
-import os
-import sys
-import tempfile
 import urllib.error
-
-_DB = os.path.join(tempfile.mkdtemp(prefix="af_health_"), "test.db")
-os.environ["AGENT_OFFICE_DB"] = _DB
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest  # noqa: E402
 
 from app import db as appdb  # noqa: E402
 from app.llm import health  # noqa: E402
-
-appdb.init_db()
-
 
 class _Resp:
     def __init__(self, payload):

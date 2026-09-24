@@ -60,6 +60,8 @@ class ProjectUpdate(BaseModel):
     po_enabled: Optional[bool] = None
     sa_review_enabled: Optional[bool] = None
     ba_review_enabled: Optional[bool] = None
+    budget_usd: Optional[float] = None
+    governance_enabled: Optional[bool] = None
 
 
 class SprintUpdate(BaseModel):

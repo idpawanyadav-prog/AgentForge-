@@ -11,11 +11,12 @@ import json
 import logging
 import random
 import re
+import sqlite3
 import threading
 import time
 
-from . import db, workspace, codegen, toolchains, po, sprint_gate, browser_test
-from . import config
+from . import db, workspace, codegen, toolchains, po, sprint_gate, browser_test, memory
+from . import config, governance, budget
 from .db import emit_event, execute, insert, now, new_id, query_one, query, update, audit
 from .task_registry import background_tasks
 
@@ -28,17 +29,22 @@ _registry_lock = threading.Lock()
 # project_id -> {"task": asyncio.Task, "cancelled": bool}
 _schedulers: dict = {}
 _schedulers_lock = threading.Lock()
+# Serializes the check-then-insert claim in start_execution: the scheduler
+# thread, chatbot commands and the REST API can otherwise both see "no
+# active run" and double-claim the same task/agent.
+_claim_lock = threading.Lock()
 
 # Background fire-and-forget coroutines are tracked centrally by
 # app.task_registry (see _spawn below); _loop is kept for the stop path's
 # call_soon_threadsafe cancellation.
 
-TASK_STATUSES = ["Todo", "Ready", "In Progress", "Blocked", "Review", "Testing", "Done", "Cancelled"]
+TASK_STATUSES = ["Todo", "Ready", "In Progress", "Blocked", "Review", "Testing",
+                 "Waiting QA", "SA Review", "BA Review", "Rework", "Done", "Cancelled"]
 AGENT_STATES = ["Idle", "Working", "Waiting", "Blocked", "Failed", "Paused", "Completed"]
 
-# Track last-seen LLM health to avoid retrying against a dead provider.
-_llm_healthy = True
-_llm_failure_count = 0
+# Track provider health per gateway; a failure in one project must not
+# degrade another project's independent gateway.
+_gateway_health: dict[str, dict[str, int | bool]] = {}
 _LLM_HEALTH_THRESHOLD = 3  # consecutive failures -> mark unhealthy
 _llm_health_lock = threading.Lock()
 
@@ -121,16 +127,6 @@ _REVIEW_STAGES = {
 
 _RUN_MODE_LABEL = {"dev": "", "qa": "QA: ", "sa": "SA review: ", "ba": "BA review: "}
 
-# Defect summaries QA may find (simulated verdicts).
-_QA_ISSUES = [
-    "API returns 500 when city lookup has no results",
-    "temperature unit toggle does not persist after reload",
-    "forecast cache never invalidates between cities",
-    "wind direction shows NaN for some stations",
-    "layout overflows on narrow screens",
-    "hourly forecast skips the midnight slot",
-]
-
 # After this many QA rejections the task is escalated to a human.
 MAX_REWORK_CYCLES = config.MAX_REWORK_CYCLES
 
@@ -147,6 +143,37 @@ PHASE_TIMEOUT_S = config.PHASE_TIMEOUT_S
 
 def _emit(project_id, event_type, payload, **kw):
     return emit_event(project_id, event_type, payload, **kw)
+
+
+async def _wait_bounded(coro, seconds: float, label: str):
+    """Hard backstop for a blocking to_thread step. Worker threads cannot be
+    killed, so codegen/review calls ALSO get a deadline argument to wind down
+    on their own; this fires only if a thread wedges (hung subprocess, stuck
+    pipe) — the run then fails visibly (task -> Blocked with a clear reason)
+    instead of hanging the sprint forever. PHASE_TIMEOUT_S was defined for
+    exactly this and previously applied nowhere."""
+    try:
+        return await asyncio.wait_for(coro, timeout=seconds)
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"{label} exceeded its {seconds:.0f}s phase budget (PHASE_TIMEOUT_S)")
+
+
+async def _codegen_impl(project, task, agent_id, feedback, pinned_ref):
+    deadline = time.monotonic() + PHASE_TIMEOUT_S
+    return await _wait_bounded(
+        asyncio.to_thread(codegen.generate_implementation, project, task,
+                          agent_id, feedback, pinned_ref=pinned_ref,
+                          deadline=deadline),
+        PHASE_TIMEOUT_S + 60, "Codegen")
+
+
+async def _browser_smoke(project):
+    # run_smoke self-limits (TOTAL_BUDGET_S + boot + lock waits); this is the
+    # deadlock backstop so a wedged app/browser can never hang the run.
+    return await _wait_bounded(
+        asyncio.to_thread(browser_test.run_smoke, project),
+        browser_test.TOTAL_BUDGET_S * 2 + 180, "Browser smoke")
 
 
 def _set_agent(agent_id, state, activity="", task_id=None, project_id=None):
@@ -177,31 +204,27 @@ def active_run_for_agent(agent_id):
         (agent_id,))
 
 
-def mark_llm_healthy():
-    global _llm_healthy, _llm_failure_count
+def mark_llm_healthy(gateway_id: str):
     with _llm_health_lock:
-        _llm_failure_count = 0
-        _llm_healthy = True
+        _gateway_health[gateway_id] = {"healthy": True, "consecutive_failures": 0}
 
 
-def mark_llm_failed():
-    global _llm_healthy, _llm_failure_count
+def mark_llm_failed(gateway_id: str):
     with _llm_health_lock:
-        _llm_failure_count += 1
-        if _llm_failure_count >= _LLM_HEALTH_THRESHOLD:
-            _llm_healthy = False
+        health = _gateway_health.setdefault(
+            gateway_id, {"healthy": True, "consecutive_failures": 0})
+        health["consecutive_failures"] += 1
+        if health["consecutive_failures"] >= _LLM_HEALTH_THRESHOLD:
+            health["healthy"] = False
 
-def is_llm_healthy() -> bool:
+def is_llm_healthy(gateway_id: str) -> bool:
     with _llm_health_lock:
-        return _llm_healthy
+        return bool(_gateway_health.get(gateway_id, {}).get("healthy", True))
 
 
-def reset_llm_health():
+def reset_llm_health(gateway_id: str):
     """Call when the provider may have recovered (e.g. after a delay)."""
-    global _llm_healthy
-    with _llm_health_lock:
-        _llm_healthy = True
-        _llm_failure_count = 0
+    mark_llm_healthy(gateway_id)
 
 
 def dependencies_satisfied(task_id) -> tuple[bool, list]:
@@ -239,10 +262,39 @@ _MODE_BY_STATUS = {"Waiting QA": "qa", "SA Review": "sa", "BA Review": "ba"}
 
 
 def start_execution(project_id: str, task_id: str, idempotency_key: str | None = None):
+    # The eligibility checks below are check-then-act; holding _claim_lock
+    # from validation through the run-row insert makes the claim atomic, so
+    # concurrent scheduler/API/chatbot callers can't both start a run for
+    # the same task or agent.
+    with _claim_lock:
+        return _start_execution_locked(project_id, task_id, idempotency_key)
+
+
+def _start_execution_locked(project_id: str, task_id: str,
+                            idempotency_key: str | None = None):
+    if idempotency_key:
+        existing = query_one(
+            "SELECT * FROM workflow_runs WHERE idempotency_key = ?", (idempotency_key,))
+        if existing:
+            if existing["project_id"] != project_id or existing["task_id"] != task_id:
+                return {"error": "Idempotency key was already used for another execution"}
+            return {"run": existing, "idempotent_replay": True}
+
     task = query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    if task and task["project_id"] != project_id:
+        return {"error": "Task does not belong to project"}
     ok, reason = validate_task_ready(task)
     if not ok:
         return {"error": reason}
+    # V3 Step 1 lifecycle gate (opt-in per project): with governance on,
+    # no task may run outside a development-permitting lifecycle state.
+    g_ok, g_reason = governance.may_execute(project_id)
+    if not g_ok:
+        return {"error": f"TASK_BLOCKED_BY_LIFECYCLE: {g_reason}"}
+    # Per-project LLM cost budget (AGENT_DEV_SPEEDUP 3.3). 0 = unlimited.
+    b_ok, b_reason = budget.may_spend(project_id)
+    if not b_ok:
+        return {"error": f"TASK_BLOCKED_BY_BUDGET: {b_reason}"}
 
     # Sprint Gatekeeper (spec §11): backend validates sprint eligibility at
     # claim time — tasks of locked/future sprints are rejected outright.
@@ -252,12 +304,6 @@ def start_execution(project_id: str, task_id: str, idempotency_key: str | None =
               {"task_id": task_id, "task": task["title"] if task else task_id,
                "reason": auth["reason"]}, task_id=task_id)
         return {"error": f"TASK_BLOCKED_BY_SPRINT_GATE: {auth['reason']}"}
-
-    if idempotency_key:
-        existing = query_one(
-            "SELECT * FROM workflow_runs WHERE idempotency_key = ?", (idempotency_key,))
-        if existing:
-            return {"run": existing, "idempotent_replay": True}
 
     agent = query_one("SELECT a.*, r.name AS role_name FROM agents a JOIN roles r ON r.id = a.role_id WHERE a.id = ?",
                       (task["assigned_agent_id"],))
@@ -286,12 +332,19 @@ def start_execution(project_id: str, task_id: str, idempotency_key: str | None =
     mode = _run_mode(task)
     review_mode = mode in ("sa", "ba")
     run_id = new_id()
-    insert("workflow_runs", {
-        "id": run_id, "project_id": project_id, "task_id": task_id,
-        "agent_id": agent["id"], "status": "Running", "mode": mode,
-        "current_step": _PHASES_BY_MODE[mode][0][0], "started_at": now(),
-        "idempotency_key": idempotency_key,
-    })
+    try:
+        insert("workflow_runs", {
+            "id": run_id, "project_id": project_id, "task_id": task_id,
+            "agent_id": agent["id"], "status": "Running", "mode": mode,
+            "current_step": _PHASES_BY_MODE[mode][0][0], "started_at": now(),
+            "idempotency_key": idempotency_key,
+        })
+    except sqlite3.IntegrityError:
+        existing = query_one("SELECT * FROM workflow_runs WHERE idempotency_key = ?",
+                             (idempotency_key,))
+        if existing and existing["project_id"] == project_id and existing["task_id"] == task_id:
+            return {"run": existing, "idempotent_replay": True}
+        return {"error": "Idempotency key was already used for another execution"}
     if review_mode:
         # Waiting-review statuses stand on their own; only refresh progress.
         update("tasks", task_id, {"progress": 88, "updated_at": now()})
@@ -345,9 +398,12 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
     # on-going work. Changed files merge back (per-file leases) when the run
     # finishes; cancelled/failed runs discard their copy.
     run_ws, ws_manifest = "", {}
+    merge_error = ""
+    isolation_failed = False
     if mode in ("dev", "qa"):
         run_ws, ws_manifest = await asyncio.to_thread(
             workspace.begin_run_workspace, project_id, run_id)
+        isolation_failed = bool(workspace.get_workspace(project_id) and not run_ws)
         if run_ws:
             project = dict(project, workspace_path=run_ws)
             _emit(project_id, "workspace.run_isolated",
@@ -360,6 +416,12 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
         model is pinned per task). A new task run resets it, so the chain is
         only re-checked from the top when the agent moves on or the sprint
         restarts. Emits a fallback event whenever the agent had to switch."""
+        for fallback in gen.get("fallbacks") or []:
+            gateway_id = fallback.get("gateway_id")
+            if gateway_id and codegen.is_llm_outage(fallback.get("error") or ""):
+                mark_llm_failed(gateway_id)
+        if gen.get("used_gateway_id"):
+            mark_llm_healthy(gen["used_gateway_id"])
         used_ref = gen.get("pinned_ref")
         if used_ref and ctrl.get("pinned_ref") != used_ref:
             ctrl["pinned_ref"] = used_ref
@@ -395,7 +457,7 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
     # failures introduced by the work count.
     baseline_failures = None
     try:
-        if toolchains.detect_stack(project, project["workspace_path"]) == "python":
+        if not isolation_failed and toolchains.detect_stack(project, project["workspace_path"]) == "python":
             baseline_failures = await asyncio.to_thread(
                 toolchains.failing_tests, "python", project["workspace_path"],
                 health_scope)
@@ -403,6 +465,8 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
         logger.debug("baseline test detection failed for run %s; continuing without it", run_id, exc_info=True)
         baseline_failures = None
     try:
+        if isolation_failed:
+            raise RuntimeError("Isolated workspace copy failed; live files were not modified")
         for step, activity, tools, next_status, progress in phases:
             if ctrl["cancelled"]:
                 raise asyncio.CancelledError()
@@ -426,9 +490,8 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
                     # scaffold otherwise) written into the project workspace.
                     # rework_count > 0 means a previous attempt failed QA.
                     feedback = task["blocked_reason"] if task["rework_count"] else ""
-                    gen = await asyncio.to_thread(
-                        codegen.generate_implementation, project, task, run["agent_id"], feedback,
-                        pinned_ref=ctrl.get("pinned_ref"))
+                    gen = await _codegen_impl(project, task, run["agent_id"], feedback,
+                                              ctrl.get("pinned_ref"))
                     _record_model(gen)
                     llm_tokens["in"] += gen["input_tokens"]
                     llm_tokens["out"] += gen["output_tokens"]
@@ -487,12 +550,11 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
                                    "activity": f"Self-fix {attempt}/{SELF_FIX_ATTEMPTS}: "
                                                f"{build_summary[:110]}"},
                                   workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
-                            gen = await asyncio.to_thread(
-                                codegen.generate_implementation, project, task,
-                                run["agent_id"],
+                            gen = await _codegen_impl(
+                                project, task, run["agent_id"],
                                 f"Your code FAILED the build check: {build_summary}\n"
                                 "Return the corrected complete file(s).",
-                                pinned_ref=ctrl.get("pinned_ref"))
+                                ctrl.get("pinned_ref"))
                             _record_model(gen)
                             if gen.get("error") and codegen.is_llm_outage(gen["error"]):
                                 bok = False
@@ -526,12 +588,11 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
                                        "activity": f"Self-fix {attempt}/{SELF_FIX_ATTEMPTS}: "
                                                    f"{test_summary[:110]}"},
                                       workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
-                                gen = await asyncio.to_thread(
-                                    codegen.generate_implementation, project, task,
-                                    run["agent_id"],
+                                gen = await _codegen_impl(
+                                    project, task, run["agent_id"],
                                     f"Your code FAILED the test suite: {test_summary}\n"
                                     "Return the corrected complete file(s).",
-                                    pinned_ref=ctrl.get("pinned_ref"))
+                                    ctrl.get("pinned_ref"))
                                 _record_model(gen)
                                 if gen.get("error") and codegen.is_llm_outage(gen["error"]):
                                     ok = False
@@ -570,7 +631,7 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
                     # Playwright SKIPS (never a fake pass/fail); a real
                     # failure triggers the dev self-fix loop like build and
                     # unit-test failures do.
-                    res = await asyncio.to_thread(browser_test.run_smoke, project)
+                    res = await _browser_smoke(project)
                     if res["status"] == "failed" and mode == "dev":
                         for attempt in range(1, SELF_FIX_ATTEMPTS + 1):
                             _emit(project_id, "agent.activity",
@@ -578,23 +639,22 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
                                    "activity": f"Self-fix {attempt}/{SELF_FIX_ATTEMPTS} (browser): "
                                                f"{res['summary'][:110]}"},
                                   workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
-                            gen = await asyncio.to_thread(
-                                codegen.generate_implementation, project, task,
-                                run["agent_id"],
+                            gen = await _codegen_impl(
+                                project, task, run["agent_id"],
                                 f"Your app FAILED the browser smoke test: {res['summary']}\n"
                                 "The app was launched and visited with a real headless "
                                 "browser: pages must render content without uncaught JS "
                                 "errors, internal links must resolve, form submits must "
                                 "not return server errors.\n"
                                 "Return the corrected complete file(s).",
-                                pinned_ref=ctrl.get("pinned_ref"))
+                                ctrl.get("pinned_ref"))
                             _record_model(gen)
                             if gen.get("error") and codegen.is_llm_outage(gen["error"]):
                                 break  # LLM down — retrying just burns quota
                             commit = None if run_ws else workspace.commit_all(project_id)
                             if commit:
                                 evidence.append("commit:" + commit)
-                            res = await asyncio.to_thread(browser_test.run_smoke, project)
+                            res = await _browser_smoke(project)
                             if res["status"] != "failed" or ctrl["cancelled"]:
                                 break
                     ctrl["browser"] = res
@@ -616,8 +676,11 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
                 if review_mode and tool == "code-review":
                     # The gate's LLM verdict, computed once per review run;
                     # _finish_review_run routes the task from ctrl["review"].
-                    verdict = await asyncio.to_thread(
-                        codegen.review_verdict, project, task, mode)
+                    verdict = await _wait_bounded(
+                        asyncio.to_thread(codegen.review_verdict, project, task, mode,
+                                          agent_ref=agent_id,
+                                          deadline=time.monotonic() + PHASE_TIMEOUT_S),
+                        PHASE_TIMEOUT_S + 60, "Review verdict")
                     ctrl["review"] = verdict
                     llm_tokens["in"] += verdict["input_tokens"]
                     llm_tokens["out"] += verdict["output_tokens"]
@@ -636,6 +699,13 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
                        "result": "ok"},
                       workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
 
+            if mode == "dev" and next_status == "Done":
+                # Never write Done from the loop: the code still lives in
+                # the private run copy until merge_back below. Final routing
+                # (gates / QA / Done) happens in _finish_dev_run AFTER the
+                # merge, so success always means the code reached the live
+                # workspace.
+                continue
             if next_status != task["status"] or progress:
                 update("tasks", task_id, {"status": next_status, "progress": progress,
                                           "updated_at": now()})
@@ -669,6 +739,7 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
                                "previous state committed before overwrite"},
                       workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
             if merged["error"]:
+                merge_error = merged["error"]
                 evidence.append("merge-error:" + merged["error"][:140])
 
         # Re-fetch task at this point — rework/fix cycles may have changed
@@ -705,6 +776,9 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
                   {"run_id": run_id, "input_tokens": in_tokens,
                    "output_tokens": out_tokens, "cost_usd": cost},
                   workflow_run_id=run_id, agent_id=agent_id)
+        # This run's cost is now in usage_records — drop its in-flight
+        # estimate so it isn't double-counted against the project budget.
+        budget.clear_inflight(project_id)
 
         if mode == "qa":
             await _finish_qa_run(run_id, ctrl, project_id, task_id, agent_id, task,
@@ -720,7 +794,8 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
                                               (selftest_reason or test_summary))
         else:
             await _finish_dev_run(run_id, ctrl, project_id, task_id, agent_id, task,
-                                  evidence, in_tokens, out_tokens, cost, test_summary)
+                                  evidence, in_tokens, out_tokens, cost, test_summary,
+                                  merge_error)
     except asyncio.CancelledError:
         update("workflow_runs", run_id, {"status": "Cancelled", "completed_at": now()})
         update("tasks", task_id, {"status": "Blocked", "blocked_reason": "Cancelled by operator",
@@ -810,19 +885,6 @@ async def _finish_dev_selftest_failed(run_id, project_id, task_id, agent_id, tas
         _spawn(_po_review())
 
 
-def _create_module_health_tasks(project_id: str, sprint_id: str, failing: set) -> int:
-    """Superseded by sprint_gate module rework tasks — kept as a thin alias
-    so any external callers keep working."""
-    project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
-    specs = sprint_gate._module_rework_specs(project, failing)
-    created = 0
-    for spec in specs:
-        if sprint_gate._insert_rework_task(project_id, sprint_id,
-                                           spec["title"], spec["description"]):
-            created += 1
-    return created
-
-
 def _request_review(project_id, task, stage, dev_agent_id, evidence_str):
     """Open a review gate for a task: assign a reviewer from the stage's
     role family and create a pending task_reviews record. Returns the
@@ -875,11 +937,52 @@ def _qa_handoff(project_id, task, dev_agent_id, evidence_str):
 
 
 async def _finish_dev_run(run_id, ctrl, project_id, task_id, agent_id, task,
-                          evidence, in_tokens, out_tokens, cost, test_summary=""):
+                          evidence, in_tokens, out_tokens, cost, test_summary="",
+                          merge_error=""):
     """Dev run finished building: route through the enabled SA/BA review
     gates, then hand off to QA ('Waiting QA'); when nothing downstream
-    exists (no reviewers, no QA), mark the task Done directly."""
+    exists (no reviewers, no QA), mark the task Done directly. A failed
+    merge-back means the code never reached the live workspace — that is
+    blocked territory, never a gate handoff or Done."""
     evidence_str = "; ".join(evidence) if evidence else "dev complete"
+    if merge_error:
+        reason = ("Code could not merge back into the live workspace: "
+                  f"{merge_error[:200]}")
+        update("tasks", task_id, {"status": "Blocked", "progress": 90,
+                                  "blocked_reason": reason,
+                                  "evidence": evidence_str,
+                                  "updated_at": now()})
+        update("workflow_runs", run_id, {"status": "Completed", "current_step": "merge-failed",
+                                         "completed_at": now()})
+        _emit(project_id, "task.status_changed",
+              {"task_id": task_id, "task": task["title"], "status": "Blocked",
+               "blocked_reason": reason},
+              workflow_run_id=run_id, task_id=task_id)
+        _emit(project_id, "workflow.completed",
+              {"run_id": run_id, "task": task["title"], "outcome": "merge-failed",
+               "error": reason[:300],
+               "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens,
+                         "cost_usd": cost}},
+              workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
+        _set_agent(agent_id, "Failed", f"Merge failed: {task['title']}",
+                   task_id=task_id, project_id=project_id)
+        await asyncio.sleep(1.2)
+        _set_agent(agent_id, "Idle", "", task_id=None, project_id=project_id)
+        audit("merge_failed", "workflow_run", run_id,
+              f"Task '{task['title']}' build could not merge into the live workspace; blocked")
+        if po.po_enabled(project_id):
+            async def _po_review_merge():
+                try:
+                    await asyncio.to_thread(
+                        po.po_autonomy_tick, project_id,
+                        f"The task '{task['title']}' completed its build but the code "
+                        f"could not merge into the live workspace ({merge_error[:200]}). "
+                        "Decide: retry the task, reassign it, or cancel it and note why.")
+                except Exception as exc:
+                    logger.warning("PO review after merge failure failed for project %s: %s",
+                                   project_id, exc)
+            _spawn(_po_review_merge())
+        return
     project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     outcome = "dev-done"
     handed_off = False
@@ -969,7 +1072,10 @@ async def _finish_review_run(run_id, ctrl, project_id, task_id, agent_id, task, 
 
     if decision == "rework":
         rework = (task["rework_count"] or 0) + 1
-        reason = f"{reviewer_name} rework: {findings}"[:400]
+        # findings already carry the reviewer's full detail (600 chars);
+        # cutting further to 400 here would silently drop it before the
+        # dev sees the rework feedback.
+        reason = f"{reviewer_name} rework: {findings}"[:1200]
         if rework >= MAX_REWORK_CYCLES:
             blocked = f"{reason}. Failed {stage} {rework} times — needs human review."
             update("tasks", task_id, {"status": "Blocked", "progress": 85,
@@ -1010,6 +1116,11 @@ async def _finish_review_run(run_id, ctrl, project_id, task_id, agent_id, task, 
                   workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
             audit("review_rejected", "workflow_run", run_id,
                   f"{stage} rejected task '{task['title']}' (cycle {rework}): {findings[:150]}")
+        # Cross-run learning: the reviewer's findings go to the pitfall
+        # ledger so the next attempt (this task or a future one) is
+        # generated with the mistake visible in the prompt.
+        memory.record_pitfall(project_id, task_id, f"{reviewer_type} review",
+                              findings, subject=task["title"], owner_agent_id=dev_agent_id)
     else:
         project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
         advanced = False
@@ -1072,12 +1183,19 @@ async def _finish_qa_run(run_id, ctrl, project_id, task_id, agent_id, task,
         summary = ""
     elif browser_status == "passed":
         # The app booted and worked in a real browser: a genuine pass, so
-        # the random fallback below never decides this task's fate.
+        # the unverified path below never decides this task's fate.
         verdict_pass = True
         summary = ""
     else:
-        verdict_pass = random.random() >= 0.15
-        summary = "" if verdict_pass else f"QA found defects: {', '.join(random.sample(_QA_ISSUES, 1))}"
+        # No real evidence reached this point (an LLM outage froze the
+        # self-fix before any test/browser signal, or no runner produced a
+        # verdict at all). A coin-flip here would fabricate QA results, so
+        # the task goes to a human/PO as UNVERIFIED — rework_count stays
+        # untouched because nothing actually failed.
+        await _finish_qa_unverified(run_id, project_id, task_id, agent_id, task,
+                                    test_summary, browser_status,
+                                    in_tokens, out_tokens, cost)
+        return
     dev_agent_id = task["qa_agent_id"] or agent_id
     browser = ctrl.get("browser") or {}
     browser_status = browser.get("status", "")
@@ -1110,6 +1228,8 @@ async def _finish_qa_run(run_id, ctrl, project_id, task_id, agent_id, task,
         return
 
     rework = (task["rework_count"] or 0) + 1
+    memory.record_pitfall(project_id, task_id, "qa", summary,
+                          subject=task["title"], owner_agent_id=dev_agent_id)
     if rework >= MAX_REWORK_CYCLES:
         update("tasks", task_id, {"status": "Blocked",
                                   "blocked_reason": f"{summary}. Failed QA {rework} times — needs human review.",
@@ -1156,6 +1276,50 @@ async def _finish_qa_run(run_id, ctrl, project_id, task_id, agent_id, task,
                task_id=task_id, project_id=project_id)
     await asyncio.sleep(1.2)
     _set_agent(agent_id, "Idle", "", task_id=None, project_id=project_id)
+
+
+async def _finish_qa_unverified(run_id, project_id, task_id, agent_id, task,
+                                test_summary, browser_status,
+                                in_tokens, out_tokens, cost):
+    """QA produced no real evidence (no test run, no browser smoke — e.g. an
+    LLM outage froze the self-fix first). Never fabricate a verdict: the
+    task goes Blocked-for-review with rework_count untouched, since nothing
+    measurably failed."""
+    signal = (test_summary or f"browser:{browser_status or 'none'}")[:200]
+    reason = (f"QA could not verify automatically — no test or browser "
+              f"evidence (last signal: {signal}). Needs human or PO review.")
+    qa = query_one("SELECT name FROM agents WHERE id = ?", (agent_id,))
+    evidence = (task["evidence"] + "; " if task["evidence"] else "") + "qa:unverified"
+    update("tasks", task_id, {"status": "Blocked", "progress": 85,
+                              "blocked_reason": reason, "evidence": evidence,
+                              "updated_at": now()})
+    update("workflow_runs", run_id, {"status": "Completed", "current_step": "qa-unverified",
+                                     "completed_at": now()})
+    _emit(project_id, "task.status_changed",
+          {"task_id": task_id, "task": task["title"], "status": "Blocked",
+           "blocked_reason": reason}, workflow_run_id=run_id, task_id=task_id)
+    _emit(project_id, "qa.unverified",
+          {"task_id": task_id, "task": task["title"],
+           "qa": qa["name"] if qa else agent_id, "signal": signal,
+           "needs_human": True}, workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
+    _emit(project_id, "workflow.completed",
+          {"run_id": run_id, "task": task["title"], "outcome": "qa-unverified",
+           "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens,
+                     "cost_usd": cost}},
+          workflow_run_id=run_id, task_id=task_id, agent_id=agent_id)
+    audit("qa_unverified", "task", task_id,
+          f"Task '{task['title']}' unverifiable by QA — blocked for review ({signal})")
+    _set_agent(agent_id, "Completed", f"QA unverified: {task['title']}",
+               task_id=task_id, project_id=project_id)
+    await asyncio.sleep(1.2)
+    _set_agent(agent_id, "Idle", "", task_id=None, project_id=project_id)
+    if po.po_enabled(project_id):
+        async def _po_review():
+            try:
+                await asyncio.to_thread(po.po_autonomy_tick, project_id)
+            except Exception as exc:
+                logger.warning("PO review failed for project %s: %s", project_id, exc)
+        _spawn(_po_review())
 
 
 async def _wait_if_paused(run_id, ctrl, project_id, task_id, agent_id):
@@ -1215,6 +1379,22 @@ def cancel_execution(run_id):
         run = get_run(run_id)
         if run and run["status"] in ("Running", "Paused"):
             update("workflow_runs", run_id, {"status": "Cancelled", "completed_at": now()})
+            # Stale DB row (worker died with the process): the live-cancel path
+            # in _run_phases never runs, so clear the task here or it stays
+            # In Progress forever and blocks its sprint from draining.
+            if run["task_id"]:
+                update("tasks", run["task_id"],
+                       {"status": "Blocked", "blocked_reason": "Cancelled by operator",
+                        "updated_at": now()})
+                _emit(run["project_id"], "task.status_changed",
+                      {"task_id": run["task_id"], "status": "Blocked",
+                       "blocked_reason": "Cancelled by operator"},
+                      workflow_run_id=run_id, task_id=run["task_id"])
+            _emit(run["project_id"], "workflow.cancelled", {"run_id": run_id},
+                  workflow_run_id=run_id, task_id=run["task_id"])
+            if run["agent_id"] and not active_run_for_agent(run["agent_id"]):
+                _set_agent(run["agent_id"], "Idle", "", task_id=None,
+                           project_id=run["project_id"])
         return {"ok": True, "note": "run was not active"}
     ctrl["cancelled"] = True
     ctrl["paused"] = False
@@ -1233,6 +1413,13 @@ def retry_execution(run_id):
 
 
 def _eligible_tasks(project_id):
+    # Governance-opted projects outside a development-permitting lifecycle
+    # state claim nothing at all (V3 Step 1).
+    g_ok, _ = governance.may_execute(project_id)
+    if not g_ok:
+        return []
+    if not budget.may_spend(project_id)[0]:
+        return []
     # Sprint Gatekeeper (RULE 2): only tasks of the ONE active sprint may
     # run. Future sprints stay locked until the current one completes.
     sprint = sprint_gate.active_sprint(project_id)
@@ -1353,6 +1540,18 @@ async def _sprint_loop(project_id: str, ctrl: dict):
             blocked = 0
             auto_assign_tasks(project_id)
             idle_rounds += 1
+            # Dependency-stall visibility: pending tasks waiting on a Blocked
+            # dependency are skipped silently by _eligible_tasks, so the sprint
+            # can never drain while the blocker stands. Surface the exact pairs
+            # (throttled) instead of letting the loop idle anonymously — the PO
+            # tick and the Control UI act on this event.
+            if stall := dependency_stall(project_id, active["id"] if active else None):
+                if idle_rounds % 5 == 1:
+                    _emit(project_id, "sprint.dependency_stall",
+                          {"sprint": active["name"] if active else "",
+                           "stalled": stall[:10],
+                           "note": "Tasks wait on Blocked dependencies — unblock or "
+                                   "cancel the blockers to let the sprint drain."})
             # Default the give-up threshold up front: with the PO enabled it is
             # only recomputed inside the %10 review branch below, so without a
             # default an idle round between reviews would reference an
@@ -1434,6 +1633,37 @@ def _active_project_runs(project_id) -> int:
     rows = query("SELECT id FROM workflow_runs WHERE project_id = ? AND status = 'Running'",
                  (project_id,))
     return sum(1 for r in rows if r["id"] in _registry)
+
+
+def dependency_stall(project_id, sprint_id):
+    """Detect pending sprint tasks that can never start because a dependency
+    is itself stuck (Blocked/Cancelled-dead or waiting on the same set). This
+    is the silent sprint-freeze case: `_eligible_tasks` skips them, `remaining`
+    never reaches 0, and the gates never run. Returns a list of
+    {task, blocker, blocked_reason} for the tasks whose blockers are not
+    themselves making progress (i.e. no active run can unblock them soon)."""
+    if not sprint_id:
+        return []
+    pending = query(
+        "SELECT id, title FROM tasks WHERE project_id = ? AND sprint_id = ? "
+        "AND status IN ('Todo','Ready','Rework','Waiting QA','SA Review','BA Review')",
+        (project_id, sprint_id))
+    stalled = []
+    for t in pending:
+        ok, unmet = dependencies_satisfied(t["id"])
+        if ok:
+            continue
+        # A blocker is "stuck" if it is Blocked (needs human/PO) — its own
+        # dependents can't progress until it is cleared.
+        for d in unmet:
+            if d["status"] == "Blocked":
+                blocker = query_one(
+                    "SELECT blocked_reason FROM tasks WHERE id = ?", (d["id"],))
+                stalled.append({"task": t["title"], "blocker": d["title"],
+                                "blocker_status": d["status"],
+                                "blocker_reason": (blocker or {}).get("blocked_reason", "")})
+    return stalled
+
 
 
 # Role families group equivalent roles so a dev task never lands on QA/BA
@@ -1687,6 +1917,12 @@ def start_sprint_execution(project_id: str, sprint_ref=None):
     project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     if not project:
         return {"error": "Project not found"}
+    g_ok, g_reason = governance.may_execute(project_id)
+    if not g_ok:
+        return {"error": f"SPRINT_BLOCKED_BY_LIFECYCLE: {g_reason}"}
+    b_ok, b_reason = budget.may_spend(project_id)
+    if not b_ok:
+        return {"error": f"SPRINT_BLOCKED_BY_BUDGET: {b_reason}"}
     sprint = _resolve_sprint(project_id, sprint_ref)
     if sprint is None and not sprint_ref:
         sprint = sprint_gate.active_sprint(project_id)
@@ -1805,20 +2041,35 @@ def stop_sprint_execution(project_id: str):
     return {"ok": True}
 
 
+# Where a task interrupted by a service restart resumes. Flattening
+# everything to Ready re-ran dev from scratch and destroyed the pipeline
+# position: a task waiting on SA review went back to coding. Waiting
+# statuses are kept as-is — the scheduler re-claims them in the right mode
+# via _MODE_BY_STATUS. Only half-done dev work is re-queued (Ready);
+# review/QA stages re-enter through their own waiting status.
+def _recovered_status(current: str) -> str:
+    return {"In Progress": "Ready", "Review": "Ready",
+            "Testing": "Waiting QA"}.get(current, current)
+
+
 def recover_orphans():
     """Called at startup: mark interrupted runs as failed and free agents.
-    Interrupted tasks go back to Ready (kept assignment) so the loop re-runs
-    them — a service restart is not a work blocker."""
+    Each interrupted task resumes at the phase its status implies (kept
+    assignment) so the scheduler re-runs the right mode — a service restart
+    is not a work blocker and not a reason to redo finished stages."""
     for run in query("SELECT * FROM workflow_runs WHERE status IN ('Running','Paused')"):
         update("workflow_runs", run["id"], {"status": "Failed", "completed_at": now(),
                                             "current_step": "interrupted (service restart)"})
         if run["task_id"]:
-            update("tasks", run["task_id"],
-                   {"status": "Ready", "blocked_reason": "",
-                    "updated_at": now()})
+            task = query_one("SELECT status FROM tasks WHERE id = ?", (run["task_id"],))
+            resume = _recovered_status(task["status"]) if task else "Ready"
+            fields = {"status": resume, "updated_at": now()}
+            if resume == "Ready":
+                fields["blocked_reason"] = ""
+            update("tasks", run["task_id"], fields)
             _emit(run["project_id"], "task.status_changed",
-                  {"task_id": run["task_id"], "status": "Ready",
-                   "note": "re-queued after service restart"})
+                  {"task_id": run["task_id"], "status": resume,
+                   "note": "resumed after service restart"})
         _emit(run["project_id"], "workflow.failed",
               {"run_id": run["id"], "error": "Service restarted; run marked recoverable",
                "recoverable": True}, workflow_run_id=run["id"])

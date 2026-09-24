@@ -1,5 +1,6 @@
 import React from 'react';
-import { get, post, patch, del, fmtTime, md, AGENT_STATE_CLASS, TASK_STATE_CLASS } from '../api';
+import { get, post, patch, del, fmtTime, AGENT_STATE_CLASS, TASK_STATE_CLASS } from '../api';
+import { MarkdownText } from '../MarkdownText';
 import { Badge, ErrorNote } from '../components';
 
 interface Msg { id: string; role: string; content: string; meta: string; created_at: string }
@@ -514,7 +515,7 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
               )}
               {poMessages.map((m) => (
                 <div key={m.id} className={`msg ${m.role}`}
-                  dangerouslySetInnerHTML={{ __html: md(m.content) }} />
+                  children={<MarkdownText text={m.content} />} />
               ))}
               <div ref={poEndRef} />
             </>
@@ -533,7 +534,7 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
               )}
               {messages.slice(-visibleMsgs).map((m) => (
                 <div key={m.id} className={`msg ${m.role}`}
-                  dangerouslySetInnerHTML={{ __html: md(m.content) }} />
+                  children={<MarkdownText text={m.content} />} />
               ))}
               {pending && (
                 <div className="row" style={{ alignSelf: 'flex-start', gap: 6 }}>

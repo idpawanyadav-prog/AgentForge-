@@ -1,0 +1,15 @@
+TITLE:
+Implement ticket comments endpoint
+
+DESCRIPTION:
+Implement the POST /api/tickets/{id}/comments endpoint for ticket comments.
+Validate input with Pydantic models; return typed responses.
+Handle 404/409 cases explicitly.
+
+ACCEPTANCE CRITERIA:
+Given a valid request to POST /api/tickets/{id}/comments
+When the endpoint is called
+Then it returns 201 with the expected payload
+And invalid input returns 422
+And a missing resource returns 404
+And there is a passing pytest covering success and error paths

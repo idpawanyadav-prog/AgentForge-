@@ -8,14 +8,9 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from ..db import audit, execute, insert, new_id, now, query, query_one, update
+from ._util import or_404 as _or_404
 
 router = APIRouter(prefix="/api/v1", tags=["settings"])
-
-
-def _or_404(row, what="Resource"):
-    if row is None:
-        raise HTTPException(404, f"{what} not found")
-    return row
 
 
 def _get_setting(key, default=""):

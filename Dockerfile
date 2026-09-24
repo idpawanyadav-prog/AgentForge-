@@ -14,7 +14,7 @@ COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
 COPY backend/ ./backend/
-COPY --from=frontend-build /app/frontend/dist ./static
+COPY --from=frontend-build /app/frontend/dist ./backend/static
 
 # Runtime state (SQLite DB + gateway-key master key) lives outside the
 # copied source tree so a stray local db/key file can never ship in an

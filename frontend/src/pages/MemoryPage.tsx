@@ -1,6 +1,7 @@
 import React from 'react';
+import { MarkdownPreview } from '../MarkdownText';
 import { get, post, patch, del, fmtRel } from '../api';
-import { Field, Modal, useAsyncData, ErrorNote, Badge } from '../components';
+import { Badge, Collapse, ErrorNote, Field, Modal, useAsyncData } from '../components';
 import { AGENT_STATE_CLASS } from '../api';
 
 function iconFor(name: string): string {
@@ -12,18 +13,6 @@ function iconFor(name: string): string {
   if (/manager|scrum|owner/i.test(name)) return '◔';
   if (/design/i.test(name)) return '🎨';
   return '⬡';
-}
-
-function renderMd(text: string): string {
-  const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  return esc.split('\n').map((line) => {
-    if (/^###\s/.test(line)) return `<div class="md-h3">${line.slice(4)}</div>`;
-    if (/^##\s/.test(line)) return `<div class="md-h2">${line.slice(3)}</div>`;
-    if (/^#\s/.test(line)) return `<div class="md-h1">${line.slice(2)}</div>`;
-    if (/^-\s/.test(line)) return `<div class="md-li">${line.slice(2)}</div>`;
-    if (!line.trim()) return '<div class="md-gap"></div>';
-    return `<div>${line}</div>`;
-  }).join('');
 }
 
 function CodeEditor({ value, onChange }: { value: string; onChange: (v: string) => void }) {
@@ -41,6 +30,40 @@ function CodeEditor({ value, onChange }: { value: string; onChange: (v: string) 
       <textarea ref={taRef} className="editor-area" value={value} spellCheck={false}
         onChange={(e) => onChange(e.target.value)} onScroll={onScroll} />
     </div>
+  );
+}
+
+function LintWarnings({ list }: { list?: string[] }) {
+  if (!list?.length) return null;
+  return (
+    <div style={{ margin: '8px 0' }}>
+      {list.map((w, i) => (
+        <div key={i} className="badge warn" style={{ display: 'block', margin: '4px 0', whiteSpace: 'normal' }}>
+          ⚠ {w}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function HistoryPanel({ kind, id, onChanged, onError }:
+  { kind: 'instructions' | 'personas'; id: string; onChanged: () => void; onError: (e: any) => void }) {
+  const { data: versions, reload } = useAsyncData<any[]>(
+    () => get(`/api/v1/${kind}/${id}/versions`), [id]);
+  return (
+    <Collapse header={<>Version history</>} sub="Every content change is snapshotted; restore is append-only.">
+      {(versions ?? []).map((v) => (
+        <div key={v.id} className="spread" style={{ padding: '4px 0' }}>
+          <span className="kv mono">v{v.version} · {fmtRel(v.created_at)} · {v.content_chars ?? v.instructions_chars ?? 0} chars</span>
+          <button className="btn small" onClick={async () => {
+            if (!confirm(`Restore version ${v.version}? Its content becomes the new current version.`)) return;
+            try { await post(`/api/v1/${kind}/${id}/restore`, { version: v.version }); onChanged(); reload(); }
+            catch (e: any) { onError(e); }
+          }}>Restore</button>
+        </div>
+      ))}
+      {!versions?.length && <div className="kv">No stored versions yet.</div>}
+    </Collapse>
   );
 }
 
@@ -262,8 +285,9 @@ function EditorPanel({ roleId, selectedId, onSelect, onError, refreshKey, onChan
   const [mode, setMode] = React.useState<'edit' | 'preview'>('edit');
   const [saving, setSaving] = React.useState(false);
   const [savedTick, setSavedTick] = React.useState(0);
+  const [warnings, setWarnings] = React.useState<string[]>([]);
 
-  React.useEffect(() => { setDraft(file?.content ?? ''); setMode('edit'); }, [file?.id, file?.version]);
+  React.useEffect(() => { setDraft(file?.content ?? ''); setMode('edit'); setWarnings([]); }, [file?.id, file?.version]);
 
   // Keep selection valid when the refreshed list changes (e.g. after a
   // delete elsewhere) so the editor never sits on a ghost id.
@@ -312,8 +336,9 @@ function EditorPanel({ roleId, selectedId, onSelect, onError, refreshKey, onChan
       <div className="editor-holder">
         {mode === 'edit'
           ? <CodeEditor value={draft} onChange={setDraft} />
-          : <div className="md-preview" dangerouslySetInnerHTML={{ __html: renderMd(draft) }} />}
+          : <div className="md-preview"><MarkdownPreview text={draft} /></div>}
       </div>
+      <LintWarnings list={warnings} />
       <div className="spread" style={{ marginTop: 10 }}>
         <span className="kv">Last saved: {fmtRel(file.updated_at)}{savedTick > 0 && !dirty ? ' ✓' : ''}</span>
         <div className="btn-row">
@@ -321,13 +346,15 @@ function EditorPanel({ roleId, selectedId, onSelect, onError, refreshKey, onChan
           <button className="btn small primary" disabled={!dirty || saving} onClick={async () => {
             setSaving(true);
             try {
-              await patch(`/api/v1/instructions/${file.id}`, { content: draft });
+              const updated = await patch(`/api/v1/instructions/${file.id}`, { content: draft });
+              setWarnings(updated.lint_warnings ?? []);
               setSavedTick((t) => t + 1);
               onChanged();
             } catch (e: any) { onError(e); } finally { setSaving(false); }
           }}>Save Changes</button>
         </div>
       </div>
+      <HistoryPanel kind="instructions" id={file.id} onChanged={onChanged} onError={onError} />
     </div>
   );
 }
@@ -474,17 +501,19 @@ function PersonaPanel({ roleId, selected, onSelect, onError, onOpenModal }:
 
 function PersonaEditor({ roleId, personaId, onSelect, onError, reloadRoles }:
   { roleId: string | null; personaId: string | null; onSelect: (id: string) => void; onError: (e: any) => void; reloadRoles: () => void }) {
-  const { data: personas } = useAsyncData<any[]>(
+  const { data: personas, reload: reloadPersonas } = useAsyncData<any[]>(
     () => (roleId ? get(`/api/v1/personas?role_id=${roleId}`) : Promise.resolve([])), [roleId, personaId]);
   const persona = personas?.find((p) => p.id === personaId) ?? null;
   const [f, setF] = React.useState({ name: '', description: '', instructions: '', constraints_text: '' });
   const [saving, setSaving] = React.useState(false);
   const [savedTick, setSavedTick] = React.useState(0);
+  const [warnings, setWarnings] = React.useState<string[]>([]);
 
   React.useEffect(() => {
     if (persona) setF({ name: persona.name, description: persona.description ?? '',
       instructions: persona.instructions ?? '', constraints_text: persona.constraints_text ?? '' });
   }, [persona?.id, persona?.version]);
+  React.useEffect(() => { setWarnings([]); }, [persona?.id]);
 
   if (!roleId) return null;
   if (!persona) {
@@ -513,11 +542,13 @@ function PersonaEditor({ roleId, personaId, onSelect, onError, reloadRoles }:
             onChange={(e) => setF({ ...f, constraints_text: e.target.value })} />
         </Field>
       </div>
+      <LintWarnings list={warnings} />
       <div className="btn-row" style={{ marginTop: 10 }}>
         <button className="btn primary" disabled={!dirty || saving || !f.name} onClick={async () => {
           setSaving(true);
           try {
             const updated = await patch(`/api/v1/personas/${persona.id}`, f);
+            setWarnings(updated.lint_warnings ?? []);
             setSavedTick(updated.version);
             reloadRoles();
           } catch (e: any) { onError(e); }
@@ -528,6 +559,7 @@ function PersonaEditor({ roleId, personaId, onSelect, onError, reloadRoles }:
           try { await del(`/api/v1/personas/${persona.id}`); onSelect(''); reloadRoles(); } catch (e: any) { onError(e); }
         }}>Delete</button>
       </div>
+      <HistoryPanel kind="personas" id={persona.id} onChanged={() => { reloadPersonas(); reloadRoles(); }} onError={onError} />
     </div>
   );
 }

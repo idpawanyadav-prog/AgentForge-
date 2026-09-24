@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 from .. import db, runtime, sprint_gate
 from ..db import audit, execute, insert, new_id, now, query, query_one, update
+from ..schemas import TaskUpdate
 
 
 TASK_TRANSITIONS: dict[str, set[str]] = {
@@ -25,6 +26,49 @@ TASK_TRANSITIONS: dict[str, set[str]] = {
     "Done": set(),
     "Cancelled": {"Todo"},
 }
+
+
+# Dependency-integrity helpers (shared by the REST router, task creation and
+# the chatbot command path). Without a cycle check, one cyclic dependency
+# silently freezes every downstream task: the scheduler skips tasks whose
+# deps are unmet and they never become Done, so the sprint never drains.
+def _dependency_graph() -> dict[str, list[str]]:
+    graph: dict[str, list[str]] = {}
+    for r in db.query("SELECT task_id, depends_on_task_id FROM task_dependencies"):
+        graph.setdefault(r["task_id"], []).append(r["depends_on_task_id"])
+    return graph
+
+
+def dependency_cycle_exists(task_id: str, dep_id: str) -> bool:
+    """True when adding `task_id depends_on dep_id` closes a cycle, i.e.
+    dep_id already (transitively) depends on task_id."""
+    graph = _dependency_graph()
+    stack, seen = [dep_id], set()
+    while stack:
+        node = stack.pop()
+        if node == task_id:
+            return True
+        if node in seen:
+            continue
+        seen.add(node)
+        stack.extend(graph.get(node, []))
+    return False
+
+
+def validate_new_dependency(task_id: str, dep_id: str) -> None:
+    if task_id == dep_id:
+        raise HTTPException(400, "A task cannot depend on itself")
+    task = db.query_one("SELECT project_id FROM tasks WHERE id=?", (task_id,))
+    if not task:
+        raise HTTPException(404, "Task not found")
+    dependency = db.query_one("SELECT project_id FROM tasks WHERE id=?", (dep_id,))
+    if not dependency:
+        raise HTTPException(404, f"Dependency task not found: {dep_id}")
+    if dependency["project_id"] != task["project_id"]:
+        raise HTTPException(400, "Dependency task belongs to another project")
+    if dependency_cycle_exists(task_id, dep_id):
+        raise HTTPException(
+            400, f"Circular dependency rejected: '{dep_id}' already depends on this task")
 
 
 def validate_task_transition(task: dict, new_status: str) -> None:
@@ -66,6 +110,38 @@ def create_task_row(project_id: str, body, *, sprint_scope_check: bool = True) -
     (priority==1) in an active sprint, the sprint may be re-opened
     mid-validation.
     """
+    if not query_one("SELECT id FROM projects WHERE id=?", (project_id,)):
+        raise HTTPException(404, "Project not found")
+    template_id = getattr(body, "template_id", None)
+    if template_id:
+        from .. import task_templates as tt
+        applied = tt.apply_template(template_id,
+                                    getattr(body, "template_variables", None) or {})
+        if applied is None:
+            raise HTTPException(400, f"Unknown task template: {template_id}")
+        if not (body.title or "").strip():
+            if applied["missing_variables"]:
+                raise HTTPException(
+                    400, "Template variables missing: " + ", ".join(applied["missing_variables"]))
+            body.title = applied["title"]
+        if not body.description:
+            body.description = applied["description"]
+        if not body.acceptance_criteria:
+            body.acceptance_criteria = applied["acceptance_criteria"]
+        # Only adopt template defaults where the caller left plain defaults.
+        if body.story_points == 3 and applied["story_points"] != 3:
+            body.story_points = applied["story_points"]
+        if body.priority == 2 and applied["priority"] != 2:
+            body.priority = applied["priority"]
+    if not (body.title or "").strip():
+        raise HTTPException(400, "Task title is required (directly or via template)")
+    _validate_project_refs(project_id, body.sprint_id, body.backlog_item_id)
+    for dep in body.depends_on:
+        dependency = query_one("SELECT project_id FROM tasks WHERE id=?", (dep,))
+        if not dependency:
+            raise HTTPException(400, f"Unknown dependency task: {dep}")
+        if dependency["project_id"] != project_id:
+            raise HTTPException(400, "Dependency task belongs to another project")
     tid = new_id()
     ts = now()
     insert("tasks", {
@@ -150,6 +226,8 @@ def update_task_row(task_id: str, body: TaskUpdate) -> dict:
                                                       "story_points", "priority", "sprint_id",
                                                       "backlog_item_id", "assigned_agent_id",
                                                       "status", "blocked_reason")}
+    _validate_project_refs(task["project_id"], allowed.get("sprint_id"),
+                           allowed.get("backlog_item_id"))
     new_status = allowed.get("status")
     if new_status and new_status != task["status"]:
         validate_task_transition(task, new_status)
@@ -159,3 +237,12 @@ def update_task_row(task_id: str, body: TaskUpdate) -> dict:
     allowed["updated_at"] = now()
     update("tasks", task_id, allowed)
     return query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
+
+
+def _validate_project_refs(project_id: str, sprint_id: str | None,
+                           backlog_item_id: str | None) -> None:
+    for table, ref_id, label in (("sprints", sprint_id, "Sprint"),
+                                 ("backlog_items", backlog_item_id, "Backlog item")):
+        if ref_id and not query_one(f"SELECT id FROM {table} WHERE id=? AND project_id=?",
+                                    (ref_id, project_id)):
+            raise HTTPException(400, f"{label} does not belong to this project")

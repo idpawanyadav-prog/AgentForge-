@@ -16,7 +16,7 @@ import logging
 import os
 import threading
 
-from . import db, workspace, runtime, toolchains, sprint_gate, config
+from . import db, workspace, runtime, toolchains, sprint_gate, config, memory, governance
 from .db import audit, emit_event, execute, insert, new_id, now, query, query_one, update
 
 logger = logging.getLogger(__name__)
@@ -44,9 +44,12 @@ Available actions:
 - {"action": "add_backlog", "items": [{"title": str, "description"?: str, "priority"?: 1-3,
     "acceptance_criteria"?: str, "points"?: 1-8}]}
 - {"action": "create_sprint", "name": str, "goal"?: str, "capacity"?: int,
-    "tasks": [{"title": str, "description"?: str, "points"?: 1-8, "priority"?: 1-3}]}
-- {"action": "add_task", "title": str, "description"?: str, "points"?: 1-8, "priority"?: 1-3,
+    "tasks": [{"title": str, "description"?: str, "acceptance_criteria"?: str, "points"?: 1-8, "priority"?: 1-3}]}
+- {"action": "add_task", "title": str, "description"?: str, "acceptance_criteria"?: str,
+    "points"?: 1-8, "priority"?: 1-3,
     "sprint"?: "<sprint number/name; default: current active sprint>"}
+Always write concrete acceptance_criteria (Given/When/Then, browser-verifiable) for every
+task you create — developers implement against them and QA/review gates judge by them.
 - {"action": "update_task", "task": "<title or partial>", "title"?: str, "description"?: str,
     "priority"?: 1-3, "points"?: 1-8}
 - {"action": "assign_task", "task": "<title or partial>", "agent": "<agent name>"}
@@ -55,10 +58,24 @@ Available actions:
     Use it whenever a task is blocked by ModuleNotFoundError / ImportError (e.g. sqlalchemy,
     slowapi), then unblock_task the affected task(s) so they rerun.
 - {"action": "unblock_task", "task": "<title or partial>",
-    "note"?: str} — clears the blocker and makes the task Ready again (also resets its rework counter)
+    "note"?: str} — clears the blocker and makes the task Ready again
 - {"action": "cancel_task", "task": "<title or partial>", "reason"?: str}
 - {"action": "start_sprint", "sprint"?: "<sprint number/name; default: active or first planned>"}
 - {"action": "stop_sprint"}
+
+Governance actions (project lifecycle + baseline approval gate; only when the
+project's GOVERNANCE section says governance is enabled):
+- {"action": "add_requirement", "title": str, "content"?: str} — record a
+  requirement; re-submitting an existing title appends a new version (never overwrites)
+- {"action": "propose_baseline", "kind"?: "requirement|architecture"} — freeze the
+  current scope as RB-n.0 / AB-n.0 and move the project to 'Pending PO Approval'
+- {"action": "decide_baseline", "decision": "approve|reject|request_revision",
+    "code"?: "RB-1.0", "notes"?: str} — approve unlocks delivery; reject/revision
+    opens a change request and parks the project in 'Change Requested'
+- {"action": "decide_change_request", "decision": "incorporate|decline",
+    "code"?: "CR-1", "notes"?: str}
+- {"action": "transition_project", "to": "<lifecycle state>", "reason"?: str} —
+  only legal transitions succeed; follow the documented state order
 
 Rules:
 - Task titles must match real work: development tasks go to developers, QA tasks to QA agents,
@@ -241,6 +258,19 @@ def _project_brief(project_id: str, focus_blockers: bool = False) -> str:
     lines = [f"PROJECT: {p['name']}", f"GOAL: {p['goal'] or '(not set)'}",
              f"DESCRIPTION: {p['description'] or '(not set)'}",
              f"TECH STACK: {p['technology_stack'] or '(not set)'}"]
+    state = governance.current_state(project_id)
+    gov_on = bool(p["governance_enabled"])
+    pending = [b["code"] for b in query(
+        "SELECT code FROM project_baselines WHERE project_id = ? "
+        "AND status = 'pending_approval'", (project_id,))]
+    lines.append(f"LIFECYCLE: {state} (governance {'ON' if gov_on else 'off'}"
+                 + (f"; pending approval: {', '.join(pending)}" if pending else "") + ")")
+    if gov_on:
+        lines.append("  GOVERNANCE ON — delivery may only run in 'Active Development' or "
+                     "'Final Validation'. Required order: record requirements "
+                     "(add_requirement) → propose_baseline → decide_baseline (approve) → "
+                     "transition_project through Scaffolding/Ready for Planning → "
+                     "Active Development. Reject/revision opens a change request.")
     backlog = query("SELECT title, priority, story_points, status, acceptance_criteria "
                     "FROM backlog_items WHERE project_id = ? ORDER BY priority, created_at", (project_id,))
     if backlog:
@@ -277,6 +307,11 @@ def _project_brief(project_id: str, focus_blockers: bool = False) -> str:
         "WHERE ta.team_id = ? AND ta.active = 1 ORDER BY a.name", (p["team_id"],))
     lines.append("TEAM: " + ("; ".join(f"{m['name']} ({m['role']}, {m['lifecycle_state']})" for m in team)
                              if team else "(no team aligned)"))
+    pitfalls = memory.recent_pitfalls(project_id, limit=5)
+    if pitfalls:
+        lines.append("KNOWN PITFALLS (causes of previous QA/review rejections — plan "
+                     "around them and write ACs that would have caught them):")
+        lines.extend(f"- [{p['source_type']}] {(p['content'] or '')[:160]}" for p in pitfalls)
     if focus_blockers:
         blocked = [l for l in lines if "BLOCKED:" in l or "UNASSIGNED" in l]
         if blocked:
@@ -303,6 +338,38 @@ def _resolve_task(project_id: str, ref: str):
         for t in pool:
             if ref in t["title"].lower():
                 return t
+    return None
+
+
+def _resolve_baseline(project_id: str, code: str):
+    """Pending baseline id by code (exact then partial), or the only pending
+    one when no code was given."""
+    pending = query("SELECT * FROM project_baselines WHERE project_id = ? "
+                    "AND status = 'pending_approval' ORDER BY created_at", (project_id,))
+    if not pending:
+        return None
+    ref = str(code or "").strip().lower()
+    if not ref:
+        return pending[0]["id"] if len(pending) == 1 else None
+    for b in pending:
+        if b["code"].lower() == ref:
+            return b["id"]
+    for b in pending:
+        if ref in b["code"].lower():
+            return b["id"]
+    return None
+
+
+def _resolve_change_request(project_id: str, code: str):
+    open_crs = governance.list_change_requests(project_id, status="open")
+    if not open_crs:
+        return None
+    ref = str(code or "").strip().lower()
+    if not ref:
+        return open_crs[0] if len(open_crs) == 1 else None
+    for c in open_crs:
+        if c["code"].lower() == ref or ref in c["code"].lower():
+            return c
     return None
 
 
@@ -460,6 +527,7 @@ def _apply_actions(project_id: str, actions) -> list[str]:
                 ts = now()
                 insert("tasks", {"id": new_id(), "project_id": project_id, "sprint_id": sprint["id"],
                                  "title": title[:120], "description": str(a.get("description") or "")[:1000],
+                                 "acceptance_criteria": str(a.get("acceptance_criteria") or "")[:1000],
                                  "story_points": _clamp(a.get("points"), 1, 8, 3),
                                  "priority": _clamp(a.get("priority"), 1, 3, 2),
                                  "status": "Todo", "created_at": ts, "updated_at": ts})
@@ -564,8 +632,12 @@ def _apply_actions(project_id: str, actions) -> list[str]:
                 if not t:
                     log.append(f"Task '{a.get('task')}' not found — unblock skipped.")
                     continue
+                # rework_count survives unblock on purpose: resetting it let
+                # the PO bounce a task through the same failing gate forever
+                # (reject → Blocked → unblock → reject ...). With the counter
+                # kept, one more rejection re-escalates immediately.
                 update("tasks", t["id"], {"status": "Ready", "blocked_reason": "",
-                                          "rework_count": 0, "updated_at": now()})
+                                          "updated_at": now()})
                 note = str(a.get("note") or "").strip()
                 log.append(f"Unblocked '{t['title']}'" + (f" — {note}" if note else "") + ".")
                 audit("po_unblock_task", "task", t["id"],
@@ -590,6 +662,60 @@ def _apply_actions(project_id: str, actions) -> list[str]:
             elif act == "stop_sprint":
                 runtime.stop_sprint_execution(project_id)
                 log.append("Stopped sprint execution; open tasks remain.")
+            elif act == "add_requirement":
+                title = str(a.get("title") or "").strip()
+                if not title:
+                    log.append("add_requirement needs a title.")
+                    continue
+                r = governance.create_requirement(
+                    project_id, title, str(a.get("content") or ""),
+                    actor="product-owner")
+                log.append(f"Recorded requirement '{title}' v{r['version']}.")
+            elif act == "propose_baseline":
+                kind = str(a.get("kind") or "requirement")
+                result = governance.propose_baseline(project_id, kind,
+                                                     actor="product-owner")
+                if "error" in result:
+                    log.append(f"Could not propose baseline: {result['error']}")
+                else:
+                    b = result["baseline"]
+                    log.append(f"Proposed baseline {b['code']} — project is now "
+                               "'Pending PO Approval'.")
+            elif act == "decide_baseline":
+                bid = _resolve_baseline(project_id, a.get("code"))
+                if not bid:
+                    log.append(f"No pending baseline found"
+                               + (f" for code '{a.get('code')}'" if a.get("code") else "")
+                               + " — decide skipped.")
+                    continue
+                result = governance.decide_baseline(
+                    project_id, bid, str(a.get("decision") or ""),
+                    str(a.get("notes") or ""), actor="product-owner")
+                if result.get("error") or not result.get("ok"):
+                    log.append(f"Baseline decision failed: {result.get('error')}")
+                else:
+                    log.append(f"Baseline decision recorded — project is now "
+                               f"'{result['state']}'.")
+            elif act == "decide_change_request":
+                cr = _resolve_change_request(project_id, a.get("code"))
+                if not cr:
+                    log.append("No open change request found — decide skipped.")
+                    continue
+                result = governance.decide_change_request(
+                    project_id, cr["id"], str(a.get("decision") or ""),
+                    str(a.get("notes") or ""), actor="product-owner")
+                if result.get("error"):
+                    log.append(f"Change-request decision failed: {result['error']}")
+                else:
+                    log.append(f"Change request {cr['code']} "
+                               f"{str(a.get('decision')).lower()}d.")
+            elif act == "transition_project":
+                ok2, err2 = governance.transition_project(
+                    project_id, str(a.get("to") or ""), str(a.get("reason") or ""),
+                    actor="product-owner")
+                log.append("Project lifecycle moved to "
+                           f"'{governance.current_state(project_id)}'."
+                           if ok2 else f"Illegal lifecycle transition: {err2}")
             else:
                 log.append(f"Unknown action '{act}' ignored.")
         except Exception as exc:  # one bad action must not kill the whole review

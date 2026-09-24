@@ -10,21 +10,97 @@ During task execution agents write real deliverable files into the workspace
 and best-effort commit them when the workspace is a git repository.
 """
 import logging
+import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
+from urllib.parse import urlsplit
 
 from .db import execute, now, query, query_one, update
 
 logger = logging.getLogger(__name__)
 
+MAX_PROJECT_WORKSPACE_BYTES = int(os.environ.get("AGENTFORGE_PROJECT_WORKSPACE_BYTES", str(1024 ** 3)))
+
+
+def _workspace_bytes(root: str) -> int:
+    total = 0
+    for current, dirs, files in os.walk(root):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(current, name))
+            except OSError:
+                pass
+    return total
+
+
+def _write_merge_journal(root: str, workspace_path: str, files: list[str]) -> None:
+    path = os.path.join(root, "journal.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"workspace_path": workspace_path, "files": files}, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _recover_merge_journal(root: str, workspace_path: str) -> bool:
+    """Restore a prepared merge after a process crash; committed ones need cleanup."""
+    try:
+        with open(os.path.join(root, "journal.json"), encoding="utf-8") as fh:
+            journal = json.load(fh)
+        if os.path.normcase(os.path.abspath(journal["workspace_path"])) != \
+                os.path.normcase(os.path.abspath(workspace_path)):
+            return False
+        files = journal["files"]
+        if not isinstance(files, list) or any(
+                not isinstance(rel, str) or rel.startswith(("/", "\\")) or
+                ".." in rel.replace("\\", "/").split("/") for rel in files):
+            return False
+        if not os.path.isfile(os.path.join(root, "committed")):
+            for rel in reversed(files):
+                dst = os.path.join(workspace_path, *rel.split("/"))
+                backup = os.path.join(root, "old", *rel.split("/"))
+                if os.path.isfile(backup):
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    fd, restored = tempfile.mkstemp(prefix=".af-restore-",
+                                                    dir=os.path.dirname(dst))
+                    os.close(fd)
+                    try:
+                        shutil.copy2(backup, restored)
+                        os.replace(restored, dst)
+                    finally:
+                        if os.path.exists(restored):
+                            os.unlink(restored)
+                elif os.path.isfile(dst):
+                    os.unlink(dst)
+        shutil.rmtree(root)
+        return True
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        logger.warning("Merge journal recovery failed for %s: %s", root, exc)
+        return False
+
+
+def recover_merge_journals() -> int:
+    """Run before accepting work so interrupted merges cannot stay partial."""
+    recovered = 0
+    for row in query("SELECT workspace_path FROM projects WHERE workspace_path != ''"):
+        ws_dir = row["workspace_path"]
+        parent = os.path.dirname(ws_dir)
+        if not os.path.isdir(parent):
+            continue
+        for name in os.listdir(parent):
+            if name.startswith(".af-merge-") and os.path.isdir(os.path.join(parent, name)):
+                recovered += _recover_merge_journal(os.path.join(parent, name), ws_dir)
+    return recovered
+
 # Per-project git locks: with parallel task execution several agents can
 # finish and commit in the same workspace at the same time. Serializing
 # add+commit per workspace avoids git index.lock races.
 _commit_locks: dict[str, threading.Lock] = {}
+_merge_locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
 
 
@@ -34,6 +110,11 @@ def _commit_lock(project_id: str) -> threading.Lock:
         if lock is None:
             lock = _commit_locks[project_id] = threading.Lock()
         return lock
+
+
+def _merge_lock(project_id: str) -> threading.Lock:
+    with _locks_guard:
+        return _merge_locks.setdefault(project_id, threading.Lock())
 
 
 def workspaces_root() -> str:
@@ -110,20 +191,33 @@ def get_workspace(project_id: str) -> str | None:
 
 
 def _git(args, cwd=None) -> str | None:
+    ok, output = _git_result(args, cwd)
+    return output if ok else None
+
+
+def _git_result(args, cwd=None) -> tuple[bool, str]:
     git = shutil.which("git")
     if not git:
-        return None
+        return False, "git is not installed"
     try:
         proc = subprocess.run([git, *args], cwd=cwd, capture_output=True, text=True, timeout=120)
         if proc.returncode != 0:
-            return None
-        return (proc.stdout or "").strip()
-    except (OSError, subprocess.TimeoutExpired):
-        return None
+            return False, f"git exited with status {proc.returncode} (check repository URL and credentials)"
+        return True, (proc.stdout or "").strip()
+    except subprocess.TimeoutExpired:
+        return False, "git timed out after 120 seconds"
+    except OSError as exc:
+        return False, f"git could not start: {type(exc).__name__}"
 
 
 def _is_git_url(url: str) -> bool:
-    return bool(url) and (url.startswith(("http://", "https://", "git@", "ssh://")) or url.endswith(".git"))
+    if not url or any(ord(ch) < 32 for ch in url) or url.startswith("-"):
+        return False
+    if re.fullmatch(r"git@[A-Za-z0-9.-]+:[A-Za-z0-9._/-]+", url):
+        return True
+    parsed = urlsplit(url)
+    return (parsed.scheme in {"https", "ssh", "git"} and bool(parsed.hostname)
+            and not parsed.password and not parsed.query and not parsed.fragment)
 
 
 def _write_readme(ws_dir: str, project):
@@ -155,15 +249,17 @@ def prepare_workspace(project) -> dict:
     result = {"workspace_path": target, "cloned": False, "git_init": False, "note": ""}
     repo_url = (project.get("repository_url") or "").strip()
 
-    if repo_url and _is_git_url(repo_url) and not os.path.isdir(os.path.join(target, ".git")):
+    if repo_url and not _is_git_url(repo_url):
+        result["note"] = "Invalid repository URL; use HTTPS, SSH, git:// or git@host:path"
+    elif repo_url and not os.path.isdir(os.path.join(target, ".git")):
         if os.path.isdir(target) and os.listdir(target):
             result["note"] = "Clone skipped: target folder is not empty"
         else:
-            out = _git(["clone", repo_url, target])
-            if out is not None:
+            ok, detail = _git_result(["clone", "--", repo_url, target])
+            if ok:
                 result["cloned"] = True
             else:
-                result["note"] = "Clone failed (unreachable or private repository); created local folder instead"
+                result["note"] = f"Clone failed: {detail}; created local folder instead"
 
     if not os.path.isdir(target):
         os.makedirs(target, exist_ok=True)
@@ -287,8 +383,9 @@ def _copy_for_run(src: str, dst: str) -> dict:
                 shutil.copy2(s, os.path.join(dst_dir, f))
                 st = os.stat(s)
                 manifest[base + f] = (st.st_size, st.st_mtime_ns)
-            except OSError:
-                continue  # transient lock on some file: the run sees the rest
+            except OSError as exc:
+                logger.error("Run workspace copy failed for %s: %s", s, exc)
+                raise OSError(f"Run workspace copy failed for {base + f}: {exc}") from exc
     return manifest
 
 
@@ -359,6 +456,12 @@ def _run_changed_files(run_ws: str, manifest: dict) -> list[str]:
 
 def merge_back_run_workspace(project_id: str, run_id: str, run_ws: str,
                              manifest: dict) -> dict:
+    with _merge_lock(project_id):
+        return _merge_back_run_workspace_locked(project_id, run_id, run_ws, manifest)
+
+
+def _merge_back_run_workspace_locked(project_id: str, run_id: str, run_ws: str,
+                                     manifest: dict) -> dict:
     """Apply the run's changed files to the live workspace under per-file
     leases. Never raises. Returns {applied, conflicts, commit, error}."""
     result: dict = {"applied": [], "conflicts": [], "commit": None, "error": ""}
@@ -392,23 +495,66 @@ def merge_back_run_workspace(project_id: str, run_id: str, run_ws: str,
             # Git safety net: capture whatever the live folder holds BEFORE
             # overwriting, so a lost-update conflict is recoverable from history.
             commit_all(project_id)
+            projected_bytes = _workspace_bytes(ws_dir)
             for rel in changed:
                 src = os.path.join(run_ws, *rel.split("/"))
                 dst = os.path.join(ws_dir, *rel.split("/"))
-                m_entry = manifest.get(rel)
-                if m_entry is not None:
-                    try:
-                        live_st = os.stat(dst)
-                        if (live_st.st_size, live_st.st_mtime_ns) != m_entry \
-                                and rel not in result["conflicts"]:
-                            result["conflicts"].append(rel)
-                    except OSError:
-                        pass  # deleted live or never existed: a new file for us
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
-                result["applied"].append(rel)
-            result["commit"] = commit_all(project_id)
-        except OSError as exc:
+                projected_bytes += os.path.getsize(src)
+                if os.path.isfile(dst):
+                    projected_bytes -= os.path.getsize(dst)
+            if projected_bytes > MAX_PROJECT_WORKSPACE_BYTES:
+                raise ValueError(
+                    f"Project workspace quota exceeded ({MAX_PROJECT_WORKSPACE_BYTES} bytes)")
+            # Stage every new version and every original on the same volume.
+            # A failed replace can then roll back all earlier replacements.
+            # Each individual file becomes visible atomically via os.replace.
+            stage_root = tempfile.mkdtemp(prefix=".af-merge-",
+                                          dir=os.path.dirname(ws_dir))
+            journal_written = False
+            merge_complete = False
+            try:
+                for rel in changed:
+                    src = os.path.join(run_ws, *rel.split("/"))
+                    dst = os.path.join(ws_dir, *rel.split("/"))
+                    staged = os.path.join(stage_root, "new", *rel.split("/"))
+                    backup = os.path.join(stage_root, "old", *rel.split("/"))
+                    m_entry = manifest.get(rel)
+                    if m_entry is not None:
+                        try:
+                            live_st = os.stat(dst)
+                            if (live_st.st_size, live_st.st_mtime_ns) != m_entry \
+                                    and rel not in result["conflicts"]:
+                                result["conflicts"].append(rel)
+                        except OSError:
+                            pass
+                    os.makedirs(os.path.dirname(staged), exist_ok=True)
+                    shutil.copy2(src, staged)
+                    if os.path.isfile(dst):
+                        os.makedirs(os.path.dirname(backup), exist_ok=True)
+                        shutil.copy2(dst, backup)
+                _write_merge_journal(stage_root, ws_dir, changed)
+                journal_written = True
+                for rel in changed:
+                    staged = os.path.join(stage_root, "new", *rel.split("/"))
+                    dst = os.path.join(ws_dir, *rel.split("/"))
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    os.replace(staged, dst)
+                result["commit"] = commit_all(project_id)
+                with open(os.path.join(stage_root, "committed"), "w", encoding="utf-8") as fh:
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                merge_complete = True
+                result["applied"] = changed
+            except Exception:
+                if journal_written:
+                    _recover_merge_journal(stage_root, ws_dir)
+                raise
+            finally:
+                if os.path.isdir(stage_root) and not journal_written:
+                    shutil.rmtree(stage_root, ignore_errors=True)
+                elif os.path.isdir(stage_root) and merge_complete:
+                    shutil.rmtree(stage_root, ignore_errors=True)
+        except Exception as exc:
             result["error"] = str(exc)[:200]
         finally:
             if leased:

@@ -1,0 +1,16 @@
+{
+  "name": "Bug fix",
+  "description": "Reproduce, fix and regression-test a specific defect.",
+  "about": "Fix a known bug in {area} with a failing-test-first approach.",
+  "title": "Fix: {symptom}",
+  "description": "Bug in {area}: {symptom}.\nRoot-cause it first; add a regression test that reproduces the bug BEFORE changing production code, then make it pass with the smallest correct change.",
+  "acceptance_criteria": "Given the reproduction steps: {repro}\nWhen the regression test runs against the fixed code\nThen the test passes\nAnd the original symptom no longer occurs\nAnd no unrelated behavior changed (existing tests still pass)",
+  "story_points": 2,
+  "priority": 1,
+  "suggested_role": "Senior Developer",
+  "variables": [
+    {"name": "symptom", "label": "Observed symptom", "example": "login returns 500 on empty password"},
+    {"name": "area", "label": "Affected area", "example": "auth module"},
+    {"name": "repro", "label": "Reproduction steps", "example": "POST /login with password=''"}
+  ]
+}

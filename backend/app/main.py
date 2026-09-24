@@ -9,13 +9,14 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import chatbot, db, po, runtime, workspace
-from .routers import agents, chat, events, gateways, models, projects, roles, settings, tasks
+from .routers import (agents, chat, events, gateways, governance, models,
+                      playground, projects, roles, settings, tasks)
 from .rate_limit import rate_limit_middleware
 from .task_registry import background_tasks
 
@@ -28,6 +29,7 @@ STATIC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "stat
 async def lifespan(app: FastAPI):
     db.init_db()
     workspace.relocate_workspaces()
+    workspace.recover_merge_journals()
     runtime.recover_orphans()
     runtime.set_loop(asyncio.get_running_loop())
 
@@ -87,6 +89,16 @@ app.include_router(tasks.router)
 app.include_router(chat.router)
 app.include_router(settings.router)
 app.include_router(events.router)
+app.include_router(governance.router)
+app.include_router(playground.router)
+
+
+@app.get("/api/v1/health")
+def health():
+    """Liveness probe used by the frontend offline banner — must answer
+    before the SPA catch-all exists, or the probe silently 'succeeds' on
+    index.html."""
+    return {"ok": True, "service": "AgentForge API", "version": app.version}
 
 
 # Static frontend
@@ -95,6 +107,10 @@ if os.path.isdir(STATIC_DIR):
 
     @app.get("/{full_path:path}")
     def spa_fallback(full_path: str):
+        # Unknown /api/... paths must 404 as JSON, not serve index.html with
+        # a 200 — otherwise typos and removed endpoints look "alive".
+        if full_path.startswith("api/") or full_path == "api":
+            raise HTTPException(404, "Not Found")
         candidate = os.path.join(STATIC_DIR, full_path)
         if full_path and os.path.isfile(candidate):
             return FileResponse(candidate)

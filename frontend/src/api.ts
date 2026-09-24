@@ -1,3 +1,5 @@
+import { useAppStore } from './store';
+
 /**
  * List endpoints return a paginated envelope `{ total, items, limit, offset }`
  * while the rest of the app consumes plain arrays. Unwrap that envelope here
@@ -33,7 +35,11 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
     } catch { /* ignore */ }
     throw new Error(String(detail));
   }
-  return unwrapEnvelope(await res.json()) as T;
+  const data = unwrapEnvelope(await res.json()) as T;
+  if (options.method && options.method.toUpperCase() !== 'GET') {
+    useAppStore.getState().notifyMutation();
+  }
+  return data;
 }
 
 export interface Page<T> {
@@ -88,15 +94,6 @@ export function fmtRel(iso: string): string {
   if (d < 7) return `${d} day${d > 1 ? 's' : ''} ago`;
   const w = Math.floor(d / 7);
   return `${w} week${w > 1 ? 's' : ''} ago`;
-}
-
-// Minimal markdown renderer: bold + inline code + newlines (escaped).
-export function md(text: string): string {
-  const esc = text
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  return esc
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
 }
 
 export const AGENT_STATE_CLASS: Record<string, string> = {

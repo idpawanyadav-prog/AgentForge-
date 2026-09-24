@@ -1,9 +1,4 @@
 import asyncio
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 from app.task_registry import BackgroundTaskRegistry  # noqa: E402
 
 

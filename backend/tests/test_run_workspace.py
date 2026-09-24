@@ -4,20 +4,16 @@ Runs against a throwaway SQLite DB (AGENT_OFFICE_DB) and temp folders;
 no git required (commit_all degrades to None outside a repo).
 """
 import os
-import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 _TMP = tempfile.mkdtemp(prefix="af_runws_")
-os.environ["AGENT_OFFICE_DB"] = os.path.join(_TMP, "test.db")
 os.environ["AGENT_OFFICE_WORKSPACES"] = os.path.join(_TMP, "workspaces")
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest  # noqa: E402
 
 from app import db as appdb  # noqa: E402
 from app import workspace  # noqa: E402
-
-appdb.init_db()
 
 PID = "proj-rw-1"
 
@@ -77,11 +73,77 @@ def test_merge_applies_modified_new_and_artifacts(live_ws):
     assert not workspace._file_leases.get(PID), "leases must be released"
 
 
+def test_merge_failure_rolls_back_all_replaced_files(live_ws, monkeypatch):
+    note_path = os.path.join(live_ws, "notes.md")
+    prior_note = open(note_path).read() if os.path.isfile(note_path) else None
+    run_ws, manifest = _begin("run-rollback")
+    _mk(os.path.join(run_ws, "app", "main.py"), "print('new')\n")
+    _mk(os.path.join(run_ws, "notes.md"), "new file\n")
+    original_replace = workspace.os.replace
+    calls = 0
+
+    def fail_second_replace(src, dst):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated merge failure")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(workspace.os, "replace", fail_second_replace)
+    result = workspace.merge_back_run_workspace(PID, "run-rollback", run_ws, manifest)
+    assert "simulated merge failure" in result["error"]
+    assert result["applied"] == []
+    assert open(os.path.join(live_ws, "app", "main.py")).read() == "print('v1')\n"
+    assert (open(note_path).read() if os.path.isfile(note_path) else None) == prior_note
+    assert not workspace._file_leases.get(PID)
+
+
 def test_merge_of_untouched_copy_changes_nothing(live_ws):
     run_ws, manifest = _begin("run-c")
     res = workspace.merge_back_run_workspace(PID, "run-c", run_ws, manifest)
     assert res["applied"] == [] and res["conflicts"] == []
     assert not res["error"]
+
+
+def test_project_quota_rejects_merge_without_changes(live_ws, monkeypatch):
+    run_ws, manifest = _begin("run-quota")
+    _mk(os.path.join(run_ws, "large.txt"), "x" * 100)
+    monkeypatch.setattr(workspace, "MAX_PROJECT_WORKSPACE_BYTES", 50)
+    result = workspace.merge_back_run_workspace(PID, "run-quota", run_ws, manifest)
+    assert "quota exceeded" in result["error"]
+    assert not os.path.exists(os.path.join(live_ws, "large.txt"))
+
+
+def test_concurrent_merges_cannot_exceed_project_quota(live_ws, monkeypatch):
+    first_ws, first_manifest = _begin("quota-one")
+    second_ws, second_manifest = _begin("quota-two")
+    _mk(os.path.join(first_ws, "first.txt"), "a" * 10)
+    _mk(os.path.join(second_ws, "second.txt"), "b" * 10)
+    monkeypatch.setattr(workspace, "commit_all", lambda *_: None)
+    monkeypatch.setattr(workspace, "MAX_PROJECT_WORKSPACE_BYTES",
+                        workspace._workspace_bytes(live_ws) + 15)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        one = pool.submit(workspace.merge_back_run_workspace, PID, "quota-one",
+                          first_ws, first_manifest)
+        two = pool.submit(workspace.merge_back_run_workspace, PID, "quota-two",
+                          second_ws, second_manifest)
+        results = [one.result(), two.result()]
+    assert sum(not r["error"] for r in results) == 1
+    assert sum(os.path.exists(os.path.join(live_ws, name)) for name in
+               ("first.txt", "second.txt")) == 1
+
+
+def test_startup_recovers_interrupted_merge(live_ws):
+    stage = tempfile.mkdtemp(prefix=".af-merge-", dir=os.path.dirname(live_ws))
+    old = os.path.join(stage, "old", "app", "main.py")
+    _mk(old, "print('v1')\n")
+    workspace._write_merge_journal(stage, live_ws, ["app/main.py", "new.txt"])
+    _mk(os.path.join(live_ws, "app", "main.py"), "print('partial')\n")
+    _mk(os.path.join(live_ws, "new.txt"), "partial")
+    assert workspace.recover_merge_journals() == 1
+    assert open(os.path.join(live_ws, "app", "main.py")).read() == "print('v1')\n"
+    assert not os.path.exists(os.path.join(live_ws, "new.txt"))
+    assert not os.path.exists(stage)
 
 
 def test_merge_detects_conflict_with_externally_changed_live_file(live_ws):
@@ -124,6 +186,25 @@ def test_no_workspace_returns_empty(live_ws):
     assert run_ws == "" and manifest == {}
 
 
+def test_repository_url_validation():
+    assert workspace._is_git_url("https://example.com/team/repo.git")
+    assert workspace._is_git_url("git@example.com:team/repo.git")
+    for url in ("-u evil", "ext::sh -c whoami", "file:///tmp/repo.git",
+                "https://user:secret@example.com/repo.git", "repo.git"):
+        assert not workspace._is_git_url(url)
+
+
+def test_run_copy_failure_is_reported(live_ws, monkeypatch):
+    original = workspace.shutil.copy2
+    def fail_source(src, dst, *args, **kwargs):
+        if src.endswith("main.py") and str(live_ws) in src:
+            raise OSError("locked")
+        return original(src, dst, *args, **kwargs)
+    monkeypatch.setattr(workspace.shutil, "copy2", fail_source)
+    run_ws, manifest = _begin("run-copy-fail")
+    assert (run_ws, manifest) == ("", {})
+
+
 # ------------------------------------------------ end-to-end runtime isolation
 
 def test_dev_run_works_on_copy_and_merges_back(live_ws, monkeypatch):
@@ -161,7 +242,7 @@ def test_dev_run_works_on_copy_and_merges_back(live_ws, monkeypatch):
 
     seen = []
 
-    def fake_gen(project, task, agent_ref, feedback="", pinned_ref=None):
+    def fake_gen(project, task, agent_ref, feedback="", pinned_ref=None, deadline=None):
         ws = project["workspace_path"]
         seen.append(ws)
         # the core guarantee: the codegen target is the temp copy, never live

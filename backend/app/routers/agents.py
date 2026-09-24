@@ -6,14 +6,9 @@ from pydantic import BaseModel
 
 from ..db import audit, execute, insert, new_id, now, query, query_one, update
 from ..schemas import AgentUpdate, TeamUpdate
+from ._util import or_404 as _or_404
 
 router = APIRouter(prefix="/api/v1", tags=["agents"])
-
-
-def _or_404(row, what="Resource"):
-    if row is None:
-        raise HTTPException(404, f"{what} not found")
-    return row
 
 
 class AgentIn(BaseModel):
@@ -78,6 +73,22 @@ def delete_agent(aid: str):
     agent = _or_404(query_one("SELECT * FROM agents WHERE id=?", (aid,)), "Agent")
     if agent["lifecycle_state"] not in ("Idle", "Failed"):
         raise HTTPException(409, "Agent is busy; stop its execution first")
+    open_tasks = query_one(
+        "SELECT COUNT(*) AS n FROM tasks WHERE assigned_agent_id = ? AND status NOT IN ('Done','Cancelled')",
+        (aid,))["n"]
+    if open_tasks:
+        raise HTTPException(409, f"Agent still owns {open_tasks} open task(s) — "
+                                 "reassign or cancel them first")
+    # FK-complete: history rows keep a nullable FK to the agent, so clear the
+    # references instead of letting SQLite reject the delete with a 500.
+    execute("UPDATE workflow_runs SET agent_id=NULL WHERE agent_id=?", (aid,))
+    execute("UPDATE tasks SET assigned_agent_id=NULL WHERE assigned_agent_id=?", (aid,))
+    execute("UPDATE tasks SET qa_agent_id=NULL WHERE qa_agent_id=?", (aid,))
+    execute("UPDATE task_reviews SET reviewer_agent_id=NULL WHERE reviewer_agent_id=?", (aid,))
+    execute("UPDATE dependency_requests SET requested_by_agent_id=NULL WHERE requested_by_agent_id=?", (aid,))
+    execute("UPDATE project_memory SET owner_agent_id=NULL WHERE owner_agent_id=?", (aid,))
+    execute("UPDATE agent_messages SET from_agent_id=NULL WHERE from_agent_id=?", (aid,))
+    execute("UPDATE agent_messages SET to_agent_id=NULL WHERE to_agent_id=?", (aid,))
     execute("DELETE FROM team_agents WHERE agent_id=?", (aid,))
     execute("DELETE FROM agents WHERE id=?", (aid,))
     return {"ok": True}

@@ -1,19 +1,9 @@
 import json
-import os
-import sys
-import tempfile
-
-_DB = os.path.join(tempfile.mkdtemp(prefix="af_resolver_"), "test.db")
-os.environ["AGENT_OFFICE_DB"] = _DB
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest  # noqa: E402
 
 from app import db as appdb  # noqa: E402
 from app.llm.resolver import resolve_project_model  # noqa: E402
-
-appdb.init_db()
-
 
 def _clear():
     for tbl in ("settings", "projects", "gateway_models", "gateways"):

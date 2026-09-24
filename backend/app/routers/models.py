@@ -10,11 +10,13 @@ swapping a member) propagates to every agent that uses it.
 from __future__ import annotations
 
 import json
+from functools import partial
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from ..db import audit, execute, insert, new_id, query, query_one, update
+from ._util import or_404
 
 router = APIRouter(prefix="/api/v1", tags=["models"])
 
@@ -50,10 +52,7 @@ _SELECT = (
 )
 
 
-def _or_404(row, what="Model"):
-    if row is None:
-        raise HTTPException(404, f"{what} not found")
-    return row
+_or_404 = partial(or_404, what="Model")
 
 
 def _validate(gateway_id: str, model_id: str):

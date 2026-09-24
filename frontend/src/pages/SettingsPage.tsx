@@ -1,6 +1,8 @@
 import React from 'react';
-import { get, post, put, patch, del, fmtDateTime, md } from '../api';
+import { get, post, put, patch, del, fmtDateTime } from '../api';
+import { MarkdownText } from '../MarkdownText';
 import { Badge, Field, Modal, useAsyncData, ErrorNote, Collapse } from '../components';
+import { GatewaySchema } from '../validation';
 
 export default function SettingsPage() {
   const { data: gateways, reload } = useAsyncData<any[]>(() => get('/api/v1/gateways'), []);
@@ -231,7 +233,7 @@ function ModelPlayground({ gateways, onError }: { gateways: any[]; onError: (e: 
       <div className="playground-msgs">
         {messages.map((m, i) => (
           <div key={i} className={`msg ${m.role}`}>
-            <div dangerouslySetInnerHTML={{ __html: md(m.content) }} />
+            <div><MarkdownText text={m.content} /></div>
             {m.meta && <div className="kv" style={{ marginTop: 6 }}>{m.meta}</div>}
           </div>
         ))}
@@ -349,6 +351,7 @@ function GatewayForm({ gateway, onClose, onSaved }: { gateway?: any; onClose: ()
     base_url: gateway?.base_url ?? 'https://api.openai.com/v1',
     api_type: gateway?.api_type ?? 'openai-chat', api_key: '',
   });
+  const [validationError, setValidationError] = React.useState('');
   const upd = (k: string) => (e: any) => setF({ ...f, [k]: e.target.value });
   return (
     <Modal title={gateway ? `Edit Gateway: ${gateway.name}` : 'Add Gateway'} onClose={onClose}>
@@ -371,18 +374,22 @@ function GatewayForm({ gateway, onClose, onSaved }: { gateway?: any; onClose: ()
         <input type="password" value={f.api_key} onChange={upd('api_key')}
           placeholder={gateway?.key_mask ?? 'sk-…'} />
       </Field>
-      <button className="btn primary" disabled={!f.name || !f.base_url} onClick={async () => {
+      <ErrorNote error={validationError} />
+      <button className="btn primary" disabled={!f.name.trim() || !f.base_url.trim()} onClick={async () => {
+        const checked = GatewaySchema.safeParse(f);
+        if (!checked.success) { setValidationError(checked.error.issues[0]?.message ?? 'Invalid gateway'); return; }
+        setValidationError('');
         try {
           if (gateway) {
-            const body: any = { name: f.name, provider: f.provider, base_url: f.base_url, api_type: f.api_type };
+            const body: any = { name: checked.data.name, provider: f.provider, base_url: checked.data.base_url, api_type: f.api_type };
             if (f.api_key) body.api_key = f.api_key;
             await patch(`/api/v1/gateways/${gateway.id}`, body);
           } else {
-            const g = await post('/api/v1/gateways', f);
+            const g = await post('/api/v1/gateways', checked.data);
             await post(`/api/v1/gateways/${g.id}/test`).catch(() => undefined);
           }
           onSaved();
-        } catch (e: any) { alert(e.message); }
+        } catch (e: any) { setValidationError(e.message || String(e)); }
       }}>{gateway ? 'Save Gateway' : 'Create & Test Gateway'}</button>
     </Modal>
   );

@@ -1,8 +1,14 @@
 """Gateway and model routes."""
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import logging
+import httpx
+import ipaddress
+import os
+import socket
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
@@ -92,6 +98,15 @@ def update_gateway(gid: str, body: GatewayUpdate):
 @router.delete("/gateways/{gid}")
 def delete_gateway(gid: str):
     _or_404(gid)
+    # FK guards: model_bindings and project defaults reference this
+    # gateway's rows; without these checks the delete 500s on FK violation.
+    if query_one("SELECT id FROM model_bindings WHERE gateway_id=? LIMIT 1", (gid,)):
+        raise HTTPException(409, "Gateway is used by models in the catalog — "
+                                 "delete or re-point those models first")
+    if query_one("SELECT id FROM projects WHERE default_gateway_id=? OR default_model_id IN "
+                 "(SELECT id FROM gateway_models WHERE gateway_id=?) LIMIT 1", (gid, gid)):
+        raise HTTPException(409, "Gateway (or one of its models) is a project default — "
+                                 "pick another gateway for those projects first")
     execute("DELETE FROM gateway_models WHERE gateway_id = ?", (gid,))
     execute("DELETE FROM gateways WHERE id = ?", (gid,))
     audit("delete_gateway", "gateway", gid, "Deleted gateway")
@@ -153,6 +168,11 @@ def add_model(gid: str, body: ModelIn):
 @router.delete("/gateways/{gid}/models/{mid}")
 def delete_model(gid: str, mid: str):
     _or_404(gid)
+    if query_one("SELECT id FROM model_bindings WHERE model_id=? LIMIT 1", (mid,)):
+        raise HTTPException(409, "Model is referenced by catalog entries — "
+                                 "remove it from those models first")
+    if query_one("SELECT id FROM projects WHERE default_model_id=? LIMIT 1", (mid,)):
+        raise HTTPException(409, "Model is a project default — clear that first")
     execute("DELETE FROM gateway_models WHERE id=? AND gateway_id=?", (mid, gid))
     return {"ok": True}
 
@@ -180,9 +200,9 @@ def gateway_test_chat(gid: str, body: TestChatIn):
 
 
 @router.post("/gateways/{gid}/discover")
-def discover_models(gid: str):
+async def discover_models(gid: str):
     gw = _or_404(gid)
-    result = _live_model_ids(gw)
+    result = await _live_model_ids(gw)
     source = "provider-catalog"
     if result["ok"] and result["ids"]:
         source = "live"
@@ -203,23 +223,47 @@ def discover_models(gid: str):
     return {"source": source, "added": sync["added"], "removed": sync["removed"], "total": total}
 
 
-def _live_model_ids(gw) -> dict:
-    import urllib.error as _uerr
-    import urllib.request as _ureq
-
+async def _live_model_ids(gw) -> dict:
     api_key = db.get_gateway_key(gw["id"])
     if not api_key:
         return {"ok": False, "ids": [], "error": "Gateway key not configured or could not be decrypted"}
-    base = gw["base_url"].rstrip("/")
-    if "/v1" not in base:
-        base += "/v1"
-    req = _ureq.Request(base + "/models", headers={"Authorization": f"Bearer {api_key}"})
     try:
-        with _ureq.urlopen(req, timeout=15) as resp:
-            data = _json.loads(resp.read())
+        url = await _models_discovery_url(gw["base_url"])
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(url,
+                                        headers={"Authorization": f"Bearer {api_key}"})
+            response.raise_for_status()
+            data = response.json()
         ids = [m.get("id") for m in data.get("data", []) if m.get("id")]
         return {"ok": True, "ids": ids, "error": None}
-    except _uerr.HTTPError as e:
-        return {"ok": False, "ids": [], "error": f"Gateway returned HTTP {e.code}"}
+    except httpx.HTTPStatusError as exc:
+        return {"ok": False, "ids": [],
+                "error": f"Gateway returned HTTP {exc.response.status_code}"}
     except Exception as exc:
         return {"ok": False, "ids": [], "error": f"Could not reach gateway: {exc}"}
+
+
+async def _models_discovery_url(base_url: str) -> str:
+    """Validate the destination at call time; allow loopback for local models."""
+    parsed = urlsplit(base_url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Gateway URL must be an HTTP(S) host without credentials")
+    host = parsed.hostname.lower().rstrip(".")
+    if host in {"metadata.google.internal", "metadata", "instance-data"}:
+        raise ValueError("Gateway host is reserved for instance metadata")
+    allow_private = os.environ.get("AGENTFORGE_ALLOW_PRIVATE_GATEWAYS") == "1"
+    try:
+        addresses = await asyncio.to_thread(socket.getaddrinfo, host, parsed.port or
+                                            (443 if parsed.scheme == "https" else 80))
+    except socket.gaierror as exc:
+        raise ValueError(f"Gateway host could not be resolved: {exc}") from exc
+    for address in addresses:
+        ip = ipaddress.ip_address(address[4][0])
+        if ip.is_loopback:
+            continue
+        if not allow_private and not ip.is_global:
+            raise ValueError("Gateway host resolves to a private or reserved address")
+    path = parsed.path.rstrip("/")
+    if not path.lower().endswith("/v1"):
+        path += "/v1"
+    return urlunsplit((parsed.scheme, parsed.netloc, path + "/models", "", ""))

@@ -1,0 +1,31 @@
+# Pre-commit hooks for the AgentForge dev loop (pip install pre-commit && pre-commit install).
+# Network-dependent hooks (audits) run only when the requirements files
+# change, or on demand: `pre-commit run --hook-stage manual --all-files`.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-fatal
+        name: ruff (fatal-error rules)
+        entry: python -m ruff check --select E9,F63,F7,F82 backend/app
+        language: system
+        pass_filenames: false
+      - id: backend-tests-quick
+        name: backend tests (offline subset)
+        entry: python -m pytest -q -x -n auto backend/tests
+        language: system
+        files: ^backend/
+        pass_filenames: false
+      - id: pip-audit
+        name: pip-audit (backend deps)
+        entry: python -m pip_audit -r backend/requirements.txt
+        language: system
+        files: ^backend/requirements.*\.txt$
+        pass_filenames: false
+        stages: [manual]
+      - id: npm-audit
+        name: npm audit (frontend deps)
+        entry: bash -c 'cd frontend && npm audit --omit=dev'
+        language: system
+        files: ^frontend/package(-lock)?\.json$
+        pass_filenames: false
+        stages: [manual]

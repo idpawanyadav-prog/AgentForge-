@@ -9,14 +9,9 @@ from pydantic import BaseModel
 
 from .. import chatbot, po
 from ..db import audit, execute, insert, new_id, now, query, query_one, update
+from ._util import or_404 as _or_404
 
 router = APIRouter(prefix="/api/v1", tags=["chat"])
-
-
-def _or_404(row, what="Resource"):
-    if row is None:
-        raise HTTPException(404, f"{what} not found")
-    return row
 
 
 class MessageIn(BaseModel):
@@ -100,10 +95,10 @@ def delete_conversation(cid: str):
 
 @router.post("/projects/{pid}/conversations/{cid}/messages")
 async def post_message(pid: str, cid: str, body: MessageIn):
-    _or_404(query_one("SELECT id FROM conversations WHERE id=?", (cid,)), "Conversation")
+    _or_404(query_one("SELECT id FROM conversations WHERE id=? AND project_id=?", (cid, pid)),
+            "Conversation")
     if not body.content.strip():
         raise HTTPException(400, "Message content is required")
-    result = await _asyncio.get_running_loop().run_in_executor(
-        None, chatbot.handle_message, pid, cid, body.content)
+    result = await chatbot.handle_message_async(pid, cid, body.content)
     messages = query("SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at, rowid", (cid,))
     return {**result, "messages": messages}

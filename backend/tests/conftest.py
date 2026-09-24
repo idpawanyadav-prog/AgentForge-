@@ -31,6 +31,7 @@ if str(BACKEND) not in sys.path:
 
 import pytest  # noqa: E402
 
+from app import budget as appbudget  # noqa: E402
 from app import db as appdb  # noqa: E402
 
 
@@ -58,5 +59,9 @@ def _build_schema(path: str):
 @pytest.fixture(autouse=True)
 def isolated_db(tmp_path):
     _build_schema(str(tmp_path / "test.db"))
+    # budget's in-flight ledger is process-global module state; a codegen
+    # test that fakes a non-dry LLM response would otherwise leak spend into
+    # later tests on the same xdist worker.
+    appbudget._inflight.clear()
     yield
     _close_conn()
