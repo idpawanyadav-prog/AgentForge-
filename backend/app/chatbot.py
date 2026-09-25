@@ -1139,7 +1139,7 @@ def _cmd_assign_task(project_id, args, ts) -> str:
         "SELECT r.name AS role_name FROM agents a JOIN roles r ON r.id = a.role_id WHERE a.id = ?",
         (agent["id"],))
     mismatch = ""
-    if agent_role and task["status"] not in ("Waiting QA", "SA Review", "BA Review"):
+    if agent_role and task["status"] not in ("Waiting QA", "Code Review", "SA Review", "BA Review"):
         family = runtime._family_for_task(task)
         agent_family = runtime._family_of_role(agent_role["role_name"] or "")
         if family and agent_family and family != agent_family:

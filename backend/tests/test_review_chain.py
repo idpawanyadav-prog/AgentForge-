@@ -168,6 +168,22 @@ def test_sa_rework_returns_to_developer(fx):
     assert "UI layer" in rev["findings"]
 
 
+def test_rework_ignores_foreign_non_dev_author(fx):
+    # After a team re-provision the recorded author can be the wrong role
+    # (here the BA). Dev rework must go back to a developer, not that author
+    # and not the SA reviewer that rejected it.
+    task = _mk_task(status="SA Review", assigned="sa1", qa_agent_id="ba1")
+    ctrl = {"review": {"decision": "rework", "findings": "wrong layering",
+                       "rework_class": "ARCHITECTURE_VIOLATION",
+                       "input_tokens": 0, "output_tokens": 0}}
+    _mk_run("sa1")
+    asyncio.run(runtime._finish_review_run("run1", ctrl, PID, "tk1", "sa1", task, "sa",
+                                           0, 0, 0.0))
+    row = appdb.query_one("SELECT * FROM tasks WHERE id='tk1'")
+    assert row["status"] == "Rework"
+    assert row["assigned_agent_id"] == "dev1"
+
+
 def test_sa_approved_advances_to_ba_then_qa(fx):
     appdb.update("projects", PID, {"sa_review_enabled": 1, "ba_review_enabled": 1})
     approved = {"decision": "approved", "findings": "", "rework_class": "",

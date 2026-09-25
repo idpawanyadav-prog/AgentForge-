@@ -3,8 +3,10 @@ change requests (spec §4/§10/§11; AF3-001/005/007) — plus V3 Step 2 spec
 pipeline documents (BAS/PDS/TS/BLUEPRINT/SPRINT-PLAN) for chat links."""
 from __future__ import annotations
 
+import sys
+
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from .. import governance
@@ -110,6 +112,52 @@ def get_document(pid: str, kind: str):
     if not doc:
         raise HTTPException(404, f"No {kind.upper()} document for this project yet")
     return doc["content_md"]
+
+
+_REVEAL_PAGE = (
+    "<!doctype html><meta charset=utf-8><title>Revealed</title>"
+    "<body style='font:14px system-ui;margin:2rem'>📂 {msg}"
+    "<script>setTimeout(function(){{window.close()}},1200)</script></body>"
+)
+
+
+@router.get("/projects/{pid}/documents/{kind}/reveal", response_class=HTMLResponse)
+def reveal_document(pid: str, kind: str):
+    """Open the project's docs folder in the OS file manager, selecting the
+    authored document. Local-only convenience for the desktop app."""
+    import os
+    import re
+    import subprocess
+    _project_or_404(pid)
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", kind):
+        raise HTTPException(400, "Invalid document name")
+    from ..db import query_one
+    row = query_one("SELECT workspace_path FROM projects WHERE id = ?", (pid,))
+    ws = (row or {}).get("workspace_path")
+    if not ws:
+        return HTMLResponse(_REVEAL_PAGE.format(
+            msg="This project has no workspace path set, so there is no folder to open."))
+    docs_dir = os.path.join(ws, "docs")
+    target = os.path.join(docs_dir, f"{kind}.md")
+    try:
+        if not os.path.isdir(docs_dir):
+            os.makedirs(docs_dir, exist_ok=True)
+        system = os.name
+        if system == "nt":
+            if os.path.exists(target):
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(target)])
+            else:
+                os.startfile(docs_dir)  # noqa: S606
+        elif system == "posix":
+            if sys.platform == "darwin" and os.path.exists(target):
+                subprocess.Popen(["open", "-R", target])
+            else:
+                subprocess.Popen(["xdg-open", docs_dir])
+        msg = f"Opened <b>{docs_dir}</b>" + (f" and selected {kind}.md"
+                                             if os.path.exists(target) else "")
+    except OSError as exc:
+        raise HTTPException(500, f"Could not open the folder: {exc}")
+    return HTMLResponse(_REVEAL_PAGE.format(msg=msg))
 
 
 @router.get("/projects/{pid}/change_requests")

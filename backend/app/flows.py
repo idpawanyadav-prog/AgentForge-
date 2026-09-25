@@ -16,12 +16,13 @@ from .db import audit, execute, insert, new_id, now, query, query_one, update
 # QA tooling and approval chat commands keep working for any flow.
 STAGE_DEFS = {
     "dev": ("implement", "Senior Developer"),
+    "cr": ("review", "Senior Developer"),
     "sa": ("review", "Solution Architect"),
     "ba": ("review", "Business Analyst"),
     "qa": ("test", "QA Engineer"),
     "approve": ("approve", "Product Owner"),
 }
-STAGE_LABEL = {"dev": "Developer", "sa": "SA review", "ba": "BA review",
+STAGE_LABEL = {"dev": "Developer", "cr": "Code review", "sa": "SA review", "ba": "BA review",
                "qa": "QA test", "approve": "Approval"}
 DEFAULT_STAGES = ["dev", "sa", "ba", "qa"]
 
@@ -100,7 +101,7 @@ def stage_order(flow: dict) -> list:
     return stages or list(DEFAULT_STAGES)
 
 
-_CANONICAL = ["dev", "sa", "ba", "qa", "approve"]
+_CANONICAL = ["dev", "cr", "sa", "ba", "qa", "approve"]
 
 
 def next_after(flow: dict, stage: str):

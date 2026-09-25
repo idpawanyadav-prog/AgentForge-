@@ -39,7 +39,8 @@ _claim_lock = threading.Lock()
 # call_soon_threadsafe cancellation.
 
 TASK_STATUSES = ["Todo", "Ready", "In Progress", "Blocked", "Review", "Testing",
-                 "Waiting QA", "SA Review", "BA Review", "Rework", "Done", "Cancelled"]
+                 "Waiting QA", "Code Review", "SA Review", "BA Review", "Rework",
+                 "Done", "Cancelled"]
 AGENT_STATES = ["Idle", "Working", "Waiting", "Blocked", "Failed", "Paused", "Completed"]
 
 # Track provider health per gateway; a failure in one project must not
@@ -114,18 +115,29 @@ SA_REVIEW_PHASES = [
 BA_REVIEW_PHASES = [
     ("ba-review", "Business Analyst: reviewing functional alignment", ["code-review"], "BA Review", 92),
 ]
+CR_REVIEW_PHASES = [
+    ("cr-review", "Senior Developer: reviewing code quality and correctness", ["code-review"], "Code Review", 92),
+]
 
 _PHASES_BY_MODE = {
     "dev": PHASES, "qa": QA_PHASES, "sa": SA_REVIEW_PHASES, "ba": BA_REVIEW_PHASES,
+    "cr": CR_REVIEW_PHASES,
 }
+
+# Modes whose run is a single LLM review-gate verdict (vs. authoring/testing).
+_REVIEW_MODES = ("sa", "ba", "cr")
+# review mode -> the task status / gate label it represents
+_MODE_STAGE = {"sa": "SA Review", "ba": "BA Review", "cr": "Code Review"}
 
 # Review-stage status -> (task_reviews.reviewer_type, team role family)
 _REVIEW_STAGES = {
     "SA Review": ("solution_architect", "architecture"),
     "BA Review": ("business_analyst", "requirements"),
+    "Code Review": ("code_review", "dev"),
 }
 
-_RUN_MODE_LABEL = {"dev": "", "qa": "QA: ", "sa": "SA review: ", "ba": "BA review: "}
+_RUN_MODE_LABEL = {"dev": "", "qa": "QA: ", "sa": "SA review: ", "ba": "BA review: ",
+                   "cr": "Code review: "}
 
 # After this many QA rejections the task is escalated to a human.
 MAX_REWORK_CYCLES = config.MAX_REWORK_CYCLES
@@ -258,7 +270,8 @@ def _run_mode(task) -> str:
     return _MODE_BY_STATUS.get(task["status"], "dev")
 
 
-_MODE_BY_STATUS = {"Waiting QA": "qa", "SA Review": "sa", "BA Review": "ba"}
+_MODE_BY_STATUS = {"Waiting QA": "qa", "SA Review": "sa", "BA Review": "ba",
+                   "Code Review": "cr"}
 
 
 def start_execution(project_id: str, task_id: str, idempotency_key: str | None = None):
@@ -330,7 +343,7 @@ def _start_execution_locked(project_id: str, task_id: str,
                 output_cost_per_m = binding["output_cost_per_m"]
 
     mode = _run_mode(task)
-    review_mode = mode in ("sa", "ba")
+    review_mode = mode in _REVIEW_MODES
     run_id = new_id()
     try:
         insert("workflow_runs", {
@@ -387,7 +400,7 @@ async def _run_phases(run_id: str, ctrl: dict, mode: str = "dev"):
     task = query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
     project = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     phases = _PHASES_BY_MODE[mode]
-    review_mode = mode in ("sa", "ba")
+    review_mode = mode in _REVIEW_MODES
     evidence = []
     llm_tokens = {"in": 0, "out": 0}
     test_summary = ""
@@ -936,7 +949,7 @@ def _qa_handoff(project_id, task, dev_agent_id, evidence_str):
     return True
 
 
-_STAGE_STATUS = {"sa": "SA Review", "ba": "BA Review"}
+_STAGE_STATUS = {"sa": "SA Review", "ba": "BA Review", "cr": "Code Review"}
 
 
 def _advance_stage(project, task, from_stage, dev_agent_id, evidence_str):
@@ -1025,7 +1038,7 @@ def resolve_task_approval(project_id, task_ref, decision, notes="", actor="user"
         return ("Several tasks await approval — name one, e.g. "
                 f"`{'approve' if decision == 'approve' else 'reject'} task "
                 f"{pending[0]['id'][:8]}`.")
-    dev_agent_id = task["qa_agent_id"] or task["assigned_agent_id"]
+    dev_agent_id = _author_agent_id(project_id, task, task["assigned_agent_id"])
     evidence_str = ((task["evidence"] + "; ") if task["evidence"] else "") + \
         f"approval:{actor}={decision}"
     if decision == "approve":
@@ -1159,7 +1172,7 @@ async def _finish_review_run(run_id, ctrl, project_id, task_id, agent_id, task, 
     After MAX_REWORK_CYCLES the task is blocked for human/PO review, and an
     'unavailable' verdict (no gateway / LLM outage) never punishes the dev —
     the gate is skipped and the chain advances."""
-    stage = "SA Review" if mode == "sa" else "BA Review"
+    stage = _MODE_STAGE[mode]
     reviewer_type, _ = _REVIEW_STAGES[stage]
     verdict = ctrl.get("review") or {
         "decision": "unavailable", "findings": "review verdict missing", "rework_class": ""}
@@ -1167,7 +1180,7 @@ async def _finish_review_run(run_id, ctrl, project_id, task_id, agent_id, task, 
     findings = (verdict["findings"] or "")[:600]
     rework_class = verdict.get("rework_class") or ""
     task = query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
-    dev_agent_id = task["qa_agent_id"] or agent_id
+    dev_agent_id = _author_agent_id(project_id, task, agent_id)
     reviewer = query_one("SELECT name FROM agents WHERE id = ?", (agent_id,))
     reviewer_name = reviewer["name"] if reviewer else stage
     row = query_one("SELECT * FROM task_reviews WHERE task_id = ? AND reviewer_type = ? "
@@ -1312,7 +1325,7 @@ async def _finish_qa_run(run_id, ctrl, project_id, task_id, agent_id, task,
                                     test_summary, browser_status,
                                     in_tokens, out_tokens, cost)
         return
-    dev_agent_id = task["qa_agent_id"] or agent_id
+    dev_agent_id = _author_agent_id(project_id, task, agent_id)
     browser = ctrl.get("browser") or {}
     browser_status = browser.get("status", "")
     browser_summary = browser.get("summary", "")
@@ -1544,7 +1557,7 @@ def _eligible_tasks(project_id):
         return []
     tasks = query(
         "SELECT * FROM tasks WHERE project_id = ? AND sprint_id = ? "
-        "AND status IN ('Todo','Ready','Rework','Waiting QA','SA Review','BA Review') AND assigned_agent_id IS NOT NULL "
+        "AND status IN ('Todo','Ready','Rework','Waiting QA','Code Review','SA Review','BA Review') AND assigned_agent_id IS NOT NULL "
         "ORDER BY priority, created_at", (project_id, sprint["id"]))
     eligible = []
     for t in tasks:
@@ -1763,7 +1776,7 @@ def dependency_stall(project_id, sprint_id):
         return []
     pending = query(
         "SELECT id, title FROM tasks WHERE project_id = ? AND sprint_id = ? "
-        "AND status IN ('Todo','Ready','Rework','Waiting QA','SA Review','BA Review')",
+        "AND status IN ('Todo','Ready','Rework','Waiting QA','Code Review','SA Review','BA Review')",
         (project_id, sprint_id))
     stalled = []
     for t in pending:
@@ -1883,10 +1896,26 @@ def _team_members(project_id):
         (project["team_id"],))
 
 
+def _author_agent_id(project_id, task, fallback_agent_id):
+    """The developer a rejected task returns to for rework: the recorded
+    author when that agent is still a live dev-family teammate, otherwise the
+    least-loaded developer on the team. Only falls back to the recorded id
+    when the team has no developer at all. Guards against a re-provisioned
+    team, where a stale/foreign qa_agent_id would otherwise bounce dev work
+    onto the SA/BA/QA reviewer that just rejected it."""
+    qa = task.get("qa_agent_id")
+    members = _team_members(project_id) or []
+    live = {m["id"]: m for m in members}
+    if qa and qa in live and _family_of_role(live[qa]["role_name"]) == "dev":
+        return qa
+    dev, _ = _pick_member(members, "dev")
+    return dev["id"] if dev else (qa or fallback_agent_id)
+
+
 def _agent_load(agent_id):
     return query_one(
         "SELECT COUNT(*) AS n FROM tasks WHERE assigned_agent_id = ? "
-        "AND status IN ('Ready','In Progress','Review','Testing','Waiting QA','SA Review','BA Review','Rework')", (agent_id,))["n"]
+        "AND status IN ('Ready','In Progress','Review','Testing','Waiting QA','Code Review','SA Review','BA Review','Rework')", (agent_id,))["n"]
 
 
 def auto_assign_tasks(project_id: str) -> dict:
@@ -2036,10 +2065,26 @@ def start_sprint_execution(project_id: str, sprint_ref=None):
         return {"error": "Project not found"}
     # Spec pipeline (V3 Step 2): a project whose blueprint-derived sprint
     # plan is ready enters Active Development the moment a sprint starts.
-    if (governance.governance_enabled(project_id)
-            and governance.current_state(project_id) == governance.READY_PLANNING):
-        governance.transition_project(project_id, governance.ACTIVE_DEV,
-                                      reason="sprint execution started", actor="user")
+    if governance.governance_enabled(project_id):
+        st = governance.current_state(project_id)
+        # A project can be stranded in Scaffolding when the post-approval
+        # blueprint/breakdown background run fails after the requirement
+        # baseline (the one human gate) is already approved. If a sprint has
+        # been planned (auto or manually), walk the remaining legal edges
+        # Scaffolding -> Ready for Planning so execution can proceed.
+        if st == governance.SCAFFOLDING:
+            planned = query_one(
+                "SELECT 1 AS x FROM sprints WHERE project_id = ? "
+                "AND status IN ('Planned','Ready') LIMIT 1", (project_id,))
+            if planned:
+                governance.transition_project(
+                    project_id, governance.READY_PLANNING,
+                    reason="sprint planned; recovered scaffolding after breakdown",
+                    actor="user")
+                st = governance.READY_PLANNING
+        if st == governance.READY_PLANNING:
+            governance.transition_project(project_id, governance.ACTIVE_DEV,
+                                          reason="sprint execution started", actor="user")
     g_ok, g_reason = governance.may_execute(project_id)
     if not g_ok:
         return {"error": f"SPRINT_BLOCKED_BY_LIFECYCLE: {g_reason}"}

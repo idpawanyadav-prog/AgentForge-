@@ -161,7 +161,23 @@ def _narrate_stuck(project_id: str, agent_name: str, reason: str, *, dedupe: boo
 # ---------------------------------------------------------------- status
 
 def po_agent_for_project(project_id: str):
-    """The Product Owner agent on this project's aligned team (or None)."""
+    """The Product Owner agent for this project.
+
+    An explicit per-project override (``projects.po_agent_id``) wins when it
+    points at an agent that is an active member of the project's team; a
+    missing, deleted or off-team id falls back to the team's Product Owner.
+    Returns None when neither exists."""
+    override_id = (query_one("SELECT po_agent_id FROM projects WHERE id = ?",
+                             (project_id,)) or {}).get("po_agent_id")
+    if override_id:
+        agent = query_one(
+            "SELECT a.*, r.name AS role_name FROM agents a "
+            "JOIN roles r ON r.id = a.role_id "
+            "JOIN team_agents ta ON ta.agent_id = a.id AND ta.active = 1 "
+            "JOIN projects p ON p.team_id = ta.team_id "
+            "WHERE a.id = ? AND p.id = ?", (override_id, project_id))
+        if agent:
+            return agent
     role = query_one("SELECT id FROM roles WHERE lower(name) = lower(?)", (PO_ROLE,))
     if not role:
         return None
@@ -170,17 +186,22 @@ def po_agent_for_project(project_id: str):
         "JOIN teams tm ON tm.id = ta.team_id "
         "JOIN agents a ON a.id = ta.agent_id JOIN roles r ON r.id = a.role_id "
         "JOIN projects p ON p.team_id = tm.id "
-        "WHERE p.id = ? AND a.role_id = ? AND ta.active = 1 LIMIT 1",
+        "WHERE p.id = ? AND a.role_id = ? AND ta.active = 1 "
+        "ORDER BY a.name LIMIT 1",
         (project_id, role["id"]))
 
 
 def po_status(project_id: str) -> dict:
     agent = po_agent_for_project(project_id)
-    project = query_one("SELECT po_enabled FROM projects WHERE id = ?", (project_id,))
+    project = query_one("SELECT po_enabled, po_agent_id FROM projects WHERE id = ?",
+                        (project_id,))
     return {
         "has_po": agent is not None,
         "po_enabled": bool(project and project["po_enabled"]),
         "agent_name": agent["name"] if agent else None,
+        "agent_id": agent["id"] if agent else None,
+        "overridden": bool(project and project["po_agent_id"] and agent
+                           and agent["id"] == project["po_agent_id"]),
     }
 
 

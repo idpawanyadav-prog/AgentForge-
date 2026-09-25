@@ -301,8 +301,9 @@ def _post(project_id: str, text: str, conversation_id: str | None = None):
 
 
 def _doc_links(project_id: str, kinds: list[str]) -> str:
-    return "\n".join(f"- **{k}**: [read {k}](/api/v1/projects/{project_id}/documents/{k}) "
-                     f"(`docs/{k}.md` in the workspace)" for k in kinds)
+    return "\n".join(
+        f"- **{k}**: [📂 docs/{k}.md](/api/v1/projects/{project_id}/documents/{k}/reveal)"
+        for k in kinds)
 
 
 def pipeline_brief(project_id: str) -> str:
@@ -555,6 +556,16 @@ def on_requirements_approved(project_id: str):
 def _continuation_worker(project_id: str):
     try:
         continue_after_approval(project_id, None)
+    except Exception:
+        # A blueprint/breakdown LLM failure used to kill this daemon thread
+        # silently, stranding the project in Scaffolding with no message and
+        # no recovery. Surface it and point at a way forward instead.
+        logger.exception("post-approval blueprint/breakdown failed for %s", project_id)
+        _post(project_id, "⚠️ The blueprint / sprint-breakdown step stopped before it "
+                          "finished, so the project is still in Scaffolding. Your approved "
+                          "requirement baseline is safe — nothing was lost. Say `start sprint` "
+                          "to run a sprint you create, or `analyze project` to re-run the "
+                          "blueprint and breakdown.", None)
     finally:
         _release(project_id)
 

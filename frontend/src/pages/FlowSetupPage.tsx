@@ -1,6 +1,6 @@
 import React from 'react';
 import { del, get, post, put } from '../api';
-import { Badge, ErrorNote, Field, Modal } from '../components';
+import { Badge, ErrorNote, Field } from '../components';
 
 interface FlowTeam { role: string; count: number }
 interface DesignStep {
@@ -18,6 +18,36 @@ interface ProcessItem { process: string; kind: string }
 const KIND_ICON: Record<string, string> = {
   implement: '💻', review: '🔍', test: '🧪', approve: '🛑',
 };
+
+const ROLE_ABBR: Record<string, string> = {
+  'Business Analyst': 'BA', 'Solution Architect': 'SA', 'Senior Developer': 'Sr Dev',
+  'Junior Developer': 'Jr Dev', 'QA Engineer': 'QA', 'Product Owner': 'PO',
+  'UI/UX Designer': 'Designer', 'DevOps Engineer': 'DevOps',
+};
+function abbr(name: string): string {
+  return ROLE_ABBR[name]
+    || name.split(/[\s/]+/).filter(Boolean).map((w) => w[0]).join('').slice(0, 3).toUpperCase();
+}
+
+// Low-alpha hues so the tint reads as pastel on the bright theme and muted on
+// dark, while the label text stays theme-driven (readable in both).
+const HUES: [number, number, number][] = [
+  [79, 142, 247], [155, 108, 222], [63, 185, 80], [210, 153, 34],
+  [248, 81, 120], [47, 169, 184], [224, 108, 63],
+];
+function hueOf(name: string): [number, number, number] {
+  let h = 0;
+  for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return HUES[h % HUES.length];
+}
+function roleStyle(name: string): React.CSSProperties {
+  const [r, g, b] = hueOf(name);
+  return {
+    background: `rgba(${r},${g},${b},0.12)`,
+    borderColor: `rgba(${r},${g},${b},0.4)`,
+    ['--hue' as any]: `rgb(${r},${g},${b})`,
+  } as React.CSSProperties;
+}
 
 export default function FlowSetupPage() {
   const [flows, setFlows] = React.useState<Flow[] | null>(null);
@@ -54,9 +84,20 @@ export default function FlowSetupPage() {
     } catch (e: any) { setError(e?.message || 'Update failed'); }
   }
 
+  if (editing) {
+    return (
+      <div className="page">
+        <FlowEditor flow={editing === 'new' ? null : editing} kinds={kinds} processes={processes}
+          roles={roles} onClose={() => setEditing(null)}
+          onSaved={() => { setEditing(null); load(); }} onError={setError} />
+      </div>
+    );
+  }
+
   return (
-    <div style={{ padding: 18, maxWidth: 1000 }}>
-      <div className="spread" style={{ marginBottom: 12 }}>
+    <div className="page">
+      <div style={{ maxWidth: 1000, margin: '0 auto' }}>
+        <div className="spread" style={{ marginBottom: 12 }}>
         <div>
           <h2 style={{ margin: 0 }}>Flow Setup</h2>
           <div className="muted small">
@@ -121,17 +162,31 @@ export default function FlowSetupPage() {
           {f.description && <div className="small muted" style={{ marginTop: 8 }}>{f.description}</div>}
         </div>
       ))}
-      {editing && (
-        <FlowForm flow={editing === 'new' ? null : editing} kinds={kinds} processes={processes}
-          roles={roles} onClose={() => setEditing(null)}
-          onSaved={() => { setEditing(null); load(); }}
-          onError={setError} />
-      )}
+      </div>
     </div>
   );
 }
 
-function FlowForm({ flow, kinds, processes, roles, onClose, onSaved, onError }: {
+// ------------------------------------------------------------------ editor
+
+// A "cr" (code review) stage is not shown as its own row: it is folded into
+// the row for the stage it reviews, surfaced as that row's Code Review
+// checkbox. These helpers convert between the stored `stages` key list (which
+// does contain "cr") and the editor's visible rows.
+interface DevRow { key: string; cr: boolean }
+function stagesToRows(stages: string[]): DevRow[] {
+  const rows: DevRow[] = [];
+  for (const s of stages) {
+    if (s === 'cr' && rows.length) rows[rows.length - 1].cr = true;
+    else rows.push({ key: s, cr: false });
+  }
+  return rows;
+}
+function rowsToStages(rows: DevRow[]): string[] {
+  return rows.flatMap((r) => (r.cr ? [r.key, 'cr'] : [r.key]));
+}
+
+function FlowEditor({ flow, kinds, processes, roles, onClose, onSaved, onError }: {
   flow: Flow | null; kinds: StageKind[]; processes: ProcessItem[];
   roles: { id: string; name: string }[];
   onClose: () => void; onSaved: () => void; onError: (m: string) => void;
@@ -141,51 +196,71 @@ function FlowForm({ flow, kinds, processes, roles, onClose, onSaved, onError }: 
   const [design, setDesign] = React.useState<DesignStep[]>(
     (flow?.design ?? []).map((s) => ({ role: s.role, processes: [...(s.processes ?? [])],
       approval_required: !!s.approval_required })));
-  const [stages, setStages] = React.useState<string[]>(flow?.stages ?? ['dev', 'sa', 'ba', 'qa']);
+  const [devRows, setDevRows] = React.useState<DevRow[]>(
+    stagesToRows(flow?.stages ?? ['dev', 'sa', 'ba', 'qa']));
   const [team, setTeam] = React.useState<FlowTeam[]>(flow?.team ?? []);
   const [poEnabled, setPoEnabled] = React.useState<number>(flow?.po_enabled ?? 0);
   const [isDefault, setIsDefault] = React.useState<number>(flow?.is_default ?? 0);
   const [busy, setBusy] = React.useState(false);
-  const [newStage, setNewStage] = React.useState('approve');
-  const [newRole, setNewRole] = React.useState('');
 
   const roleNames = roles.map((r) => r.name);
-  const usable = kinds.filter((k) => !stages.includes(k.key));
+  const kindOf = (key: string) => kinds.find((k) => k.key === key);
+  const roleLabel = (role: string) => `${abbr(role)} (${role})`;
 
-  function moveStage(i: number, dir: -1 | 1) {
-    const j = i + dir;
-    if (j < 0 || j >= stages.length) return;
-    const next = [...stages];
-    [next[i], next[j]] = [next[j], next[i]];
-    setStages(next);
+  // ---- team member selection (backed by the existing team spec) ----
+  const teamByRole = new Map(team.map((t) => [t.role, t]));
+  function toggleRole(role: string) {
+    if (teamByRole.has(role)) setTeam(team.filter((t) => t.role !== role));
+    else setTeam([...team, { role, count: 1 }]);
+  }
+  function setCount(role: string, n: number) {
+    setTeam(team.map((t) => t.role === role ? { ...t, count: Math.max(1, n) } : t));
   }
 
-  function addStep() {
+  // ---- design phase steps ----
+  function addDesignStep() {
     const role = roleNames.find((r) => !design.some((s) => s.role === r)) ?? roleNames[0] ?? '';
     setDesign([...design, { role, processes: [], approval_required: true }]);
   }
-  function moveStep(i: number, dir: -1 | 1) {
-    const j = i + dir;
-    if (j < 0 || j >= design.length) return;
-    const next = [...design];
-    [next[i], next[j]] = [next[j], next[i]];
-    setDesign(next);
-  }
   function patchStep(i: number, patch: Partial<DesignStep>) {
+    const next = [...design]; next[i] = { ...next[i], ...patch }; setDesign(next);
+  }
+  function removeDesignStep(i: number) { setDesign(design.filter((_, x) => x !== i)); }
+  function moveDesign(i: number, to: number) {
     const next = [...design];
-    next[i] = { ...next[i], ...patch };
+    const [row] = next.splice(i, 1);
+    next.splice(Math.max(0, Math.min(next.length, to)), 0, row);
     setDesign(next);
   }
-  function toggleProcess(i: number, proc: string) {
-    const cur = design[i].processes;
-    patchStep(i, { processes: cur.includes(proc) ? cur.filter((p) => p !== proc)
-      : [...cur, proc] });
+
+  // ---- development flow (fixed stage-kind chain; "cr" = per-row code review) ----
+  const addableKinds = kinds.filter((k) => k.key !== 'cr');
+  function addDevStep() {
+    const next = addableKinds.find((k) => !devRows.some((r) => r.key === k.key));
+    if (next) setDevRows([...devRows, { key: next.key, cr: false }]);
+  }
+  function setDevStep(i: number, key: string) {
+    const next = devRows.map((r, x) => (x === i ? { ...r, key } : r));
+    setDevRows(next);
+  }
+  function toggleDevCR(i: number, on: boolean) {
+    setDevRows(devRows.map((r, x) => (x === i ? { ...r, cr: on } : r)));
+  }
+  function removeDevStep(i: number) { setDevRows(devRows.filter((_, x) => x !== i)); }
+  function moveDev(i: number, to: number) {
+    const next = [...devRows];
+    const [row] = next.splice(i, 1);
+    // The Developer stage must stay first.
+    const idx = (row.key === 'dev') ? 0 : Math.max(next[0]?.key === 'dev' ? 1 : 0,
+      Math.min(next.length, to));
+    next.splice(idx, 0, row);
+    setDevRows(next);
   }
 
   async function save() {
     setBusy(true);
     const body = {
-      name, description, stages, team,
+      name, description, stages: rowsToStages(devRows), team,
       design: design.map((s, i) => ({ seq: i + 1, role: s.role,
         processes: s.processes, approval_required: s.approval_required })),
       po_enabled: poEnabled, is_default: isDefault,
@@ -202,144 +277,265 @@ function FlowForm({ flow, kinds, processes, roles, onClose, onSaved, onError }: 
   }
 
   return (
-    <Modal title={flow ? `Edit flow — ${flow.name}` : 'New Flow'} onClose={onClose}>
-      <Field label="Name"><input className="input" value={name}
-        onChange={(e) => setName(e.target.value)} placeholder="e.g. Fast Track (no BA review)" /></Field>
-      <Field label="Description"><input className="input" value={description}
-        onChange={(e) => setDescription(e.target.value)} placeholder="What this flow is for" /></Field>
+    <div className="flow-editor">
+      <div className="page-header">
+        <div className="row" style={{ gap: 12 }}>
+          <button className="btn small back-btn" onClick={onClose} title="Back to flows">←</button>
+          <h1 style={{ margin: 0 }}>{flow ? `Edit Flow — ${flow.name}` : 'Create Flow'}</h1>
+        </div>
+      </div>
 
-      <Field label="Design phase (before the stage chain)">
-        <div className="card" style={{ padding: 10 }}>
-          <div className="small muted" style={{ marginBottom: 8 }}>
-            A strictly sequential pre-delivery workflow. Each step's role authors its
-            documents; steps with an approval gate pause until approved — a rejection
-            returns the step to its role for revision.
+      {/* 1 — Flow Details & Team Members */}
+      <section className="flowsec flowsec-1">
+        <SectionHead n={1} title="Flow Details & Team Members" />
+        <div className="flowsec-body two-col">
+          <div>
+            <Field label="Flow Name *">
+              <input className="input" value={name} onChange={(e) => setName(e.target.value)}
+                placeholder="e.g. Web Application Development" />
+            </Field>
+            <Field label="Description">
+              <textarea className="input" value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="What this flow is for" />
+            </Field>
           </div>
-          {design.length === 0 && <div className="small muted">No steps — the project goes
-            straight from the requirement to the stage chain.</div>}
-          {design.length > 0 && (
-            <div className="row small muted" style={{ marginBottom: 4, fontWeight: 600 }}>
-              <span style={{ width: 26 }}>Seq</span>
-              <span style={{ minWidth: 150 }}>Role</span>
-              <span style={{ flex: 1 }}>Processes</span>
-              <span style={{ width: 70 }}>Approve?</span>
-              <span style={{ width: 78 }} />
+          <div>
+            <div className="field-label">Team Members *</div>
+            <div className="muted small" style={{ marginBottom: 8 }}>
+              Select team members who can participate in this flow based on available roles.
             </div>
-          )}
-          {design.map((s, i) => (
-            <div key={i} style={{ marginBottom: 10, paddingBottom: 10,
-              borderBottom: i < design.length - 1 ? '1px solid var(--border, #333)' : 'none' }}>
-              <div className="row">
-                <span className="muted small" style={{ width: 26 }}>{i + 1}.</span>
-                <select className="input" style={{ minWidth: 150 }} value={s.role}
+            <div className="member-grid">
+              {roleNames.map((r) => {
+                const sel = teamByRole.has(r);
+                return (
+                  <div key={r} className={`member-card${sel ? ' sel' : ''}`} style={roleStyle(r)}
+                    onClick={() => toggleRole(r)}>
+                    <input type="checkbox" checked={sel} readOnly tabIndex={-1} />
+                    <span className="member-avatar">👤</span>
+                    <span className="member-name">
+                      <b>{abbr(r)}</b> <span className="muted small">({r})</span>
+                    </span>
+                    {sel && (
+                      <span className="member-count" onClick={(e) => e.stopPropagation()}>
+                        <button className="mc-btn" onClick={() => setCount(r, teamByRole.get(r)!.count - 1)}>−</button>
+                        <span>{teamByRole.get(r)!.count}</span>
+                        <button className="mc-btn" onClick={() => setCount(r, teamByRole.get(r)!.count + 1)}>+</button>
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+              <AddMemberButton roles={roleNames} selected={teamByRole} onAdd={toggleRole} />
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* 2 — Design Phase */}
+      <section className="flowsec flowsec-2">
+        <SectionHead n={2} title="Design Phase"
+          sub="Define the design phase workflow from initial requirement to supporting documents. Select documents for each role and configure approval." />
+        <div className="flowsec-body">
+          <div className="flow-table">
+            <div className="ft-row ft-head">
+              <span className="ft-seq">Sequence</span>
+              <span className="ft-role">Role</span>
+              <span className="ft-docs">Documents (Multi-select)</span>
+              <span className="ft-approve">Approval Required</span>
+              <span className="ft-act" />
+            </div>
+            {design.length === 0 && (
+              <div className="small muted" style={{ padding: '10px 4px' }}>
+                No steps — the project goes straight from the requirement to the development flow.
+              </div>
+            )}
+            {design.map((s, i) => (
+              <div className="ft-row" key={i}>
+                <input className="seq-input" type="number" min={1} max={design.length} value={i + 1}
+                  onChange={(e) => { const to = (Number(e.target.value) || 1) - 1; if (to !== i) moveDesign(i, to); }} />
+                <select className="input ft-role" value={s.role}
                   onChange={(e) => patchStep(i, { role: e.target.value })}>
                   {!roleNames.includes(s.role) && <option value={s.role}>{s.role || 'select role…'}</option>}
-                  {roleNames.map((r) => <option key={r} value={r}>{r}</option>)}
+                  {roleNames.map((r) => <option key={r} value={r}>{roleLabel(r)}</option>)}
                 </select>
-                <label className="row small" style={{ width: 70 }}>
+                <div className="ft-docs">
+                  <DocMultiSelect value={s.processes} options={processes}
+                    onChange={(next) => patchStep(i, { processes: next })} />
+                </div>
+                <span className="ft-approve">
                   <input type="checkbox" checked={s.approval_required}
                     onChange={(e) => patchStep(i, { approval_required: e.target.checked })} />
-                  needed</label>
-                <span style={{ flex: 1 }} />
-                <button className="btn small" disabled={i === 0} onClick={() => moveStep(i, -1)}>↑</button>
-                <button className="btn small" disabled={i === design.length - 1}
-                  onClick={() => moveStep(i, 1)}>↓</button>
-                <button className="btn small danger"
-                  onClick={() => setDesign(design.filter((_, x) => x !== i))}>×</button>
+                </span>
+                <span className="ft-act">
+                  <button className="icon-btn danger" title="Remove step"
+                    onClick={() => removeDesignStep(i)}>🗑</button>
+                </span>
               </div>
-              <div className="row" style={{ marginTop: 6, flexWrap: 'wrap', gap: 6, paddingLeft: 32 }}>
-                {processes.map((p) => (
-                  <label key={p.process} className="chip small"
-                    style={{ cursor: 'pointer', opacity: s.processes.includes(p.process) ? 1 : 0.55,
-                             outline: s.processes.includes(p.process) ? '1px solid var(--accent, #888)' : 'none' }}>
-                    <input type="checkbox" style={{ marginRight: 4 }}
-                      checked={s.processes.includes(p.process)}
-                      onChange={() => toggleProcess(i, p.process)} />
-                    {p.process} <span className="muted">({p.kind})</span>
-                  </label>
-                ))}
-              </div>
-            </div>
-          ))}
-          <button className="btn small" style={{ marginTop: 6 }} onClick={addStep}
-            disabled={roleNames.length === 0}>+ Add step</button>
+            ))}
+          </div>
+          <button className="btn small add-btn" onClick={addDesignStep}
+            disabled={roleNames.length === 0}>+ Add Design Phase Step</button>
         </div>
-      </Field>
+      </section>
 
-      <Field label="Stage chain (per task)">
-        <div className="card" style={{ padding: 10 }}>
-          {stages.map((s, i) => {
-            const k = kinds.find((x) => x.key === s);
-            return (
-              <div className="row" key={s} style={{ marginBottom: 6 }}>
-                <span className="muted small" style={{ width: 18 }}>{i + 1}.</span>
-                <span>{KIND_ICON[k?.kind ?? ''] ?? '•'}</span>
-                <b style={{ minWidth: 130 }}>{k?.label ?? s}</b>
-                <span className="muted small">{k?.kind} · {k?.role}</span>
-                <span style={{ flex: 1 }} />
-                <button className="btn small" disabled={i === 0} onClick={() => moveStage(i, -1)}>↑</button>
-                <button className="btn small" disabled={i === stages.length - 1}
-                  onClick={() => moveStage(i, 1)}>↓</button>
-                <button className="btn small danger" disabled={s === 'dev'}
-                  onClick={() => setStages(stages.filter((x) => x !== s))}>×</button>
-              </div>
-            );
-          })}
-          <div className="row" style={{ marginTop: 8 }}>
-            <select className="input" value={newStage} onChange={(e) => setNewStage(e.target.value)}>
-              {usable.map((k) => <option key={k.key} value={k.key}>{k.label} ({k.kind})</option>)}
-            </select>
-            <button className="btn small" disabled={!usable.some((k) => k.key === newStage)}
-              onClick={() => setStages([...stages, newStage])}>+ Add stage</button>
+      {/* 3 — Development Flow */}
+      <section className="flowsec flowsec-3">
+        <SectionHead n={3} title="Development Flow"
+          sub="Define the development flow sequence. Agents cannot be duplicated in this flow." />
+        <div className="flowsec-body">
+          <div className="flow-table">
+            <div className="ft-row ft-head">
+              <span className="ft-seq">Sequence</span>
+              <span className="ft-role2">Agent / Role</span>
+              <span className="ft-cr">Code Review</span>
+              <span className="ft-act">Actions</span>
+            </div>
+            {devRows.map((row, i) => {
+              const k = kindOf(row.key);
+              const crAllowed = !!k && (k.kind === 'implement' || k.kind === 'test');
+              return (
+                <div className="ft-row" key={i}>
+                  <input className="seq-input" type="number" min={1} max={devRows.length} value={i + 1}
+                    disabled={row.key === 'dev'}
+                    onChange={(e) => { const to = (Number(e.target.value) || 1) - 1; if (to !== i) moveDev(i, to); }} />
+                  <select className="input ft-role2" value={row.key} disabled={row.key === 'dev'}
+                    onChange={(e) => setDevStep(i, e.target.value)}>
+                    {addableKinds.map((kk) => {
+                      const usedElsewhere = devRows.some((r, x) => r.key === kk.key && x !== i);
+                      return <option key={kk.key} value={kk.key} disabled={usedElsewhere}>
+                        {roleLabel(kk.role)}{kk.key === 'dev' ? '' : ` · ${kk.label}`}
+                      </option>;
+                    })}
+                  </select>
+                  <span className="ft-cr">
+                    <input type="checkbox" checked={row.cr} disabled={!crAllowed}
+                      onChange={(e) => toggleDevCR(i, e.target.checked)}
+                      title={crAllowed ? 'Insert a Senior-Developer code-review gate after this step'
+                        : 'Code review applies to implementation / test steps'} />
+                  </span>
+                  <span className="ft-act">
+                    <button className="icon-btn danger" title="Remove step" disabled={row.key === 'dev'}
+                      onClick={() => removeDevStep(i)}>🗑</button>
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+          <div className="row" style={{ marginTop: 8, gap: 10 }}>
+            <button className="btn small add-btn" onClick={addDevStep}
+              disabled={!addableKinds.some((k) => !devRows.some((r) => r.key === k.key))}>+ Add Development Step</button>
+            <span className="muted small">ⓘ Agents can not be duplicated. Code review adds a
+              Senior-Developer gate after that step.</span>
           </div>
         </div>
-      </Field>
+      </section>
 
-      <Field label="Team (provisioned when a new project picks this flow)">
-        <div className="card" style={{ padding: 10 }}>
-          {team.map((t, i) => (
-            <div className="row" key={t.role} style={{ marginBottom: 6 }}>
-              <b style={{ minWidth: 160 }}>{t.role}</b>
-              <input className="input" type="number" min={1} max={9} style={{ width: 64 }}
-                value={t.count}
-                onChange={(e) => {
-                  const next = [...team];
-                  next[i] = { ...t, count: Math.max(1, Number(e.target.value) || 1) };
-                  setTeam(next);
-                }} />
-              <span className="muted small">member(s)</span>
-              <span style={{ flex: 1 }} />
-              <button className="btn small danger"
-                onClick={() => setTeam(team.filter((x) => x.role !== t.role))}>×</button>
-            </div>
-          ))}
-          <div className="row" style={{ marginTop: 8 }}>
-            <select className="input" value={newRole} onChange={(e) => setNewRole(e.target.value)}>
-              <option value="">add role…</option>
-              {roleNames.filter((r) => !team.some((t) => t.role === r))
-                .map((r) => <option key={r} value={r}>{r}</option>)}
-            </select>
-            <button className="btn small" disabled={!newRole}
-              onClick={() => { setTeam([...team, { role: newRole, count: 1 }]); setNewRole(''); }}>
-              + Add role</button>
-          </div>
+      {/* 4 — Other Settings */}
+      <section className="flowsec flowsec-4">
+        <SectionHead n={4} title="Other Settings" />
+        <div className="flowsec-body">
+          <label className="opt-row">
+            <input type="checkbox" checked={poEnabled === 1}
+              onChange={(e) => setPoEnabled(e.target.checked ? 1 : 0)} />
+            <span>PO autonomous <span className="muted small">(auto-reviews design-phase approval gates)</span></span>
+          </label>
+          <label className="opt-row">
+            <input type="checkbox" checked={isDefault === 1}
+              onChange={(e) => setIsDefault(e.target.checked ? 1 : 0)} />
+            <span>Default for new projects</span>
+          </label>
         </div>
-      </Field>
+        <div className="editor-footer">
+          <button className="btn" onClick={onClose}>Cancel</button>
+          <button className="btn primary" disabled={busy || !name.trim()} onClick={save}>
+            {flow ? 'Save Flow' : 'Save Flow'}</button>
+        </div>
+      </section>
+    </div>
+  );
+}
 
-      <div className="row" style={{ marginTop: 4 }}>
-        <label className="row small"><input type="checkbox" checked={poEnabled === 1}
-          onChange={(e) => setPoEnabled(e.target.checked ? 1 : 0)} />
-          PO autonomous (auto-reviews design-phase approval gates)</label>
-        <label className="row small"><input type="checkbox" checked={isDefault === 1}
-          onChange={(e) => setIsDefault(e.target.checked ? 1 : 0)} />
-          Default for new projects</label>
-      </div>
+function SectionHead({ n, title, sub }: { n: number; title: string; sub?: string }) {
+  return (
+    <div className="flowsec-head">
+      <span className="num-badge">{n}</span>
+      <span className="sec-title">{title}</span>
+      {sub && <span className="sec-sub">{sub}</span>}
+    </div>
+  );
+}
 
-      <div className="btn-row" style={{ marginTop: 14 }}>
-        <button className="btn primary" disabled={busy || !name.trim()} onClick={save}>
-          {flow ? 'Save flow' : 'Create flow'}</button>
-        <button className="btn" onClick={onClose}>Cancel</button>
+function AddMemberButton({ roles, selected, onAdd }: {
+  roles: string[]; selected: Map<string, FlowTeam>; onAdd: (r: string) => void;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const ref = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [open]);
+  const remaining = roles.filter((r) => !selected.has(r));
+  return (
+    <div className="add-member" ref={ref}>
+      <button className="btn small add-btn" onClick={() => setOpen((o) => !o)}
+        disabled={remaining.length === 0}>+ Add Member</button>
+      {open && remaining.length > 0 && (
+        <div className="add-member-list">
+          {remaining.map((r) => (
+            <button key={r} className="add-member-item" onClick={() => { onAdd(r); setOpen(false); }}>
+              <b>{abbr(r)}</b> <span className="muted small">({r})</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Multi-select of design-phase documents rendered as removable chips + a
+// dropdown of the options that are not yet chosen.
+function DocMultiSelect({ value, options, onChange }: {
+  value: string[]; options: ProcessItem[]; onChange: (next: string[]) => void;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const ref = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [open]);
+  const add = (p: string) => onChange([...value, p]);
+  const remove = (p: string) => onChange(value.filter((x) => x !== p));
+  const remaining = options.filter((o) => !value.includes(o.process));
+  return (
+    <div className={`msel${open ? ' open' : ''}`} ref={ref}>
+      <div className="msel-box" onClick={() => setOpen((o) => !o)}>
+        {value.map((p) => (
+          <span className="msel-chip" key={p} onClick={(e) => { e.stopPropagation(); remove(p); }}>
+            {p} <span className="msel-x">×</span>
+          </span>
+        ))}
+        {!value.length && <span className="muted small">— select documents —</span>}
+        <span className="msel-caret">▾</span>
       </div>
-    </Modal>
+      {open && (
+        <div className="msel-list">
+          {remaining.map((o) => (
+            <button type="button" key={o.process} className="msel-item" onClick={() => add(o.process)}>
+              {o.process} <span className="muted small">({o.kind})</span>
+            </button>
+          ))}
+          {!remaining.length && <div className="msel-empty">All documents selected.</div>}
+        </div>
+      )}
+    </div>
   );
 }

@@ -734,6 +734,11 @@ function DesignTab({ projectId, onError }: { projectId: string; onError: (e: any
     finally { setBusy(false); }
   }
 
+  async function reveal(kind: string) {
+    try { await fetch(`/api/v1/projects/${projectId}/documents/${kind}/reveal`); }
+    catch (e: any) { onError(e); }
+  }
+
   if (loading) return <div className="muted">Loading design phase…</div>;
   if (!st) {
     return (
@@ -774,8 +779,25 @@ function DesignTab({ projectId, onError }: { projectId: string; onError: (e: any
               <Badge kind={DESIGN_STATE_BADGE[s.state] ?? 'dim'}>{(s.state || '').replace(/_/g, ' ')}</Badge>
               {s.approval_required && <Badge kind="dim">approval required</Badge>}
             </div>
-            <div className="row small muted">
-              {s.processes.map((p: string) => <span className="chip" key={p}>{p}</span>)}
+            <div className="design-docs">
+              {(s.docs || []).map((d: any) => (
+                <div className="design-doc" key={d.kind}>
+                  {d.done ? (
+                    <a className="doc-link" onClick={() => reveal(d.kind)} role="button"
+                       title={`Open docs/${d.kind}.md in the folder`}>
+                      📂 {d.process}
+                      <span className="muted small"> · docs/{d.kind}.md</span>
+                    </a>
+                  ) : d.preparing ? (
+                    <span className="doc-preparing">
+                      <span className="spin" aria-hidden="true" />
+                      Preparing {d.title}…
+                    </span>
+                  ) : (
+                    <span className="muted small doc-queued">{d.process}</span>
+                  )}
+                </div>
+              ))}
             </div>
           </div>
           {awaiting && s.seq === st.current_seq && (
@@ -851,10 +873,20 @@ function SettingsTab({ project, teams, gateways, onError, onChanged }: any) {
           )}
         </Field>
         <Field label="Team">
-          <select value={f.team_id ?? ''} onChange={upd('team_id')}>
+          <select value={f.team_id ?? ''} onChange={(e) => setF({ ...f, team_id: e.target.value, po_agent_id: '' })}>
             <option value="">— none —</option>
             {teams.map((t: any) => <option key={t.id} value={t.id}>{t.name}</option>)}
           </select>
+        </Field>
+        <Field label="Product Owner">
+          <select value={f.po_agent_id ?? ''} onChange={upd('po_agent_id')} disabled={!f.team_id}>
+            <option value="">— team default (its Product Owner agent) —</option>
+            {((teams.find((t: any) => t.id === f.team_id)?.agents) ?? [])
+              .map((a: any) => <option key={a.id} value={a.id}>{a.name} · {a.role_name}</option>)}
+          </select>
+          <div className="muted small" style={{ marginTop: 4 }}>
+            By default the project uses its team’s Product Owner. Pick a specific agent to override it for this project only.
+          </div>
         </Field>
         <Field label="Default gateway">
           <select value={f.default_gateway_id ?? ''} onChange={(e) => setF({ ...f, default_gateway_id: e.target.value, default_model_id: '' })}>
@@ -874,7 +906,7 @@ function SettingsTab({ project, teams, gateways, onError, onChanged }: any) {
       </div>
       <div className="btn-row">
         <button className="btn primary" onClick={async () => {
-          try { await patch(`/api/v1/projects/${project.id}`, { ...f, team_id: f.team_id || null, flow_id: f.flow_id || null, default_gateway_id: f.default_gateway_id || null, default_model_id: f.default_model_id || null }); onChanged(); }
+          try { await patch(`/api/v1/projects/${project.id}`, { ...f, team_id: f.team_id || null, flow_id: f.flow_id || null, po_agent_id: f.po_agent_id || null, default_gateway_id: f.default_gateway_id || null, default_model_id: f.default_model_id || null }); onChanged(); }
           catch (e: any) { onError(e); }
         }}>Save Changes</button>
         <button className="btn danger" onClick={() => setConfirmDelete(true)}>Delete Project</button>

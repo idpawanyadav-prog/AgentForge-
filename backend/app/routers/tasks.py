@@ -135,6 +135,7 @@ def control_summary(pid: str):
 
 
 def _build_summary(pid: str) -> dict:
+    from .. import flows as _flows
     from ..sprint_gate import active_sprint, next_locked_sprint, sprint_gate_summary
     project = _or_404(query_one(
         "SELECT p.*, t.name AS team_name, g.name AS gateway_name FROM projects p "
@@ -165,8 +166,11 @@ def _build_summary(pid: str) -> dict:
         "WHERE wr.project_id = ?", (pid,))
     active_runs = query("SELECT * FROM workflow_runs WHERE project_id=? AND status IN ('Running','Paused')", (pid,))
     backlog_count = query_one("SELECT COUNT(*) AS n FROM backlog_items WHERE project_id=? AND status='Backlog'", (pid,))["n"]
+    flow = _flows.flow_for_project(project)
     return {
         "project": project,
+        "flow": {"id": flow.get("id"), "name": flow.get("name"),
+                 "stages": _flows.stage_order(flow)},
         "agents": agents,
         "sprint": active_s,
         "sprint_gates": sprint_gates,

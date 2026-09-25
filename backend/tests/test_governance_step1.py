@@ -199,6 +199,44 @@ def test_sprint_start_blocked_by_lifecycle():
     assert "SPRINT_BLOCKED_BY_LIFECYCLE" in res.get("error", "")
 
 
+def test_sprint_start_recovers_stranded_scaffolding(monkeypatch):
+    """A project left in Scaffolding (post-approval blueprint/breakdown run
+    died after RB approval) must be unblocked when a sprint is already
+    planned — walking the legal edges Scaffolding -> Ready -> Active Dev."""
+    from app import runtime
+    _seed_project(governance=1, state="Scaffolding")
+    appdb.insert("agents", {"id": "a-dev", "name": "DEV", "role_id": "r-dev",
+                            "persona_id": "p-dev", "created_at": TS, "updated_at": TS})
+    appdb.insert("sprints", {"id": "sp1", "project_id": "pr1", "name": "1",
+                             "status": "Planned", "created_at": TS})
+    appdb.insert("tasks", {"id": "tk1", "project_id": "pr1", "sprint_id": "sp1",
+                           "title": "Weather page", "description": "",
+                           "acceptance_criteria": "", "story_points": 1, "priority": 2,
+                           "status": "Todo", "evidence": "", "rework_count": 0,
+                           "created_at": TS, "updated_at": TS})
+
+    def fake_spawn(coro):
+        coro.close()
+        return SimpleNamespace(cancel=lambda: None)
+    monkeypatch.setattr(runtime, "_spawn", fake_spawn)
+    try:
+        res = runtime.start_sprint_execution("pr1", "sp1")
+        assert "SPRINT_BLOCKED_BY_LIFECYCLE" not in res.get("error", "")
+        assert res.get("ok") is True
+        assert gov.current_state("pr1") == "Active Development"
+    finally:
+        with runtime._schedulers_lock:
+            runtime._schedulers.pop("pr1", None)
+
+
+def test_scaffolding_without_planned_sprint_stays_blocked():
+    from app import runtime
+    _seed_project(governance=1, state="Scaffolding")
+    res = runtime.start_sprint_execution("pr1", None)
+    assert "SPRINT_BLOCKED_BY_LIFECYCLE" in res.get("error", "")
+    assert gov.current_state("pr1") == "Scaffolding"
+
+
 # ---------------------------------------------------------------- PO dispatch
 
 def test_po_governance_actions_dispatch():

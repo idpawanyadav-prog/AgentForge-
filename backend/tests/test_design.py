@@ -258,6 +258,42 @@ def test_catalog_lists_document_kinds(seed):
     assert {"BAS", "PDS", "TS", "ARCH", "DEVPLAN", "IMPLPLAN", "TESTPLAN"} <= kinds
 
 
+def test_state_exposes_doc_progress(seed, posted, spawned):
+    flow = _flow([{"role": "Business Analyst",
+                   "processes": ["Requirement Doc", "Project Definition Sheet"],
+                   "approval_required": True},
+                  {"role": "Solution Architect", "processes": ["Technical Spec"],
+                   "approval_required": True}])
+    design.start_run(PID, flow)
+    _drain(spawned)
+    st = design.state(PID)
+    s1, s2 = st["steps"]
+    # step 1 fully authored -> its docs done, carrying a title + kind
+    assert [d["kind"] for d in s1["docs"]] == ["BAS", "PDS"]
+    assert all(d["done"] for d in s1["docs"])
+    assert s1["docs"][0]["title"]            # human title present
+    # step 2 untouched -> not done, no preparing pulse (step 1 already gated)
+    assert all(not d["done"] for d in s2["docs"])
+    assert not any(d.get("preparing") for d in s2["docs"])
+
+
+def test_reveal_document_validation_only(seed):
+    # Uses only the pre-filesystem branches so no OS file manager is launched.
+    from fastapi.testclient import TestClient
+    from app.main import app
+    client = TestClient(app)
+    # a name that fails the [A-Za-z0-9_-]+ guard is rejected (400) before any
+    # filesystem / OS work runs.
+    assert client.get(f"/api/v1/projects/{PID}/documents/bad%20kind/reveal"
+                      ).status_code == 400
+    # a project with no workspace path returns a message, not an OS open
+    appdb.execute("UPDATE projects SET workspace_path = '' WHERE id = ?", (PID,))
+    r = client.get(f"/api/v1/projects/{PID}/documents/BAS/reveal")
+    assert r.status_code == 200 and "no workspace path" in r.text.lower()
+    # missing project
+    assert client.get("/api/v1/projects/nope/documents/BAS/reveal").status_code == 404
+
+
 def test_design_routes(seed):
     from fastapi.testclient import TestClient
     from app.main import app
@@ -270,3 +306,27 @@ def test_design_routes(seed):
                     json={"decision": "approve"})
     assert d.status_code == 200 and "awaiting" in d.json()["message"].lower() \
         or "Could not" in d.json()["message"]
+
+
+def test_delete_project_cascades_design_rows(seed, posted, spawned):
+    # A finished/awaiting design run leaves rows in project_documents,
+    # project_design_runs and design_approvals; deleting the project must clear
+    # all three (they carry NOT NULL FKs) or the delete 500s.
+    from fastapi.testclient import TestClient
+    from app.main import app
+    flow = _flow([{"role": "Business Analyst",
+                   "processes": ["Requirement Doc", "Project Definition Sheet"],
+                   "approval_required": True}])
+    design.start_run(PID, flow)
+    _drain(spawned)
+    # rows exist across all three design tables
+    assert appdb.query_one(
+        "SELECT COUNT(*) n FROM project_documents WHERE project_id=?", (PID,))["n"] > 0
+    assert appdb.query_one(
+        "SELECT COUNT(*) n FROM project_design_runs WHERE project_id=?", (PID,))["n"] == 1
+    client = TestClient(app)
+    r = client.delete(f"/api/v1/projects/{PID}")
+    assert r.status_code == 200, r.text
+    for tbl in ("project_documents", "project_design_runs", "design_approvals"):
+        assert appdb.query_one(
+            f"SELECT COUNT(*) n FROM {tbl} WHERE project_id=?", (PID,))["n"] == 0, tbl

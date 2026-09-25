@@ -422,6 +422,7 @@ def state(project_id: str) -> dict | None:
     for h in hist:
         by_seq.setdefault(h["seq"], []).append(h)
     steps = []
+    authoring = run["status"] == RUNNING
     for s in run["steps"]:
         latest = (by_seq.get(s["seq"]) or [{}])[-1]
         if s["seq"] < run["current_seq"] or run["status"] == COMPLETED:
@@ -433,8 +434,20 @@ def state(project_id: str) -> dict | None:
                 step_state = "in_revision"
         else:
             step_state = "pending"
-        steps.append({**s, "state": step_state,
-                      "docs": [PROCESS_CATALOG[p]["kind"] for p in s["processes"]]})
+        docs = []
+        for proc in s["processes"]:
+            kind = PROCESS_CATALOG[proc]["kind"]
+            done = bool(specs.latest_doc(project_id, kind))
+            title = (specs.DOC_SPECS.get(kind) or (proc,))[0]
+            docs.append({"kind": kind, "process": proc, "title": title, "done": done})
+        # In the step being authored, the first not-yet-done document is the one
+        # in flight so the UI can show a "preparing" pulse on exactly one item.
+        if authoring and step_state in ("in_progress", "in_revision") \
+                and s["seq"] == run["current_seq"]:
+            for i, d in enumerate(docs):
+                d["preparing"] = (i == next((j for j, x in enumerate(docs)
+                                             if not x["done"]), None))
+        steps.append({**s, "state": step_state, "docs": docs})
     return {"project_id": project_id, "flow_id": run["flow_id"],
             "status": run["status"], "current_seq": run["current_seq"],
             "steps": steps, "history": hist,

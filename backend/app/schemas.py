@@ -59,6 +59,7 @@ class ProjectUpdate(BaseModel):
     status: Optional[str] = None
     flow_id: Optional[str] = None
     po_enabled: Optional[bool] = None
+    po_agent_id: Optional[str] = None
     sa_review_enabled: Optional[bool] = None
     ba_review_enabled: Optional[bool] = None
     budget_usd: Optional[float] = None

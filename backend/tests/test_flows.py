@@ -204,6 +204,49 @@ def test_flow_without_qa_ends_in_done(fx):
     assert row["status"] == "SA Review"  # untouched by the failed hop
 
 
+def test_cr_stage_validates_and_maps_to_mode(fx):
+    assert "cr" in flows.STAGE_DEFS
+    flow = _mk_flow(["dev", "cr", "sa"], name="CR Flow")
+    assert flow["stages"] == ["dev", "cr", "sa"]
+    assert runtime._run_mode({"status": "Code Review"}) == "cr"
+
+
+def _add_second_senior_dev():
+    appdb.insert("agents", {"id": "ag5", "name": "A5", "role_id": "role-Senior Developer",
+                            "persona_id": "per-Senior Developer", "created_at": TS,
+                            "updated_at": TS})
+    appdb.execute("INSERT INTO team_agents (team_id, agent_id) VALUES (?,?)", (TID, "ag5"))
+
+
+def test_dev_hands_off_to_code_review_gate(fx):
+    # A 2nd Senior Developer lets the cr gate run: the author is excluded.
+    _add_second_senior_dev()
+    flow = _mk_flow(["dev", "cr", "sa", "qa"], name="CR chain")
+    appdb.update("projects", PID, {"flow_id": flow["id"]})
+    task = _task()
+    handed, outcome = runtime._advance_stage(_project(), task, "dev", "ag0", "ev")
+    assert handed and outcome == "cr-review-handoff"
+    row = appdb.query_one("SELECT * FROM tasks WHERE id = 'tk1'")
+    assert row["status"] == "Code Review"
+    assert row["assigned_agent_id"] == "ag5"   # the other Senior Developer
+    assert row["qa_agent_id"] == "ag0"          # author preserved for rework routing
+    rev = appdb.query_one("SELECT * FROM task_reviews WHERE task_id = 'tk1'")
+    assert rev["reviewer_type"] == "code_review"
+    assert rev["status"] == "pending"
+
+
+def test_code_review_gate_skips_without_second_dev(fx):
+    # Only one Senior Developer (the author): cr is skipped and the chain continues.
+    flow = _mk_flow(["dev", "cr", "sa", "qa"], name="CR skip")
+    appdb.update("projects", PID, {"flow_id": flow["id"]})
+    task = _task()
+    handed, outcome = runtime._advance_stage(_project(), task, "dev", "ag0", "ev")
+    assert handed and outcome == "sa-review-handoff"
+    row = appdb.query_one("SELECT * FROM tasks WHERE id = 'tk1'")
+    assert row["status"] == "SA Review"
+    assert row["assigned_agent_id"] == "ag1"
+
+
 def test_approve_stage_parks_task_and_chat_resolves_it(fx, monkeypatch):
     posted = []
     from app import specs
@@ -260,7 +303,7 @@ def test_flow_routes(seed):
     assert r.status_code == 200
     r = client.get("/api/v1/flows/stage_kinds")
     assert r.status_code == 200 and {k["key"] for k in r.json()} == \
-        {"dev", "sa", "ba", "qa", "approve"}
+        {"dev", "cr", "sa", "ba", "qa", "approve"}
     r = client.post("/api/v1/flows", json={"name": "Route Flow",
                                            "stages": ["dev", "qa"],
                                            "team": [{"role": "Senior Developer", "count": 1},
@@ -279,3 +322,19 @@ def test_flow_routes(seed):
     assert r.status_code == 200
     r = client.get(f"/api/v1/flows/{fid}")
     assert r.status_code == 404
+
+
+def test_control_summary_exposes_project_flow(seed):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+    client = TestClient(app)
+    flow = _mk_flow(["dev", "cr", "sa", "ba", "qa"], name="Summary Flow",
+                    team=[{"role": "Senior Developer", "count": 1},
+                          {"role": "Solution Architect", "count": 1},
+                          {"role": "Business Analyst", "count": 1},
+                          {"role": "QA Engineer", "count": 1}])
+    appdb.update("projects", PID, {"flow_id": flow["id"]})
+    body = client.get(f"/api/v1/projects/{PID}/control/summary").json()
+    assert body["flow"]["id"] == flow["id"]
+    assert body["flow"]["stages"] == ["dev", "cr", "sa", "ba", "qa"]

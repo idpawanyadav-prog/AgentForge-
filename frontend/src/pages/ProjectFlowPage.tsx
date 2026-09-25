@@ -12,58 +12,82 @@ interface TaskRow {
 }
 interface RunRow { id: string; task_id: string; agent_id: string; status: string; current_step: string; mode: string }
 interface EventRow { seq: number; event_type: string; payload: any; created_at: string }
+interface Flow { id: string | null; name: string; stages: string[] }
 interface Summary {
   project: any; agents: AgentRow[]; sprint: any; sprint_tasks: TaskRow[];
-  events: EventRow[]; usage: any; active_runs: RunRow[];
+  events: EventRow[]; usage: any; active_runs: RunRow[]; flow?: Flow;
   po?: { has_po: boolean; po_enabled: boolean; agent_name: string | null };
 }
 
-type Stage = 'dev' | 'sa' | 'ba' | 'qa' | 'done' | 'support';
+type Stage = 'dev' | 'cr' | 'sa' | 'ba' | 'qa' | 'approve' | 'done';
 
-// Fixed pipeline anchors in an abstract 1000x520 canvas space.
-const ANCHOR: Record<Exclude<Stage, 'support'>, { x: number; y: number }> = {
-  dev: { x: 110, y: 270 },
-  sa: { x: 345, y: 150 },
-  ba: { x: 565, y: 335 },
-  qa: { x: 775, y: 160 },
-  done: { x: 930, y: 320 },
-};
 const STAGE_LABEL: Record<Stage, string> = {
-  dev: 'Developer', sa: 'Solution Architect', ba: 'Business Analyst',
-  qa: 'QA Engineer', done: 'Delivered', support: 'Support',
+  dev: 'Developer', cr: 'Code review', sa: 'Solution Architect', ba: 'Business Analyst',
+  qa: 'QA Engineer', approve: 'Approval', done: 'Delivered',
 };
 const STAGE_ICON: Record<Stage, string> = {
-  dev: '💻', sa: '🏛️', ba: '📋', qa: '🧪', done: '✅', support: '🧩',
+  dev: '💻', cr: '🔍', sa: '🏛️', ba: '📋', qa: '🧪', approve: '👑', done: '✅',
 };
-
-function stageOfRole(role: string): Stage {
+// Which role's agents sit on each node. Code review is a Senior Developer
+// activity (peer of the author), so it shares the dev-family listing.
+function roleToStage(role: string): Stage {
   const r = (role || '').toLowerCase();
   if (r.includes('architect') || r.includes('tech lead')) return 'sa';
   if (r.includes('business analyst')) return 'ba';
-  if (r.includes('product owner')) return 'done';
+  if (r.includes('product owner')) return 'approve';
   if (r.includes('qa') || r.includes('test')) return 'qa';
-  if (r.includes('developer') || r.includes('engineer')) return 'dev';
-  return 'support';
+  return 'dev';
 }
 function stageOfStatus(status: string): Stage | null {
   switch (status) {
-    case 'In Progress': return 'dev';
+    case 'In Progress': case 'Rework': return 'dev';
+    case 'Code Review': return 'cr';
     case 'SA Review': return 'sa';
     case 'BA Review': return 'ba';
     case 'Waiting QA': case 'Testing': case 'Review': return 'qa';
-    case 'Pending Approval': return 'done';
+    case 'Pending Approval': return 'approve';
     case 'Done': return 'done';
-    case 'Rework': return 'dev';
     default: return null;
   }
 }
-// The forward hop that lands a task in this stage (for the traveling chip).
-const ENTRY_FROM: Partial<Record<Stage, Stage>> = { sa: 'dev', ba: 'sa', qa: 'ba', done: 'qa' };
+
+// Canvas nodes in delivery order, derived from the project's flow. The
+// terminal "Delivered" node is always present even if the flow omits it.
+function flowNodes(flow?: Flow): Stage[] {
+  const map: Record<string, Stage> = {
+    dev: 'dev', cr: 'cr', sa: 'sa', ba: 'ba', qa: 'qa', approve: 'approve',
+  };
+  const nodes: Stage[] = [];
+  for (const s of flow?.stages ?? ['dev', 'qa']) {
+    const n = map[s];
+    if (n && !nodes.includes(n)) nodes.push(n);
+  }
+  if (!nodes.length) nodes.push('dev');
+  if (nodes[nodes.length - 1] !== 'done') nodes.push('done');
+  return nodes;
+}
+
+// Fixed pipeline layout in an abstract 1000x520 canvas: nodes run left→right
+// in flow order with a light zig-zag, so any chain (with/without cr/approve)
+// renders sensibly.
+function layout(nodes: Stage[]): Record<Stage, { x: number; y: number }> {
+  const a = {} as Record<Stage, { x: number; y: number }>;
+  const n = nodes.length;
+  const left = 95, right = 905, mid = 270, hi = 150, lo = 365;
+  nodes.forEach((s, i) => {
+    const x = n <= 1 ? 500 : Math.round(left + (right - left) * (i / (n - 1)));
+    let y = mid;
+    if (n > 2 && i !== 0 && i !== n - 1) y = (i % 2 === 1) ? hi : lo;
+    a[s] = { x, y };
+  });
+  return a;
+}
 
 function curve(a: { x: number; y: number }, b: { x: number; y: number }): string {
   const mx = (a.x + b.x) / 2;
   return `M ${a.x} ${a.y} C ${mx} ${a.y}, ${mx} ${b.y}, ${b.x} ${b.y}`;
 }
+
 
 export default function ProjectFlowPage({ activeProject, setActiveProject }:
   { activeProject: string | null; setActiveProject: (id: string) => void }) {
@@ -93,6 +117,10 @@ export default function ProjectFlowPage({ activeProject, setActiveProject }:
         const s: Summary = await get(`/api/v1/projects/${activeProject}/control/summary`);
         if (!alive) return;
         setError(null);
+        // Forward hops come straight from the project's flow chain.
+        const fwd = new Set<string>();
+        const nodes = flowNodes(s.flow);
+        for (let i = 0; i + 1 < nodes.length; i++) fwd.add(`${nodes[i]}>${nodes[i + 1]}`);
         // Detect forward handoffs to fire a one-shot traveling chip.
         const seen: Record<string, string> = {};
         for (const t of s.sprint_tasks || []) {
@@ -100,7 +128,7 @@ export default function ProjectFlowPage({ activeProject, setActiveProject }:
           const before = prevStatus.current[t.id];
           if (before && before !== t.status) {
             const a = stageOfStatus(before), b = stageOfStatus(t.status);
-            if (a && b && a !== b && ENTRY_FROM[b] === a) {
+            if (a && b && a !== b && fwd.has(`${a}>${b}`)) {
               const k = Date.now();
               setFlash({ key: k, from: a, to: b, label: t.title.slice(0, 28) });
               window.clearTimeout(flashTimer.current);
@@ -121,48 +149,39 @@ export default function ProjectFlowPage({ activeProject, setActiveProject }:
   const agents = summary?.agents ?? [];
   const runs = summary?.active_runs ?? [];
   const tasks = summary?.sprint_tasks ?? [];
-  const saOn = !!summary?.project?.sa_review_enabled;
-  const baOn = !!summary?.project?.ba_review_enabled;
+  const nodes = flowNodes(summary?.flow);
+  const anchors = layout(nodes);
 
-  // Agents bucketed per stage; every stage node lists its agents.
-  const byStage: Record<Stage, AgentRow[]> = { dev: [], sa: [], ba: [], qa: [], done: [], support: [] };
-  for (const a of agents) byStage[stageOfRole(a.role_name)].push(a);
+  // Agents bucketed per node by their role. Code review shares the dev family.
+  const byStage: Record<Stage, AgentRow[]> = {
+    dev: [], cr: [], sa: [], ba: [], qa: [], approve: [], done: [],
+  };
+  for (const a of agents) byStage[roleToStage(a.role_name)].push(a);
+  byStage.cr = byStage.dev;
 
   const tasksAtStage = (st: Stage) => tasks.filter((t) => stageOfStatus(t.status) === st);
   const busyStages = new Set<Stage>();
+  const MODE_STAGE: Record<string, Stage> = { dev: 'dev', cr: 'cr', sa: 'sa', ba: 'ba', qa: 'qa' };
   for (const r of runs) {
     const ag = agents.find((a) => a.id === r.agent_id);
-    if (ag) busyStages.add(stageOfRole(ag.role_name));
-    if (r.mode === 'dev') busyStages.add('dev');
-    if (r.mode === 'sa') busyStages.add('sa');
-    if (r.mode === 'ba') busyStages.add('ba');
-    if (r.mode === 'qa') busyStages.add('qa');
+    if (ag) busyStages.add(roleToStage(ag.role_name));
+    if (MODE_STAGE[r.mode]) busyStages.add(MODE_STAGE[r.mode]);
   }
 
-  // Connector list (only enabled gates get their review hop; skips collapse to QA).
-  const connectors: { from: Stage; to: Stage; label: string; kind: 'flow' | 'skip' | 'rework' }[] = [];
-  const nextAfterDev: Stage = saOn ? 'sa' : baOn ? 'ba' : 'qa';
-  const nextAfterSa: Stage = baOn ? 'ba' : 'qa';
-  const chain: Stage[] = ['dev', nextAfterDev];
-  if (nextAfterDev === 'sa') chain.push(nextAfterSa);
-  if (chain[chain.length - 1] !== 'qa') chain.push('qa');
-  chain.push('done');
-  for (let i = 0; i < chain.length - 1; i++) {
-    connectors.push({ from: chain[i], to: chain[i + 1], label: hopLabel(chain[i], chain[i + 1]), kind: 'flow' });
+  // Connectors follow the flow's own stage order; every review/test stage
+  // loops rework back to the developer.
+  function hopLabel(b: Stage): string {
+    return ({ cr: 'Code review', sa: 'SA review', ba: 'BA review',
+      qa: 'QA test', approve: 'Approve', done: 'Done' } as Partial<Record<Stage, string>>)[b] ?? '';
   }
-  // Rework loops back to dev from whichever review stages are enabled.
-  for (const st of ['sa', 'ba', 'qa'] as Stage[]) {
-    if (st === 'sa' && !saOn) continue;
-    if (st === 'ba' && !baOn) continue;
-    connectors.push({ from: st, to: 'dev', label: 'rework', kind: 'rework' });
+  const connectors: { from: Stage; to: Stage; label: string; kind: 'flow' | 'rework' }[] = [];
+  for (let i = 0; i + 1 < nodes.length; i++) {
+    connectors.push({ from: nodes[i], to: nodes[i + 1], label: hopLabel(nodes[i + 1]), kind: 'flow' });
   }
-
-  function hopLabel(a: Stage, b: Stage): string {
-    if (b === 'sa') return 'SA Review';
-    if (b === 'ba') return 'BA Review';
-    if (b === 'qa') return 'QA';
-    if (b === 'done') return 'Done';
-    return '';
+  for (const st of nodes) {
+    if (st === 'cr' || st === 'sa' || st === 'ba' || st === 'qa') {
+      connectors.push({ from: st, to: 'dev', label: 'rework', kind: 'rework' });
+    }
   }
 
   const sel = agents.find((a) => a.id === selectedAgent) || null;
@@ -175,7 +194,8 @@ export default function ProjectFlowPage({ activeProject, setActiveProject }:
 
   const sprint = summary?.sprint;
   const done = tasks.filter((t) => t.status === 'Done').length;
-  const inReview = tasks.filter((t) => ['SA Review', 'BA Review', 'Review', 'Waiting QA', 'Testing'].includes(t.status)).length;
+  const inReview = tasks.filter((t) => ['Code Review', 'SA Review', 'BA Review', 'Review',
+    'Waiting QA', 'Testing', 'Pending Approval'].includes(t.status)).length;
   const rework = tasks.filter((t) => t.status === 'Rework').length;
 
   return (
@@ -230,8 +250,9 @@ export default function ProjectFlowPage({ activeProject, setActiveProject }:
                     </marker>
                   </defs>
                   {connectors.map((c, i) => {
-                    const a = ANCHOR[c.from as Exclude<Stage, 'support'>];
-                    const b = ANCHOR[c.to as Exclude<Stage, 'support'>];
+                    const a = anchors[c.from];
+                    const b = anchors[c.to];
+                    if (!a || !b) return null;
                     const active = c.kind === 'rework'
                       ? tasksAtStage(c.from).length > 0 && tasks.some((t) => t.status === 'Rework')
                       : busyStages.has(c.to) || tasksAtStage(c.to).length > 0;
@@ -244,8 +265,9 @@ export default function ProjectFlowPage({ activeProject, setActiveProject }:
                 </svg>
 
                 {connectors.filter((c) => c.kind === 'flow').map((c, i) => {
-                  const a = ANCHOR[c.from as Exclude<Stage, 'support'>];
-                  const b = ANCHOR[c.to as Exclude<Stage, 'support'>];
+                  const a = anchors[c.from];
+                  const b = anchors[c.to];
+                  if (!a || !b) return null;
                   return (
                     <div key={i} className="flow-line-label"
                       style={{ left: `${(((a.x + b.x) / 2) / 1000) * 100}%`, top: `${(((a.y + b.y) / 2) / 520) * 100}%` }}>
@@ -254,8 +276,8 @@ export default function ProjectFlowPage({ activeProject, setActiveProject }:
                   );
                 })}
 
-                {(['dev', 'sa', 'ba', 'qa', 'done'] as const).map((st) => {
-                  const anchor = ANCHOR[st];
+                {nodes.map((st) => {
+                  const anchor = anchors[st];
                   const left = (anchor.x / 1000) * 100;
                   const top = (anchor.y / 520) * 100;
                   const list = byStage[st];
@@ -288,8 +310,9 @@ export default function ProjectFlowPage({ activeProject, setActiveProject }:
                 })}
 
                 {flash && (() => {
-                  const a = ANCHOR[flash.from as Exclude<Stage, 'support'>];
-                  const b = ANCHOR[flash.to as Exclude<Stage, 'support'>];
+                  const a = anchors[flash.from];
+                  const b = anchors[flash.to];
+                  if (!a || !b) return null;
                   return (
                     <div key={flash.key} className="flow-chip"
                       style={{ ['--x1' as any]: `${(a.x / 1000) * 100}%`, ['--y1' as any]: `${(a.y / 520) * 100}%`,
@@ -300,12 +323,11 @@ export default function ProjectFlowPage({ activeProject, setActiveProject }:
                 })()}
               </div>
               <div className="flow-legend small muted">
-                <span><i className="lg dev" /> dev</span>
-                <span><i className="lg sa" /> SA review</span>
-                <span><i className="lg ba" /> BA review</span>
-                <span><i className="lg qa" /> QA</span>
+                {nodes.map((st) => (
+                  <span key={st}><i className={`lg ${st}`} /> {STAGE_LABEL[st]}</span>
+                ))}
                 <span><i className="lg rework" /> rework</span>
-                <span className="muted">· gates: SA {saOn ? 'on' : 'off'}, BA {baOn ? 'on' : 'off'}</span>
+                <span className="muted">· flow: {summary?.flow?.name ?? 'default'}</span>
               </div>
             </div>
 

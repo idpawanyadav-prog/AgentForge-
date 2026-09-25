@@ -78,6 +78,10 @@ def create_project(body: ProjectIn, idempotency_key: Optional[str] = Header(None
     def _create():
         pid = new_id()
         ts = now()
+        # A project on a design-bearing flow begins in Draft so its Design
+        # Phase can run (the default 'Active' maps to Active Development,
+        # which the phase guard refuses to re-run).
+        start_state = governance.DRAFT if (flow and flow.get("design")) else "Active"
         insert("projects", {"id": pid, "name": body.name, "goal": body.goal,
                             "description": body.description, "technology_stack": body.technology_stack,
                             "repository_url": body.repository_url, "workspace_path": body.workspace_path,
@@ -85,6 +89,7 @@ def create_project(body: ProjectIn, idempotency_key: Optional[str] = Header(None
                             "default_model_id": body.default_model_id,
                             "team_id": body.team_id,
                             "flow_id": body.flow_id,
+                            "lifecycle_state": start_state,
                             "status": "Active", "created_at": ts, "updated_at": ts})
         project = query_one("SELECT * FROM projects WHERE id = ?", (pid,))
         ws = workspace.prepare_workspace(project)
@@ -130,6 +135,7 @@ def update_project(pid: str, body: ProjectUpdate):
                                                       "repository_url", "workspace_path",
                                                       "default_gateway_id", "default_model_id",
                                                       "team_id", "status", "flow_id", "po_enabled",
+                                                      "po_agent_id",
                                                       "sa_review_enabled", "ba_review_enabled",
                                                       "governance_enabled", "budget_usd")}
     if allowed.get("flow_id"):
@@ -156,6 +162,21 @@ def update_project(pid: str, body: ProjectUpdate):
         err = workspace.validate_workspace_path(allowed["workspace_path"])
         if err:
             raise HTTPException(400, err)
+    # Per-project Product Owner override: NULL/empty → the team's PO.
+    if "team_id" in allowed and "po_agent_id" not in allowed:
+        allowed["po_agent_id"] = None  # switching teams drops the stale override
+    if "po_agent_id" in allowed:
+        po_val = allowed["po_agent_id"]
+        eff_team = allowed.get("team_id") or \
+            (query_one("SELECT team_id FROM projects WHERE id=?", (pid,)) or {}).get("team_id")
+        if po_val in (None, ""):
+            allowed["po_agent_id"] = None
+        else:
+            on_team = eff_team and query_one(
+                "SELECT 1 AS x FROM team_agents WHERE team_id=? AND agent_id=? AND active=1",
+                (eff_team, po_val))
+            if not on_team:
+                raise HTTPException(400, "po_agent_id must be an active agent on this project's team")
     for flag in ("po_enabled", "sa_review_enabled", "ba_review_enabled"):
         if flag in allowed:
             allowed[flag] = 1 if allowed[flag] else 0
@@ -173,6 +194,7 @@ _PROJECT_GOV_TABLES = (
     "interface_contracts", "file_contracts", "file_ownership", "component_registry",
     "dependency_requests", "task_reviews", "project_memory", "memory_checkpoints",
     "agent_messages", "change_requests", "context_cache",
+    "design_approvals", "project_design_runs", "project_documents",
 )
 
 

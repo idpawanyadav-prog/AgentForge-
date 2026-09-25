@@ -2,6 +2,8 @@ import React from 'react';
 import { get, post, patch, del, fmtTime, AGENT_STATE_CLASS, TASK_STATE_CLASS } from '../api';
 import { MarkdownText } from '../MarkdownText';
 import { Badge, ErrorNote } from '../components';
+import { useAbortableFetch } from '../useAbortable';
+import { isApiReachable, cacheResponse, getCachedResponse, DisconnectedBanner } from '../offline';
 
 interface Msg { id: string; role: string; content: string; meta: string; created_at: string }
 interface Conv { id: string; title: string }
@@ -196,6 +198,9 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
   const [error, setError] = React.useState<string | null>(null);
   const msgEndRef = React.useRef<HTMLDivElement>(null);
   const lastSeqRef = React.useRef(0);
+  const { fetchWithAbort, cancel: abortController } = useAbortableFetch();
+  const [disconnected, setDisconnected] = React.useState(false);
+  const [cached, setCached] = React.useState<Summary | null>(null);
 
   // Product Owner chat mode + autonomous-authority toggle
   const [poMode, setPoMode] = React.useState<boolean>(() => loadUi('ao.pomode', 'chat') === 'po');
@@ -251,6 +256,27 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
     return () => clearInterval(t);
   }, [activeConv, poMode]);
 
+  // API reachability probe: surface a disconnected banner and fall back to
+  // cached project state instead of showing a blank page.
+  React.useEffect(() => {
+    if (!activeProject) return;
+    const tick = async () => {
+      try {
+        const ok = await isApiReachable();
+        setDisconnected(!ok);
+        if (!ok) {
+          const stale = getCachedResponse();
+          if (stale) setCached(stale.data as Summary);
+          return;
+        }
+        setCached(null);
+      } catch { /* ignore transient probe errors */ }
+    };
+    tick();
+    const timer = setInterval(tick, 8000);
+    return () => { clearInterval(timer); };
+  }, [activeProject]);
+
   // Initial Activity load: ONLY the latest 15 events, newest first (server-side).
   React.useEffect(() => {
     if (!activeProject) return;
@@ -273,9 +299,8 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
       try {
         const s: Summary = await get(`/api/v1/projects/${activeProject}/control/summary`);
         if (!alive) return;
+        cacheResponse(s);
         setSummary(s);
-        // Events: incremental forward poll once the initial latest-15 page is in
-        // (lastSeqRef > 0); new events are prepended so the list stays desc.
         if (lastSeqRef.current > 0) {
           const evs: any = await get(`/api/v1/projects/${activeProject}/events?after=${lastSeqRef.current}`);
           if (!alive) return;
@@ -293,8 +318,8 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
     };
     poll();
     const timer = setInterval(poll, 1200);
-    return () => { alive = false; clearInterval(timer); };
-  }, [activeProject]);
+    return () => { alive = false; clearInterval(timer); abortController(); };
+  }, [activeProject, abortController]);
 
   const loadOlderEvents = async () => {
     if (!activeProject || !liveEvents.length || loadingOlder || eventsExhausted) return;
@@ -458,6 +483,16 @@ export default function ControlPage({ activeProject, setActiveProject }: { activ
 
   return (
     <div className="control-layout">
+      {disconnected && (
+        <div style={{ padding: '8px 14px' }}>
+          <DisconnectedBanner onRetry={() => { setDisconnected(false); getCachedResponse(); }} />
+        </div>
+      )}
+      {cached && disconnected && (
+        <div className="small muted" style={{ padding: '0 14px 8px' }}>
+          Showing cached state — click retry to refresh
+        </div>
+      )}
       {/* ------------- chat column ------------- */}
       <div className="chat-col">
         <div className="chat-toolbar">
